@@ -1,0 +1,91 @@
+all_targets = aclqos interface interrupt l2 l3 misc nexthop stats usrid vlan security oam mpls ptp
+
+all: $(all_targets) FORCE
+clean: $(addprefix clean_,$(all_targets)) FORCE
+
+aclqos: FORCE
+	make -C $(SDK_DIR)/core/humber/src/ctc/aclqos -f Makefile.vx
+
+clean_aclqos: FORCE
+	make -C $(SDK_DIR)/core/humber/src/ctc/aclqos -f Makefile.vx  clean
+
+oam: FORCE
+	make -C $(SDK_DIR)/core/humber/src/ctc/oam -f Makefile.vx
+
+clean_oam: FORCE
+	make -C $(SDK_DIR)/core/humber/src/ctc/oam -f Makefile.vx clean
+
+mpls: FORCE
+	make -C $(SDK_DIR)/core/humber/src/ctc/mpls -f Makefile.vx
+clean_mpls: FORCE
+	make -C $(SDK_DIR)/core/humber/src/ctc/mpls -f Makefile.vx clean
+
+ptp: FORCE
+	make -C $(SDK_DIR)/core/humber/src/ctc/ptp -f Makefile.vx
+clean_ptp: FORCE
+	make -C $(SDK_DIR)/core/humber/src/ctc/ptp -f Makefile.vx clean
+
+interface: FORCE
+	make -C $(SDK_DIR)/core/humber/src/ctc/interface -f Makefile.vx
+
+clean_interface: FORCE
+	make -C $(SDK_DIR)/core/humber/src/ctc/interface -f Makefile.vx  clean
+
+interrupt: FORCE
+	make -C $(SDK_DIR)/core/humber/src/ctc/interrupt -f Makefile.vx
+
+clean_interrupt: FORCE
+	make -C $(SDK_DIR)/core/humber/src/ctc/interrupt -f Makefile.vx  clean
+
+l2: FORCE
+	make -C $(SDK_DIR)/core/humber/src/ctc/l2 -f Makefile.vx
+
+clean_l2: FORCE
+	make -C $(SDK_DIR)/core/humber/src/ctc/l2 -f Makefile.vx  clean
+
+l3: FORCE
+	make -C $(SDK_DIR)/core/humber/src/ctc/l3 -f Makefile.vx
+
+clean_l3: FORCE
+	make -C $(SDK_DIR)/core/humber/src/ctc/l3 -f Makefile.vx  clean
+
+misc: FORCE
+	make -C $(SDK_DIR)/core/humber/src/ctc/misc -f Makefile.vx
+
+clean_misc: FORCE
+	make -C $(SDK_DIR)/core/humber/src/ctc/misc -f Makefile.vx  clean
+
+nexthop: FORCE
+	make -C $(SDK_DIR)/core/humber/src/ctc/nexthop -f Makefile.vx
+
+clean_nexthop: FORCE
+	make -C $(SDK_DIR)/core/humber/src/ctc/nexthop -f Makefile.vx  clean
+
+stats: FORCE
+	make -C $(SDK_DIR)/core/humber/src/ctc/stats -f Makefile.vx
+
+clean_stats: FORCE
+	make -C $(SDK_DIR)/core/humber/src/ctc/stats -f Makefile.vx  clean
+
+usrid: FORCE
+	make -C $(SDK_DIR)/core/humber/src/ctc/usrid -f Makefile.vx
+
+clean_usrid: FORCE
+	make -C $(SDK_DIR)/core/humber/src/ctc/usrid -f Makefile.vx  clean
+
+vlan: FORCE
+	make -C $(SDK_DIR)/core/humber/src/ctc/vlan -f Makefile.vx
+
+clean_vlan: FORCE
+	make -C $(SDK_DIR)/core/humber/src/ctc/vlan -f Makefile.vx  clean
+
+security: FORCE
+	make -C $(SDK_DIR)/core/humber/src/ctc/security -f Makefile.vx
+
+clean_security: FORCE
+	make -C $(SDK_DIR)/core/humber/src/ctc/security -f Makefile.vx  clean
+
+
+
+.PHONY: FORCE
+FORCE:

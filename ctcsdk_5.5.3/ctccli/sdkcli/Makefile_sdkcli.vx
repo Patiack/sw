@@ -1,0 +1,41 @@
+
+################################## vxworks #####################################
+ifeq ($(targetbase),vxworks)
+
+OBJ_DIR=$(OBJ_BASE_DIR)/ctccli/sdkcli
+
+all_targets = sdkcli $(COMPATIBAL_CHIP)
+ifeq ($(USW),yes)
+all_targets += usw
+endif
+
+all: $(all_targets) FORCE
+clean: $(addprefix clean_,$(all_targets)) FORCE
+
+sdkcli: FORCE
+	$(CTC_MAKE) -f Makefile.vx
+
+clean_sdkcli: FORCE
+	$(CTC_MAKE) -f Makefile.vx clean
+
+usw: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/ctccli/sdkcli/usw -f Makefile.vx
+
+clean_usw: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/ctccli/sdkcli/usw -f Makefile.vx clean
+
+goldengate: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/ctccli/sdkcli/goldengate -f Makefile.vx
+
+clean_goldengate: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/ctccli/sdkcli/goldengate -f Makefile.vx clean
+
+greatbelt: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/ctccli/sdkcli/greatbelt -f Makefile.vx
+
+clean_greatbelt: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/ctccli/sdkcli/greatbelt -f Makefile.vx clean
+
+.PHONY: FORCE
+FORCE:
+endif

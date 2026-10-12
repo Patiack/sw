@@ -1,0 +1,166 @@
+ifeq ($(targetbase),linux)
+include $(MK_DIR)/sys.mk
+OBJ_DIR=$(OBJ_BASE_DIR)
+LIB = ctcsdk
+
+# sal
+SRCS = $(shell find sal/src/linux_um -name "*.c")
+SRCS += $(shell find sal/src/common -name "*.c")
+
+# dal
+SRCS += $(shell find dal/src/common -name "*.c")
+ifeq ($(TARGETBOARD),ctc-sim)
+SRCS += dal/src/linux/user/dal_user_sim.c
+else
+  ifeq ($(TARGETBOARD),linux-sim)
+  SRCS += dal/src/linux/user/dal_user_sim.c
+  else
+  SRCS += dal/src/linux/user/dal_user.c
+  endif
+endif
+
+#driver
+ifeq ($(USW),yes)
+SRCS += $(shell find driver/api -name "*.c")
+SRCS += $(shell find driver/usw/src -name "*.c")
+endif
+SRCS += $(foreach n, $(COMPATIBAL_CHIP), $(shell find driver/$(n)/src -name "*.c"))
+
+ifeq ($(TARGETBOARD),ctc-sim)
+CPPFLAGS += -DDRVIER_WORK_PLATFORM=1
+else
+CPPFLAGS += -DDRVIER_WORK_PLATFORM=0
+endif
+
+
+#core
+ifeq ($(PUMP), TRUE)
+SRCS += $(shell find pump/ -name "*.c")
+SRCS += $(shell find pump/sb_api -name "*.c")
+SRCS += $(shell find pump/nb_api -name "*.c")
+SRCS += $(shell find pump/app -name "*.c")
+endif
+
+SRCS += $(shell find core/api/src -name "*.c")
+ifeq ($(USW),yes)
+SRCS += $(shell find core/usw/src -maxdepth 2 -name "*.c")
+SRCS += $(foreach n, $(CHIPNAME), $(shell find core/usw/src/sys/$(n) -name "*.c"))
+endif
+SRCS += $(foreach n, $(COMPATIBAL_CHIP), $(shell find core/$(n)/src -name "*.c"))
+SRCS += $(shell find core/common/src -name "*.c")
+SRCS += $(shell find core/init -name "*.c")
+SRCS += $(shell find core/app -name "*.c")
+
+#dkits
+SRCS += dkits/ctc_dkit_cli.c
+SRCS += dkits/ctc_dkit_api.c
+SRCS += dkits/ctc_dkit_dump_cfg.c
+ifeq ($(USW),yes)
+SRCS += $(shell find dkits/common/ -maxdepth 1 -name "*.c")
+SRCS += $(foreach n, $(CHIPNAME), $(shell find dkits/common/$(n)/ -name "*.c"))
+endif
+SRCS += $(foreach n, $(COMPATIBAL_CHIP), $(shell find dkits/$(n) -name "*.c"))
+
+
+#memmodel
+#ifeq ($(TARGETBOARD),ctc-sim)
+#ifneq ($(CHIPNAME), duet2)
+#SRCS += $(shell find mem_model/$(CHIPNAME)/src -name "*.c")
+#CPPFLAGS += -DUSE_SIM_MEM
+#endif
+#endif
+
+#chipagent
+ifeq ($(ChipAgent),TRUE)
+SRCS += $(foreach n, $(CHIPNAME), $(shell find chip_agent/$(n)/src -name "*.c"))
+
+CPPFLAGS += $(foreach n, $(CHIPNAME), -I$(SDK_DIR)/chip_agent/$(n)/include)
+endif
+
+#libctccli
+SRCS += $(shell find libctccli/src -name "*.c")
+
+CFLAGS += -I$(SDK_DIR)/ctc_shell/
+
+
+
+#ctccli
+SRCS += $(wildcard ctccli/*.c)
+SRCS += $(shell find ctccli/sdkcli -maxdepth 1 -name "*.c")
+ifeq ($(USW),yes)
+SRCS += $(shell find ctccli/sdkcli/usw -name "*.c")
+endif
+SRCS += $(foreach n, $(COMPATIBAL_CHIP), $(shell find ctccli/sdkcli/$(n) -name "*.c"))
+
+CPPFLAGS += -I$(SDK_DIR)/dal/include
+CPPFLAGS += -I$(SDK_DIR)/dal/src/linux
+CPPFLAGS += -I$(SDK_DIR)/sal/include
+CPPFLAGS += -I$(SDK_DIR)/core/init
+CPPFLAGS += -I$(SDK_DIR)/core/api/include
+CPPFLAGS += -I$(SDK_DIR)/core/common/include
+CPPFLAGS += -I$(SDK_DIR)/core/app
+CPPFLAGS += -I$(SDK_DIR)/core
+
+ifeq ($(PUMP),TRUE)
+CPPFLAGS += -I$(SDK_DIR)/pump
+CPPFLAGS += -I$(SDK_DIR)/pump/app
+CPPFLAGS += -I$(SDK_DIR)/pump/lib
+CPPFLAGS += -I$(SDK_DIR)/pump/nb_api
+CPPFLAGS += -I$(SDK_DIR)/pump/sb_api
+endif
+
+ifeq ($(USW),yes)
+CPPFLAGS += -I$(SDK_DIR)/core/usw/include
+CPPFLAGS += -I$(SDK_DIR)/core/usw/include/ctc
+CPPFLAGS += -I$(SDK_DIR)/core/usw/include/sys
+CPPFLAGS += -I$(SDK_DIR)/ctccli/sdkcli/usw
+CPPFLAGS += -I$(SDK_DIR)/driver/api
+endif
+CPPFLAGS += $(foreach n, $(COMPATIBAL_CHIP), -I$(SDK_DIR)/core/$(n)/include)
+CPPFLAGS += $(foreach n, $(COMPATIBAL_CHIP), -I$(SDK_DIR)/core/$(n)/include/ctc)
+CPPFLAGS += $(foreach n, $(COMPATIBAL_CHIP), -I$(SDK_DIR)/core/$(n)/include/sys)
+CPPFLAGS += $(foreach n, $(COMPATIBAL_CHIP), -I$(SDK_DIR)/ctccli/sdkcli/$(n))
+
+CPPFLAGS += -I$(SDK_DIR)/libctccli/include
+CPPFLAGS += -I$(SDK_DIR)/libctccli/ctc_shell/include
+CPPFLAGS += -I$(SDK_DIR)/libctccli/src
+
+CPPFLAGS += -I$(SDK_DIR)/ctccli/sdkcli
+
+CPPFLAGS += -I$(SDK_DIR)/driver
+
+ifeq ($(TARGETBOARD),ctc-sim)
+CPPFLAGS += -I$(SDK_DIR)/../cmodel/ctckal/include
+CPPFLAGS += $(foreach n, $(CHIPNAME), -I$(SDK_DIR)/../cmodel/$(n)/include)
+CPPFLAGS += $(foreach n, $(CHIPNAME), -I$(SDK_DIR)/driver/$(n)/include)
+ifneq ($(CHIPNAME), $(filter $(CHIPNAME), greatbelt goldengate))
+CPPFLAGS += $(foreach n, $(CHIPNAME), -I$(SDK_DIR)/../cmodel/$(n)/mem_model/include)
+else
+CPPFLAGS += $(foreach n, $(CHIPNAME), -I$(SDK_DIR)/mem_model/$(n)/include)
+endif
+endif
+
+ifneq ($(CHIPNAME), $(filter $(CHIPNAME), greatbelt goldengate))
+ifeq ($(TARGETBOARD),ctc-board)
+CPPFLAGS += $(foreach n, $(CHIPNAME), -I$(SDK_DIR)/../cmodel/$(n)/mem_model/include)
+endif
+endif
+
+CPPFLAGS += -I$(SDK_DIR)/app/config
+CPPFLAGS += -I$(SDK_DIR)/app/sample
+CPPFLAGS += -I$(SDK_DIR)/app/usr
+CPPFLAGS += -I$(SDK_DIR)/app
+
+CPPFLAGS += -I$(SDK_DIR)/dkits
+ifeq ($(USW),yes)
+CPPFLAGS += -I$(SDK_DIR)/dkits/usw
+endif
+CPPFLAGS += $(foreach n, $(CHIPNAME), -I$(SDK_DIR)/dkits/$(n))
+CPPFLAGS += -I$(SDK_DIR)/dkits/common
+
+ifeq ($(SO_LIB),yes)
+include $(MK_DIR)/solib.mk
+else
+include $(MK_DIR)/lib.mk
+endif
+endif

@@ -1,0 +1,135 @@
+all_targets = acl qos interface interrupt l2 l3 misc nexthop stats vlan security oam mpls common
+
+ifneq ($(findstring humber, $(CHIPNAME)),humber)
+all_targets += scl timesync stacking dma packet
+endif
+
+ifeq ($(findstring goldengate, $(CHIPNAME)),goldengate)
+all_targets += overlay
+endif
+
+all: $(all_targets) FORCE
+clean: $(addprefix clean_,$(all_targets)) FORCE
+
+acl: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core/goldengate/src/sys/acl -f Makefile.vx
+
+clean_acl: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core/goldengate/src/sys/acl -f Makefile.vx  clean
+
+qos: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core/goldengate/src/sys/qos -f Makefile.vx
+
+clean_qos: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core/goldengate/src/sys/qos -f Makefile.vx  clean
+
+oam: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core/goldengate/src/sys/oam -f Makefile.vx
+
+clean_oam: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core/goldengate/src/sys/oam -f Makefile.vx clean
+
+mpls: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core/goldengate/src/sys/mpls -f Makefile.vx
+
+clean_mpls: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core/goldengate/src/sys/mpls -f Makefile.vx clean
+
+common: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core/goldengate/src/sys/common -f Makefile.vx
+
+clean_common: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core/goldengate/src/sys/common -f Makefile.vx  clean
+
+interface: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core/goldengate/src/sys/interface -f Makefile.vx
+
+clean_interface: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core/goldengate/src/sys/interface -f Makefile.vx  clean
+
+interrupt: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core/goldengate/src/sys/interrupt -f Makefile.vx
+
+clean_interrupt: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core/goldengate/src/sys/interrupt -f Makefile.vx  clean
+
+l2: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core/goldengate/src/sys/l2 -f Makefile.vx
+
+clean_l2: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core/goldengate/src/sys/l2 -f Makefile.vx  clean
+
+l3: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core/goldengate/src/sys/l3 -f Makefile.vx
+
+clean_l3: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core/goldengate/src/sys/l3 -f Makefile.vx  clean
+
+misc: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core/goldengate/src/sys/misc -f Makefile.vx
+
+clean_misc: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core/goldengate/src/sys/misc -f Makefile.vx  clean
+
+nexthop: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core/goldengate/src/sys/nexthop -f Makefile.vx
+
+clean_nexthop: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core/goldengate/src/sys/nexthop -f Makefile.vx  clean
+
+stats: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core/goldengate/src/sys/stats -f Makefile.vx
+
+clean_stats: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core/goldengate/src/sys/stats -f Makefile.vx  clean
+
+scl: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core/goldengate/src/sys/scl -f Makefile.vx
+
+clean_scl: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core/goldengate/src/sys/scl -f Makefile.vx  clean
+
+vlan: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core/goldengate/src/sys/vlan -f Makefile.vx
+
+clean_vlan: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core/goldengate/src/sys/vlan -f Makefile.vx  clean
+
+security: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core/goldengate/src/sys/security -f Makefile.vx
+
+clean_security: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core/goldengate/src/sys/security -f Makefile.vx  clean
+
+timesync: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core/goldengate/src/sys/timesync -f Makefile.vx
+
+clean_timesync: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core/goldengate/src/sys/timesync -f Makefile.vx  clean
+
+stacking: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core/goldengate/src/sys/stacking -f Makefile.vx
+
+clean_stacking: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core/goldengate/src/sys/stacking -f Makefile.vx  clean
+
+dma: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core/goldengate/src/sys/dma -f Makefile.vx
+
+clean_dma: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core/goldengate/src/sys/dma -f Makefile.vx  clean
+
+packet: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core/goldengate/src/sys/packet -f Makefile.vx
+
+clean_packet: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core/goldengate/src/sys/packet -f Makefile.vx  clean
+
+overlay: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core/goldengate/src/sys/overlay -f Makefile.vx
+	
+clean_overlay: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core/goldengate/src/sys/overlay -f Makefile.vx clean
+	
+.PHONY: FORCE
+FORCE:

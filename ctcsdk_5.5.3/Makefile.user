@@ -1,0 +1,144 @@
+all: $(all_targets) FORCE
+image: $(image_targets) FORCE
+dkcli: $(dkcli_targets) FORCE
+clean: $(addprefix clean_,$(all_targets)) FORCE
+
+libsal: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/sal
+
+clean_libsal: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/sal clean
+
+libdal: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/dal -f Makefile
+
+clean_libdal: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/dal clean
+
+libdrv: FORCE
+	@echo "GEN => $@"
+	$(CTC_MAKE) -C $(SDK_DIR)/driver
+
+clean_libdrv: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/driver clean
+
+libsdkcore: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core
+libdkit: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/dkits -f Makefile.lib
+
+clean_libdkit:FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/dkits -f Makefile.lib clean
+
+clean_libsdkcore: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core clean
+
+libctcsdk: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR) -f Makefile.one_lib
+
+clean_libctcsdk: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR) -f Makefile.one_lib clean
+
+libmemmodel: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/mem_model/$(CHIPNAME)
+
+clean_libmemmodel: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/mem_model/$(CHIPNAME) clean
+
+libchipagent: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/chip_agent
+
+clean_libchipagent: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/chip_agent clean
+
+liblibctccli: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/libctccli
+
+clean_liblibctccli: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/libctccli clean
+
+libpkt:	FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/libpktxr
+
+clean_libpkt:	FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/libpktxr clean
+
+libmodelcpp: FORCE
+ifeq ($(cpp),yes)
+	@echo "GEN => $@"
+	$(CTC_MAKE) -C $(CMODEL_DIR)/$(CHIPNAME)/src/modelcpp -f Makefile.lib
+else
+	@echo "====> SKIP MAKE libmodelcpp.so"
+endif
+
+clean_libmodelcpp: FORCE
+	@rm -rf $(CMODEL_DIR)/build.i686.d/bin.tmp
+	$(CTC_MAKE) -C $(CMODEL_DIR)/$(CHIPNAME)/src/modelcpp -f Makefile.lib clean
+
+libctccli: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/ctccli
+
+clean_libctccli: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/ctccli clean
+
+libcmodel: FORCE
+	@echo "GEN => $@"
+	$(CTC_MAKE) -C $(CMODEL_DIR) -f Makefile.lib
+
+clean_libcmodel: FORCE
+	@rm -rf $(CMODEL_DIR)/build.i686.d/bin.tmp
+	$(CTC_MAKE) -C $(CMODEL_DIR) -f Makefile.lib clean
+
+libcmodelcli: FORCE
+	$(CTC_MAKE) -C $(CMODEL_DIR)/$(CHIPNAME)/ui/cmodel_cli -f Makefile
+
+clean_libcmodelcli: FORCE
+	$(CTC_MAKE) -C $(CMODEL_DIR)/$(CHIPNAME)/ui/cmodel_cli clean  -f Makefile
+
+libpump: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/pump  -f Makefile
+
+clean_libpump:	FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/pump -f Makefile clean
+
+libapp:	FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/app  -f Makefile_libapp
+
+clean_libapp: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/app -f Makefile_libapp clean
+
+app: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/app  -f Makefile
+
+clean_app:	FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/app -f Makefile clean
+
+kdal: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/dal/src/linux/kernel -f Makefile
+
+clean_kdal: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/dal/src/linux/kernel -f Makefile clean
+
+knet: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/dal/src/linux/kernel/knet -f Makefile
+
+clean_knet: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/dal/src/linux/kernel/knet -f Makefile clean
+
+libdkcli: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/dkits
+
+clean_libdkcli: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/dkits clean
+
+ctc_shell: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/ctc_shell
+
+clean_ctc_shell: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/ctc_shell clean
+
+distclean: FORCE
+	rm -rf $(BLD_DIR)
+
+.PHONY: FORCE
+FORCE:

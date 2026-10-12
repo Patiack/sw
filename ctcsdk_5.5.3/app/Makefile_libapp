@@ -1,0 +1,30 @@
+ifeq ($(targetbase),linux)
+
+include $(MK_DIR)/sys.mk
+OBJ_DIR=$(OBJ_BASE_DIR)/app
+
+LIB = app
+SRCS = $(wildcard ctc_app.c)
+SRCS += $(wildcard config/*.c)
+SRCS += $(wildcard usr/*.c)
+SRCS += $(wildcard sample/*.c)
+
+ifeq ($(UNIT_TEST),TRUE)
+CPPFLAGS += -DSDK_UNIT_TEST
+endif
+
+CPPFLAGS += -I$(SDK_DIR)/sal/include
+CPPFLAGS += -I$(SDK_DIR)/core
+CPPFLAGS += -I$(SDK_DIR)/libctccli/include
+CPPFLAGS += -I$(SDK_DIR)/ctccli/sdkcli
+CPPFLAGS += -I$(SDK_DIR)/app
+CPPFLAGS += -I$(SDK_DIR)/app/config
+CPPFLAGS += -I$(SDK_DIR)/app/usr
+CPPFLAGS += -I$(SDK_DIR)/app/sample
+CPPFLAGS += $(foreach n, $(CHIPNAME), -I$(SDK_DIR)/ctccli/sdkcli/$(n))
+ifeq ($(PUMP), TRUE)
+CPPFLAGS += -I$(SDK_DIR)/pump/app
+endif
+
+include $(MK_DIR)/lib.mk
+endif

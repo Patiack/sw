@@ -1,0 +1,27 @@
+include $(MK_DIR)/sys_vx.mk
+OBJ_DIR=$(OBJ_BASE_DIR)/dkits
+
+LIB = dkit 
+OBJS = $(wildcard $(OBJ_DIR)/*.o)
+DEPS = $(wildcard $(OBJ_DIR)/*.d)
+ifeq ($(USW),yes)
+OBJS += $(wildcard $(OBJ_DIR)/common/*.o)
+DEPS += $(wildcard $(OBJ_DIR)/common/*.d)
+OBJS += $(foreach n, $(CHIPNAME), $(wildcard $(OBJ_DIR)/common/$(n)/*.o))
+DEPS += $(foreach n, $(CHIPNAME), $(wildcard $(OBJ_DIR)/common/$(n)/*.d))
+endif
+OBJS += $(foreach n, $(COMPATIBAL_CHIP), $(wildcard $(OBJ_DIR)/$(n)/*.o))
+DEPS += $(foreach n, $(COMPATIBAL_CHIP), $(wildcard $(OBJ_DIR)/$(n)/*.d))
+
+$(LIB_DIR)/libdkit.a: $(OBJS)
+	$(shell mkdir -p $(dir $@))
+	echo "LIB => $(subst $(BLD_DIR),build.$(CPU).$(VER),$@)" && \
+	rm -rf $@ && \
+	$(AR) cru $@ $^ && \
+	$(RANLIB) $@
+
+.PHONY: clean
+clean:
+	rm -rf $(LIB_DIR)/lib$(LIB).a
+
+

@@ -1,0 +1,120 @@
+
+all_targets = acl qos interface interrupt l2 l3 misc nexthop stats vlan security oam mpls
+
+ifeq ($(findstring greatbelt, $(CHIPNAME)),greatbelt)
+all_targets += scl timesync stacking dma packet
+endif
+
+all: $(all_targets) FORCE
+clean: $(addprefix clean_,$(all_targets)) FORCE
+
+acl: FORCE
+	make -C $(SDK_DIR)/core/greatbelt/src/ctc/acl -f Makefile.vx
+
+clean_acl: FORCE
+	make -C $(SDK_DIR)/core/greatbelt/src/ctc/acl -f Makefile.vx  clean
+
+qos: FORCE
+	make -C $(SDK_DIR)/core/greatbelt/src/ctc/qos -f Makefile.vx
+
+clean_qos: FORCE
+	make -C $(SDK_DIR)/core/greatbelt/src/ctc/qos -f Makefile.vx  clean
+
+oam: FORCE
+	make -C $(SDK_DIR)/core/greatbelt/src/ctc/oam -f Makefile.vx
+
+clean_oam: FORCE
+	make -C $(SDK_DIR)/core/greatbelt/src/ctc/oam -f Makefile.vx clean
+
+mpls: FORCE
+	make -C $(SDK_DIR)/core/greatbelt/src/ctc/mpls -f Makefile.vx
+
+clean_mpls: FORCE
+	make -C $(SDK_DIR)/core/greatbelt/src/ctc/mpls -f Makefile.vx clean
+
+interface: FORCE
+	make -C $(SDK_DIR)/core/greatbelt/src/ctc/interface -f Makefile.vx
+
+clean_interface: FORCE
+	make -C $(SDK_DIR)/core/greatbelt/src/ctc/interface -f Makefile.vx  clean
+
+interrupt: FORCE
+	make -C $(SDK_DIR)/core/greatbelt/src/ctc/interrupt -f Makefile.vx
+
+clean_interrupt: FORCE
+	make -C $(SDK_DIR)/core/greatbelt/src/ctc/interrupt -f Makefile.vx  clean
+
+l2: FORCE
+	make -C $(SDK_DIR)/core/greatbelt/src/ctc/l2 -f Makefile.vx
+
+clean_l2: FORCE
+	make -C $(SDK_DIR)/core/greatbelt/src/ctc/l2 -f Makefile.vx  clean
+
+l3: FORCE
+	make -C $(SDK_DIR)/core/greatbelt/src/ctc/l3 -f Makefile.vx
+
+clean_l3: FORCE
+	make -C $(SDK_DIR)/core/greatbelt/src/ctc/l3 -f Makefile.vx  clean
+
+misc: FORCE
+	make -C $(SDK_DIR)/core/greatbelt/src/ctc/misc -f Makefile.vx
+
+clean_misc: FORCE
+	make -C $(SDK_DIR)/core/greatbelt/src/ctc/misc -f Makefile.vx  clean
+
+nexthop: FORCE
+	make -C $(SDK_DIR)/core/greatbelt/src/ctc/nexthop -f Makefile.vx
+
+clean_nexthop: FORCE
+	make -C $(SDK_DIR)/core/greatbelt/src/ctc/nexthop -f Makefile.vx  clean
+
+stats: FORCE
+	make -C $(SDK_DIR)/core/greatbelt/src/ctc/stats -f Makefile.vx
+
+clean_stats: FORCE
+	make -C $(SDK_DIR)/core/greatbelt/src/ctc/stats -f Makefile.vx  clean
+
+scl: FORCE
+	make -C $(SDK_DIR)/core/greatbelt/src/ctc/scl -f Makefile.vx
+
+clean_scl: FORCE
+	make -C $(SDK_DIR)/core/greatbelt/src/ctc/scl -f Makefile.vx  clean
+
+vlan: FORCE
+	make -C $(SDK_DIR)/core/greatbelt/src/ctc/vlan -f Makefile.vx
+
+clean_vlan: FORCE
+	make -C $(SDK_DIR)/core/greatbelt/src/ctc/vlan -f Makefile.vx  clean
+
+security: FORCE
+	make -C $(SDK_DIR)/core/greatbelt/src/ctc/security -f Makefile.vx
+
+clean_security: FORCE
+	make -C $(SDK_DIR)/core/greatbelt/src/ctc/security -f Makefile.vx  clean
+
+timesync: FORCE
+	make -C $(SDK_DIR)/core/greatbelt/src/ctc/timesync -f Makefile.vx
+
+clean_timesync: FORCE
+	make -C $(SDK_DIR)/core/greatbelt/src/ctc/timesync -f Makefile.vx  clean
+
+stacking: FORCE
+	make -C $(SDK_DIR)/core/greatbelt/src/ctc/stacking -f Makefile.vx
+
+clean_stacking: FORCE
+	make -C $(SDK_DIR)/core/greatbelt/src/ctc/stacking -f Makefile.vx  clean
+
+dma: FORCE
+	make -C $(SDK_DIR)/core/greatbelt/src/ctc/dma -f Makefile.vx
+
+clean_dma: FORCE
+	make -C $(SDK_DIR)/core/greatbelt/src/ctc/dma -f Makefile.vx  clean
+
+packet: FORCE
+	make -C $(SDK_DIR)/core/greatbelt/src/ctc/packet -f Makefile.vx
+
+clean_packet: FORCE
+	make -C $(SDK_DIR)/core/greatbelt/src/ctc/packet -f Makefile.vx  clean
+
+.PHONY: FORCE
+FORCE:

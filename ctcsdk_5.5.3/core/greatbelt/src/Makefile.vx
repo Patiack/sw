@@ -1,0 +1,21 @@
+include $(MK_DIR)/sys_vx.mk
+
+all_targets = api sys
+
+all: $(all_targets) FORCE
+clean: $(addprefix clean_,$(all_targets)) FORCE
+
+api: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core/greatbelt/src/ctc -f Makefile.vx
+
+clean_api: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core/greatbelt/src/ctc -f Makefile.vx clean
+
+sys: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core/greatbelt/src/sys -f Makefile.vx
+
+clean_sys: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/core/greatbelt/src/sys -f Makefile.vx  clean
+
+.PHONY: FORCE
+FORCE:

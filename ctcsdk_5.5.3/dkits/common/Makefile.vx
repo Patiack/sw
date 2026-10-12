@@ -1,0 +1,29 @@
+ifeq ($(targetbase),vxworks)
+OBJ_DIR=$(OBJ_BASE_DIR)/dkits/common
+
+all_targets = common $(CHIPNAME)
+
+all: $(all_targets) FORCE
+clean: $(addprefix clean_,$(all_targets)) FORCE
+
+common: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/dkits/common -f Makefile_common.vx
+
+clean_common: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/dkits/common -f Makefile_common.vx clean
+
+duet2: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/dkits/common/duet2/ -f Makefile.vx
+    
+clean_duet2: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/dkits/common/duet2/ -f Makefile.vx clean
+    
+tsingma: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/dkits/common/tsingma/ -f Makefile.vx
+
+clean_tsingma: FORCE
+	$(CTC_MAKE) -C $(SDK_DIR)/dkits/common/tsingma/ -f Makefile.vx clean	
+
+.PHONY: FORCE
+FORCE:
+endif

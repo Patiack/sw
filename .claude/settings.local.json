@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell($files = @\\(\"hw_l3.c\",\"hw_mpls.c\",\"hw_mpls_new.c\",\"hw_rt.c\"\\); foreach \\($f in $files\\) { $path = \"d:\\\\share\\\\runos\\\\frr-frr-10.6.1\\\\hsl\\\\hw\\\\$f\"; $lines = \\(Get-Content $path | Measure-Object -Line\\).Lines; Write-Output \"$f : $lines lines\" })",
+      "PowerShell($p='D:\\\\share\\\\runos\\\\frr-frr-10.6.1\\\\frr-frr-10.6.1\\\\zebra\\\\ctcdplane\\\\ctc_dplane.c'; $b=[System.IO.File]::ReadAllBytes\\($p\\); $s=[System.Text.Encoding]::UTF8.GetString\\($b\\); $lines=$s -split \"`n\"; 1505..1516 | ForEach-Object { $l=$lines[$_-1]; \"$_`: \" + \\($l -replace \"`r\",\"<CR>\"\\) + \" || len=\" + $l.Length })",
+      "PowerShell(Get-Command gcc,make,clang -ErrorAction SilentlyContinue)",
+      "PowerShell($p = 'D:\\\\share\\\\runos\\\\frr-frr-10.6.1\\\\hsl\\\\hw\\\\hw_l3.c'; $t = Get-Content -Raw -Encoding UTF8 $p; \"braces  { = \" + \\([regex]::Matches\\($t,'\\\\{'\\)\\).Count + \"   } = \" + \\([regex]::Matches\\($t,'\\\\}'\\)\\).Count; \"parens  \\( = \" + \\([regex]::Matches\\($t,'\\\\\\('\\)\\).Count + \"   \\) = \" + \\([regex]::Matches\\($t,'\\\\\\)'\\)\\).Count; \"lines = \" + \\(Get-Content $p | Measure-Object -Line\\).Lines)",
+      "PowerShell(foreach \\($f in @\\('hsl\\\\hw\\\\hw_mpls.c','hsl\\\\hsl_rt.c','hsl\\\\hw\\\\hw_l3.c'\\)\\) { $p = Join-Path 'D:\\\\share\\\\runos\\\\frr-frr-10.6.1' $f; $t = Get-Content -Raw -Encoding UTF8 $p; $o = \\([regex]::Matches\\($t,'\\\\\\('\\)\\).Count; $c = \\([regex]::Matches\\($t,'\\\\\\)'\\)\\).Count; \"$f  \\( = $o   \\) = $c   delta = $\\($o-$c\\)\" })"
+    ]
+  }
+}
