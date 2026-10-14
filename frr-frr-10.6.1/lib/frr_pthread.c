@@ -4,6 +4,20 @@
  * Copyright (C) 2017  Cumulus Networks, Inc.
  */
 
+/* ==================== 文件导读 ====================
+ * 本文件实现 FRR 的 POSIX 线程管理（frr_pthread，接口见 frr_pthread.h）。
+ * 设计要点：
+ *   - FRR 采用“每线程一个事件循环”模型。frr_pthread_new 会为该线程创建
+ *     一个独立的 event_loop（master），之后往该 master 投递的事件都在该
+ *     线程执行，从而把并发限制在线程边界内，减少锁竞争。
+ *   - 所有 frr_pthread 对象登记在全局链表 frr_pthread_list 中，用一个全局
+ *     互斥量 frr_pthread_list_mtx 保护。
+ *   - 线程启动时通过 startup_cond 做“父线程放行、子线程等待”的握手；
+ *     启动后通过 running_cond 通知“已就绪可工作”。
+ *   - rcu_thread_start 在子线程入口里注册 RCU 读侧，配合 FRR 的 RCU 机制。
+ *   - 启动前会屏蔽继承来的信号，避免把信号递交给工作线程。
+ * ================================================ */
+
 #include <zebra.h>
 
 #include <signal.h>
@@ -22,9 +36,13 @@
 #include "libfrr_trace.h"
 #include "sigevent.h"
 
+/* 为 frr_pthread 对象与线程同步原语（mutex / cond）分别登记内存类型，
+ * 便于内存统计与排查。
+ */
 DEFINE_MTYPE_STATIC(LIB, FRR_PTHREAD, "FRR POSIX Thread");
 DEFINE_MTYPE_STATIC(LIB, PTHREAD_PRIM, "POSIX sync primitives");
 
+/* 默认的线程入口与停止例程（当属性未指定 start / stop 时使用）。 */
 /* default frr_pthread start/stop routine prototypes */
 static void *fpt_run(void *arg);
 static int fpt_halt(struct frr_pthread *fpt, void **res);
@@ -32,18 +50,21 @@ static int fpt_halt(struct frr_pthread *fpt, void **res);
 /* misc sigs */
 static void frr_pthread_destroy_nolock(struct frr_pthread *fpt);
 
+/* 默认属性对象：入口为 fpt_run，停止为 fpt_halt。 */
 /* default frr_pthread attributes */
 const struct frr_pthread_attr frr_pthread_attr_default = {
 	.start = fpt_run,
 	.stop = fpt_halt,
 };
 
+/* 记录所有已创建的 frr_pthread，保护它的是 frr_pthread_list_mtx。 */
 /* list to keep track of all frr_pthreads */
 static pthread_mutex_t frr_pthread_list_mtx = PTHREAD_MUTEX_INITIALIZER;
 static struct list *frr_pthread_list;
 
 /* ------------------------------------------------------------------------ */
 
+/* 初始化模块：创建全局 frr_pthread 链表。必须在其它接口之前调用。 */
 void frr_pthread_init(void)
 {
 	frr_with_mutex (&frr_pthread_list_mtx) {
@@ -51,6 +72,9 @@ void frr_pthread_init(void)
 	}
 }
 
+/* 反初始化：先停止所有线程，再逐个从链表摘除并销毁，最后删除链表。之后
+ * 可再次调用 frr_pthread_init 重新使用本模块。
+ */
 void frr_pthread_finish(void)
 {
 	frr_pthread_stop_all();
@@ -68,6 +92,12 @@ void frr_pthread_finish(void)
 	}
 }
 
+/* 创建一个 frr_pthread：分配对象、初始化互斥量与条件变量、创建该线程专属
+ * 的事件循环、复制属性与名字，并把对象登记进全局链表。
+ *   attr 为 NULL 时用默认属性；name 为 NULL 时用 "Anonymous thread"；
+ *   os_name 为 NULL 时沿用 name（两者都截断到 OS_THREAD_NAMELEN）。
+ * 返回创建好的对象。注意此时线程尚未启动，需再调用 frr_pthread_run。
+ */
 struct frr_pthread *frr_pthread_new(const struct frr_pthread_attr *attr,
 				    const char *name, const char *os_name)
 {
@@ -108,6 +138,10 @@ struct frr_pthread *frr_pthread_new(const struct frr_pthread_attr *attr,
 	return fpt;
 }
 
+/* 真正释放一个 frr_pthread 的全部资源（不涉及全局链表的加锁），供持有
+ * frr_pthread_list_mtx 的调用者使用。会销毁事件循环、各互斥量 / 条件变量
+ * 并释放内存。调用前应确保线程已停止。
+ */
 static void frr_pthread_destroy_nolock(struct frr_pthread *fpt)
 {
 	event_master_free(fpt->master);
@@ -122,6 +156,9 @@ static void frr_pthread_destroy_nolock(struct frr_pthread *fpt)
 	XFREE(MTYPE_FRR_PTHREAD, fpt);
 }
 
+/* 销毁一个 frr_pthread：先从全局链表摘除（加锁），再调用 nolock 版本释放
+ * 资源。调用前必须确保其 pthread 已终止。
+ */
 void frr_pthread_destroy(struct frr_pthread *fpt)
 {
 	frr_with_mutex (&frr_pthread_list_mtx) {
@@ -131,6 +168,9 @@ void frr_pthread_destroy(struct frr_pthread *fpt)
 	frr_pthread_destroy_nolock(fpt);
 }
 
+/* 设置操作系统层面的线程名，按平台选用 pthread_setname_np 或
+ * pthread_set_name_np。返回底层调用的错误码（0 为成功）。
+ */
 int frr_pthread_set_name(struct frr_pthread *fpt)
 {
 	int ret = 0;
@@ -148,6 +188,7 @@ int frr_pthread_set_name(struct frr_pthread *fpt)
 	return ret;
 }
 
+/* 子线程入口处等待父线程放行：在 startup_cond 上循环等待 started 变为真。 */
 /* New pthread waits before running */
 static void frr_pthread_wait_startup(struct frr_pthread *fpt)
 {
@@ -158,6 +199,7 @@ static void frr_pthread_wait_startup(struct frr_pthread *fpt)
 	}
 }
 
+/* 父线程放行子线程：置 started 为真并 signal startup_cond。 */
 /* Parent pthread allows new pthread to start running */
 static void frr_pthread_notify_startup(struct frr_pthread *fpt)
 {
@@ -167,6 +209,9 @@ static void frr_pthread_notify_startup(struct frr_pthread *fpt)
 	}
 }
 
+/* 底层线程入口：先等待父线程放行，再在当前线程注册 RCU 读侧，最后调用
+ * 用户提供的 start 回调并返回其结果。
+ */
 static void *frr_pthread_inner(void *arg)
 {
 	struct frr_pthread *fpt = arg;
@@ -179,6 +224,12 @@ static void *frr_pthread_inner(void *arg)
 	return fpt->attr.start(fpt);
 }
 
+/* 启动底层 pthread 并绑定到该 frr_pthread。步骤：断言确保已在 fork 之后；
+ * 先屏蔽主线程专用信号（子线程会继承掩码，从而不接收这些信号），调用
+ * pthread_create，随后恢复调用者的信号掩码，再放行子线程（notify_startup）。
+ * 若 pthread_create 失败（ret 小于 0），按 pthread_create(3) 语义 fpt->thread
+ * 内容未定义，这里把它清零并撤销 rcu_thread。返回 pthread_create 的错误码。
+ */
 int frr_pthread_run(struct frr_pthread *fpt, const pthread_attr_t *attr)
 {
 	int ret;
@@ -214,6 +265,7 @@ int frr_pthread_run(struct frr_pthread *fpt, const pthread_attr_t *attr)
 	return ret;
 }
 
+/* 阻塞等待目标线程就绪（running 变为真）。通常由创建方在 run 之后调用。 */
 void frr_pthread_wait_running(struct frr_pthread *fpt)
 {
 	frr_with_mutex (fpt->running_cond_mtx) {
@@ -223,6 +275,7 @@ void frr_pthread_wait_running(struct frr_pthread *fpt)
 	}
 }
 
+/* 由子线程在完成初始化后调用：置 running 为真并 signal，唤醒等待者。 */
 void frr_pthread_notify_running(struct frr_pthread *fpt)
 {
 	frr_with_mutex (fpt->running_cond_mtx) {
@@ -231,6 +284,9 @@ void frr_pthread_notify_running(struct frr_pthread *fpt)
 	}
 }
 
+/* 请求停止线程：调用 attr.stop 回调（默认 fpt_halt），随后把 fpt->thread
+ * 清零，返回回调的返回值。result 用于接收线程结果。
+ */
 int frr_pthread_stop(struct frr_pthread *fpt, void **result)
 {
 	frrtrace(1, frr_libfrr, frr_pthread_stop, fpt->name);
@@ -240,6 +296,7 @@ int frr_pthread_stop(struct frr_pthread *fpt, void **result)
 	return ret;
 }
 
+/* 遍历全局链表，停止所有 running 为真的 frr_pthread（持全局锁调用 stop）。 */
 void frr_pthread_stop_all(void)
 {
 	frr_with_mutex (&frr_pthread_list_mtx) {
@@ -253,6 +310,7 @@ void frr_pthread_stop_all(void)
 	}
 }
 
+/* 非受控线程的“伪”入口：仅把 running 置真，不真正跑事件循环。 */
 static void *frr_pthread_attr_non_controlled_start(void *arg)
 {
 	struct frr_pthread *fpt = arg;
@@ -262,6 +320,11 @@ static void *frr_pthread_attr_non_controlled_start(void *arg)
 	return NULL;
 }
 
+/* 为一个由外部库启动、并非 FRR 自建的 pthread 建立 frr_pthread 上下文，
+ * 使其能接入 FRR 的日志 / RCU 机制。会新建 rcu_thread 并立即 start，用伪
+ * 入口构造 fpt，随后直接在当前线程调用 frr_pthread_inner。成功返回 0，
+ * 失败返回 -1。
+ */
 /* Create a FRR pthread context from a non FRR pthread initialized from an
  * external library in order to allow logging */
 int frr_pthread_non_controlled_startup(pthread_t thread, const char *name,
@@ -290,17 +353,24 @@ int frr_pthread_non_controlled_startup(pthread_t thread, const char *name,
 	return 0;
 }
 
+/* 默认事件循环：当 frr_pthread 未自定义 start 时使用。线程入口 fpt_run 会
+ * 运行一个基础事件循环，直到被 fpt_halt 投递的“毒丸”事件结束。
+ */
 /*
  * ----------------------------------------------------------------------------
  * Default Event Loop
  * ----------------------------------------------------------------------------
  */
 
+/* 空任务：仅用于把 sleeper 管道的读端作为 io 源挂进事件循环，防止循环因
+ * 无任何事件而空转 / 退出。
+ */
 /* dummy task for sleeper pipe */
 static void fpt_dummy(struct event *event)
 {
 }
 
+/* 毒丸任务：把 running 置假，使主循环条件不再成立从而退出。 */
 /* poison pill task to end event loop */
 static void fpt_finish(struct event *event)
 {
@@ -309,6 +379,9 @@ static void fpt_finish(struct event *event)
 	atomic_store_explicit(&fpt->running, false, memory_order_relaxed);
 }
 
+/* 默认停止函数：向目标线程的 master 投递毒丸事件，然后 pthread_join 等它
+ * 退出，结果写入 res。由其它线程调用。
+ */
 /* stop function, called from other threads to halt this one */
 static int fpt_halt(struct frr_pthread *fpt, void **res)
 {
@@ -318,6 +391,12 @@ static int fpt_halt(struct frr_pthread *fpt, void **res)
 	return 0;
 }
 
+/* 默认线程入口兼主事件循环。启动时：把 master 的归属线程设为当前 pthread；
+ * 初始化线程局部日志缓冲；创建 sleeper 管道并作为读事件挂入 master（防止
+ * poll 无源可等）；设置本循环不处理信号；设置 OS 线程名；通知 running。
+ * 随后循环：只要 running 为真就 pthread_testcancel 并取出 / 执行一个事件。
+ * 退出后关闭管道、清理线程局部日志缓冲。注意：循环退出不执行任何清理回调。
+ */
 /*
  * Entry pthread function & main event loop.
  *
