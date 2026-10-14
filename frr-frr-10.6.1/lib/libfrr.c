@@ -5,6 +5,26 @@
  * Copyright (C) 2016  David Lamparter for NetDEF, Inc.
  */
 
+/*
+ * 文件导读：libfrr.c —— 守护进程公共启动骨架
+ *
+ * 本文件是 FRR 所有守护进程共享的 main() 模板与运行期基础设施，被每个 daemon 以
+ * FRR_DAEMON_INFO 加少量 hook 的方式复用。它负责：命令行解析、配置文件定位、
+ * 日志与内存初始化、权限与 pid 文件处理、信号安装、zclient 连接、VTY 服务，
+ * 以及主事件循环的进出。
+ *
+ * 结构脉络：
+ *   1. 全局目录变量与各种默认路径（config_default、pidfile_default 等）。
+ *   2. 命令行选项体系：struct optspec 描述一组短选项/长选项/帮助文本，
+ *      opt_extend 逐组累积到 comb_optstr / comb_lo / comb_helpstr 供 getopt 使用。
+ *      选项按功能分为 always / cfg / fullcli / pid / zclient / vty / user 若干组。
+ *   3. frr_preinit / frr_init / frr_config_fork / frr_run 构成的启动流程。
+ *   4. 生命周期 hook（frr_early_init 等到 frr_fini）的定义与触发时机。
+ *   5. 内存统计、pid 文件、信号、VTY 与 zclient 相关辅助函数。
+ *
+ * 阅读建议：先看 libfrr.h 了解对外契约，再从上到下读本文件的启动主干，
+ * 最后结合各 hook 的触发点理解模块如何插入启动流程。
+ */
 #include <zebra.h>
 
 #include <signal.h>
@@ -40,6 +60,8 @@
 
 #include "lib/config_paths.h"
 
+/* 启动/收尾生命周期钩子的定义点：HOOK 是顺序钩子（init 方向），
+ * KOOH 是逆序钩子（fini 方向，与前面的 hook 镜像）。声明见 libfrr.h。 */
 DEFINE_HOOK(frr_early_init, (struct event_loop * tm), (tm));
 DEFINE_HOOK(frr_late_init, (struct event_loop * tm), (tm));
 DEFINE_HOOK(frr_config_pre, (struct event_loop * tm), (tm));
@@ -47,15 +69,20 @@ DEFINE_HOOK(frr_config_post, (struct event_loop * tm), (tm));
 DEFINE_KOOH(frr_early_fini, (), ());
 DEFINE_KOOH(frr_fini, (), ());
 
+/* 编译期确定的标准目录：系统配置目录为常量，运行/状态/模块/脚本目录
+ * 可被 -N 命名空间等运行期方式修改。 */
 const char frr_sysconfdir[] = SYSCONFDIR;
 char frr_runstatedir[256] = FRR_RUNSTATE_PATH;
 char frr_libstatedir[256] = FRR_LIBSTATE_PATH;
 const char frr_moduledir[] = MODULE_PATH;
 const char frr_scriptdir[] = SCRIPT_PATH;
 
+/* 协议名及其带实例名的缓存，默认 NONE，启动时由 daemon 信息填充 */
 char frr_protoname[256] = "NONE";
 char frr_protonameinst[256] = "NONE";
 
+/* 运行时计算出的各默认路径：配置文件、zclient socket、pid 文件、
+ * 可选的 sqlite 数据库文件、VTY 路径，缓冲较大以容纳前缀与命名空间。 */
 char config_default[512];
 char frr_zclientpath[512];
 static char pidfile_default[1024];
@@ -64,26 +91,38 @@ static char dbfile_default[1024];
 #endif
 static char vtypath_default[512];
 
+/* 运行期状态标志：frr_is_after_fork 在 frr_preinit 清除、守护化后重设；
+ * debug_memstats_at_exit 控制退出是否打印内存统计；
+ * nodetach_term / nodetach_daemon 记录 -d -t 相关模式；
+ * startup_fds 保存平滑重启时继承的 fd 位图。 */
 /* cleared in frr_preinit(), then re-set after daemonizing */
 bool frr_is_after_fork = true;
 bool debug_memstats_at_exit = false;
 static bool nodetach_term, nodetach_daemon;
 static uint64_t startup_fds;
 
+/* 命令行选项聚合缓冲：把所有 optspec 组拼成一个短选项串 comb_optstr、
+ * 一个长选项数组 comb_lo、一段合并帮助文本 comb_helpstr；comb_next_lo 是
+ * 往 comb_lo 追加长选项的游标。 */
 static char comb_optstr[256];
 static struct option comb_lo[64];
 static struct option *comb_next_lo = &comb_lo[0];
 static char comb_helpstr[4096];
 
+/* 前向声明：内存统计的初始化与收尾，在下面按需调用 */
 static void frr_memory_init(struct event_loop *loop);
 static void frr_memory_fini(void);
 
+/* 一组命令行选项的描述：短选项串 optstr、帮助文本 helpstr、长选项数组 longopts；
+ * 由 opt_extend 合并进全局选项表。 */
 struct optspec {
 	const char *optstr;
 	const char *helpstr;
 	const struct option *longopts;
 };
 
+/* 把一组选项并入全局选项表：拼接短选项串与帮助文本，逐个复制长选项。
+ * 关键参数：os 待并入的 optspec。副作用：改动 comb_optstr / comb_helpstr / comb_lo。 */
 static void opt_extend(const struct optspec *os)
 {
 	const struct option *lo;
@@ -95,6 +134,8 @@ static void opt_extend(const struct optspec *os)
 }
 
 
+/* 长选项的伪短选项编号（从 1000 起），用于 getopt_long 中区分没有单字符短选项的
+ * 长选项，如 --vty_socket、--log、--limit-fds 等。 */
 #define OPTION_VTYSOCK   1000
 #define OPTION_MODULEDIR 1002
 #define OPTION_LOG       1003
@@ -105,6 +146,8 @@ static void opt_extend(const struct optspec *os)
 #define OPTION_LIMIT_FDS 1008
 #define OPTION_SCRIPTDIR 1009
 
+/* “始终可用”的选项组：帮助、版本、守护化、模块、profile、命名空间(-N)、
+ * VRF、平滑重启、socket 路径、日志、fd 上限等所有守护进程通用选项。 */
 static const struct option lo_always[] = {
 	{ "help", no_argument, NULL, 'h' },
 	{ "version", no_argument, NULL, 'v' },
@@ -152,8 +195,10 @@ static const struct optspec os_always = {
 	lo_always
 };
 
+/* 是否把日志输出到标准输出（由 --log stdout 设定） */
 static bool logging_to_stdout = false; /* set when --log stdout specified */
 
+/* 配置相关选项组：-f 指定配置文件、-C 只做配置校验(dryrun) 后退出 */
 static const struct option lo_cfg[] = {
 	{"config_file", required_argument, NULL, 'f'},
 	{"dryrun", no_argument, NULL, 'C'},
@@ -165,6 +210,8 @@ static const struct optspec os_cfg = {
 	lo_cfg};
 
 
+/* 完整 CLI 相关选项组：-t 在标准输入输出上开终端会话、--tcli 使用事务型 CLI、
+ * 可选 --db_file 指定 sqlite 数据库 */
 static const struct option lo_fullcli[] = {
 	{"terminal", no_argument, NULL, 't'},
 	{"tcli", no_argument, NULL, OPTION_TCLI},
@@ -180,6 +227,7 @@ static const struct optspec os_fullcli = {
 	lo_fullcli};
 
 
+/* pid 文件选项组：-i 指定进程标识文件路径 */
 static const struct option lo_pid[] = {
 	{"pid_file", required_argument, NULL, 'i'},
 	{NULL}};
@@ -189,6 +237,7 @@ static const struct optspec os_pid = {
 	lo_pid};
 
 
+/* zclient 选项组：-z 指定 zebra socket 路径 */
 static const struct option lo_zclient[] = {
 	{"socket", required_argument, NULL, 'z'},
 	{NULL}};
@@ -196,6 +245,7 @@ static const struct optspec os_zclient = {
 	"z:", "  -z, --socket       Set path of zebra socket\n", lo_zclient};
 
 
+/* VTY 选项组：-A 绑定地址、-P 端口 */
 static const struct option lo_vty[] = {
 	{"vty_addr", required_argument, NULL, 'A'},
 	{"vty_port", required_argument, NULL, 'P'},
@@ -207,6 +257,7 @@ static const struct optspec os_vty = {
 	lo_vty};
 
 
+/* 权限选项组：-u 运行用户、-g 运行组（需要 privs 支持） */
 static const struct option lo_user[] = {{"user", required_argument, NULL, 'u'},
 					{"group", required_argument, NULL, 'g'},
 					{NULL}};
@@ -215,6 +266,12 @@ static const struct optspec os_user = {"u:g:",
 				       "  -g, --group        Group to run as\n",
 				       lo_user};
 
+/* 把 zclient 连接地址解析进 sockaddr_storage，返回是否成功。
+ * 关键参数：sa 输出地址、sa_len 输出长度、path 路径（为 NULL 时用默认 frr_zclientpath）。
+ * 逻辑：若 path 以 ZAPI_TCP_PATHNAME 前缀开头则解析 TCP 形式（可带 4/6 与端口），
+ *       但该分支被下面的 #if 1 强制禁用——TCP zapi 存在安全隐患，仅作开发调试用；
+ *       否则按 Unix 域 socket（AF_UNIX）填充 sun_path。
+ * 坑：TCP 路径即使解析成功也返回 false，调用者需注意。 */
 bool frr_zclient_addr(struct sockaddr_storage *sa, socklen_t *sa_len,
 		      const char *path)
 {
@@ -326,8 +383,15 @@ bool frr_zclient_addr(struct sockaddr_storage *sa, socklen_t *sa_len,
 	return true;
 }
 
+/* 指向当前守护进程的信息结构（由 frr_preinit 传入），全文件共享的单例 */
 static struct frr_daemon_info *di = NULL;
 
+/* 启动第一步：在正式解析命令行前保存 daemon 信息并做基础初始化。
+ * 关键动作：记录 di、清除 frr_is_after_fork、从 argv[0] 取程序名、按是否 profiling 设置 umask、
+ *   初始化早期日志参数、按 flags 组合要启用的选项组、计算 config/pid/zclient/db 默认路径、
+ *   设置协议名与 CLI 模式默认值，并扫描记录启动时已打开的 fd（startup_fds）。
+ * 关键参数：daemon 守护进程信息、argc/argv 命令行。
+ * 坑：必须在使用 frr_getopt 之前调用；它会改动全局默认路径缓冲。 */
 void frr_preinit(struct frr_daemon_info *daemon, int argc, char **argv)
 {
 	di = daemon;
@@ -402,11 +466,15 @@ void frr_preinit(struct frr_daemon_info *daemon, int argc, char **argv)
 	systemd_init_env();
 }
 
+/* 判断 fd 是否为进程启动时就已打开的 fd（记录在 startup_fds 位图里）。
+ * 用于区分“本进程自己该管的 fd”和“继承来的 fd”，避免误用（如往 BGP 会话 fd 写日志）。 */
 bool frr_is_startup_fd(int fd)
 {
 	return !!(startup_fds & (UINT64_C(0x1) << (uint64_t)fd));
 }
 
+/* 供守护进程在解析前追加自定义选项：构造一个临时 optspec 并并入全局选项表。
+ * 关键参数：optstr 短选项串、longopts 长选项数组、helpstr 帮助文本。 */
 void frr_opt_add(const char *optstr, const struct option *longopts,
 		 const char *helpstr)
 {
@@ -414,6 +482,8 @@ void frr_opt_add(const char *optstr, const struct option *longopts,
 	opt_extend(&main_opts);
 }
 
+/* 打印用法与帮助后退出（不返回）。status 非 0 时先向 stderr 打印 Invalid options.。
+ * 优先用 di->printhelp，否则用 proghelp / copyright / comb_helpstr 拼出用法信息。 */
 void frr_help_exit(int status)
 {
 	FILE *target = status ? stderr : stdout;
@@ -431,14 +501,21 @@ void frr_help_exit(int status)
 	exit(status);
 }
 
+/* 模块选项 -M 的链表节点：把每个 -M 指定的模块名按出现顺序串起来。 */
 struct option_chain {
 	struct option_chain *next;
 	const char *arg;
 };
 
+/* modules 链表头与尾部插入游标 modnext；errors 累计命令行解析中的错误次数。 */
 static struct option_chain *modules = NULL, **modnext = &modules;
 static int errors = 0;
 
+/* getopt 的分发函数：处理每个已解析选项（由 frr_getopt 在循环中调用）。
+ * 覆盖 -h/-v/-d/-M/-F/-i/-f/-N/-w/-o/-K/-C/-t/-z/-A/-P 以及 --vty_socket、
+ * --moduledir、--scriptdir、--db_file 等长选项，设置 di 中对应字段。
+ * 返回：0 表示继续；返回 1 表示该选项被 flags 禁用，应视为“不支持”交上层处理。
+ * 坑：很多选项在对应 FRR_NO_* 标志置位时直接返回 1；重复指定某些选项会 errors++。 */
 static int frr_opt(int opt)
 {
 	static int vty_port_set = 0;
@@ -660,6 +737,10 @@ static int frr_opt(int opt)
 	return 0;
 }
 
+/* 命令行解析循环：先用 comb_next_lo->name=NULL 给长选项数组收尾，再反复调
+ * getopt_long 并分发给 frr_opt；遇到 frr_opt 返回非 0 或解析结束(-1) 时退出循环。
+ * 返回：最后得到的选项码（-1 表示解析结束）；若结束时有解析错误则调用 frr_help_exit(1)。
+ * 副作用：*longindex 传出命中的长选项下标。 */
 int frr_getopt(int argc, char *const argv[], int *longindex)
 {
 	int opt;
@@ -680,6 +761,10 @@ int frr_getopt(int argc, char *const argv[], int *longindex)
 	return opt;
 }
 
+/* 创建目录并按 frrvty 组的需求设置权限与属主。
+ * 关键参数：path 目录路径；strip 为 true 时只创建其父目录（去掉最后一段）。
+ * 做法：临时 umask(0022) 后 mkdir 0755，再 chown 给 zprivs 中的普通用户/组。
+ * 坑：目录已存在(EEXIST)时直接返回以保留用户自定义权限；失败只记日志不中断。 */
 static void frr_mkdir(const char *path, bool strip)
 {
 	char buf[256];
@@ -725,6 +810,7 @@ static void frr_mkdir(const char *path, bool strip)
 			 strerror(errno));
 }
 
+/* 模块加载器用的错误输出回调：cookie 是前缀字符串，把“前缀: 错误信息”打到 stderr */
 static void _err_print(const void *cookie, const char *errstr)
 {
 	const char *prefix = (const char *)cookie;
@@ -732,7 +818,14 @@ static void _err_print(const void *cookie, const char *errstr)
 	fprintf(stderr, "%s: %s\n", prefix, errstr);
 }
 
+/* 全局主事件循环指针，由 frr_init 创建、frr_run 使用 */
 static struct event_loop *master;
+/* 守护进程初始化的核心：在 frr_preinit/frr_getopt 之后调用，返回主事件循环 master。
+ * 主要步骤：设置随机种子、应用默认配置(profile)、按实例与命名空间重算 config/pid/db 路径、
+ *   初始化 privs 与日志（消费早期日志目标）、解析 zclient 地址、按需 mkdir 各运行目录、
+ *   加载命令行 -M 指定的模块、初始化 privs 与事件循环、安装信号、触发 frr_early_init 钩子，
+ *   再初始化 CLI/VTY/调试/线程/脚本/日志引用/北向接口(northbound) 与内存统计。
+ * 返回：主事件循环指针。坑：多处直接 exit(1) 而非返回错误；调用顺序对外部模块有约束。 */
 struct event_loop *frr_init(void)
 {
 	struct option_chain *oc;
@@ -856,29 +949,42 @@ struct event_loop *frr_init(void)
 	return master;
 }
 
+/* 返回当前进程程序名；di 未初始化时返回 NULL */
 const char *frr_get_progname(void)
 {
 	return di ? di->progname : NULL;
 }
 
+/* 返回当前 CLI 模式；di 未初始化时默认 CLASSIC */
 enum frr_cli_mode frr_get_cli_mode(void)
 {
 	return di ? di->cli_mode : FRR_CLI_CLASSIC;
 }
 
+/* 返回 select/poll 使用的 fd 上限（来自 --limit-fds）；未设置时为 0 */
 uint32_t frr_get_fd_limit(void)
 {
 	return di ? di->limit_fds : 0;
 }
 
+/* 记录最近收到的信号编号，供 frr_daemon_wait 的信号循环判断 */
 static int rcvd_signal = 0;
 
+/* 信号处理函数：仅把信号编号存入 rcvd_signal。poll 被信号中断后由主循环读取处理，
+ * 因此这里不做任何复杂动作（信号处理中应尽量可重入、低风险）。 */
 static void rcv_signal(int signum)
 {
 	rcvd_signal = signum;
 	/* poll() is interrupted by the signal; handled below */
 }
 
+/* 父进程在守护化后等待子进程进入主循环的“握手”等待函数（FRR_NORETURN，必然退出）。
+ * 做法：屏蔽并捕获 SIGTSTP/SIGQUIT/SIGINT，用 poll/ppoll 等监听与子进程的 socketpair；
+ *   收到 TSTP 时把终端挂起信号转发给子进程并等待其就绪、收到 INT/QUIT 时转发字符；
+ *   子进程成功进入主循环并关闭 socket 后，父进程收到可读事件并退出(0)；
+ *   若子进程启动失败则打印错误并 exit(1)。
+ * 关键参数：fd 为与子进程通信的父端 socket。
+ * 坑：无 ppoll/pollts 时退化为“有竞态”的 poll 加 sigprocmask 实现（仅用于老系统）。 */
 static FRR_NORETURN void frr_daemon_wait(int fd)
 {
 	struct pollfd pfd[1];
@@ -967,8 +1073,11 @@ static FRR_NORETURN void frr_daemon_wait(int fd)
 	exit(1);
 }
 
+/* 子进程侧保存的守护化控制 socket（-1 表示无）；frr_check_detach 会按需关闭它 */
 static int daemon_ctl_sock = -1;
 
+/* 把当前进程守护化：建一对 socketpair，fork 出子进程；子进程 setsid 成为会话首进程，
+ * 保存控制 socket 后返回继续启动；父进程关闭子端并进入 frr_daemon_wait 等待握手。 */
 static void frr_daemonize(void)
 {
 	int fds[2];
@@ -1002,6 +1111,11 @@ static void frr_daemonize(void)
 	frr_daemon_wait(fds[0]);
 }
 
+/* 读取配置文件的回调（作为事件在事件循环启动后执行），并触发 config_pre/post 钩子。
+ * 做法：先 hook_call(frr_config_pre)；读主配置（失败则尝试 backup_config_file 并恢复原配置）；
+ *   事务型 CLI 下自动提交候选配置；最后 hook_call(frr_config_post)。
+ * 参数：t 为事件对象（此处不用其内容）。
+ * 坑：放在事件循环里执行是为了让集成配置(integrated config)与非集成配置的时序一致。 */
 /*
  * Why is this a thread?
  *
@@ -1051,6 +1165,10 @@ static void frr_config_read_in(struct event *t)
 	hook_call(frr_config_post, master);
 }
 
+/* 完成“读配置 + 守护化 + 写 pid”的启动切换。
+ * 步骤：hook_call(frr_late_init)；非 SPLIT_CONFIG 时（dryrun 则立即读配置并退出，
+ *   否则安排 frr_config_read_in 事件）；守护模式或终端模式下调用 frr_daemonize；
+ *   置 frr_is_after_fork；补默认 pid 文件并写 pid；初始化 zlog 线程缓冲。 */
 void frr_config_fork(void)
 {
 	hook_call(frr_late_init, master);
@@ -1077,6 +1195,8 @@ void frr_config_fork(void)
 	zlog_tls_buffer_init();
 }
 
+/* 按需释放守护化控制 socket：若处于“保持附着”(nodetach_term/nodetach_daemon) 状态则不动，
+ * 否则关闭并置 -1，表示不再需要与父进程的握手通道。 */
 static void frr_check_detach(void)
 {
 	if (nodetach_term || nodetach_daemon)
@@ -1087,6 +1207,8 @@ static void frr_check_detach(void)
 	daemon_ctl_sock = -1;
 }
 
+/* 启动 VTY 服务：在 Unix socket（或可选 TCP）上监听，供 vtysh 等连接。
+ * 关键参数：check_detach 为真时先调用 frr_check_detach 处理守护化控制 socket。 */
 void frr_vty_serv_start(bool check_detach)
 {
 	/* allow explicit override of vty_path in the future
@@ -1115,6 +1237,7 @@ void frr_vty_serv_start(bool check_detach)
 		frr_check_detach();
 }
 
+/* 停止 VTY 服务：调用 vty_serv_stop 关闭监听，并删除对应的 vty socket 文件 */
 void frr_vty_serv_stop(void)
 {
 	vty_serv_stop();
@@ -1123,6 +1246,10 @@ void frr_vty_serv_stop(void)
 		unlink(di->vty_path);
 }
 
+/* 终端会话(-t)结束时的回调。若未开启守护模式或 isexit 为真，则打印退出信息并（非主动退出时）
+ * 触发 SIGINT；否则打印 daemonizing 并把 tty 上的 stdin/stdout/stderr 重定向到 /dev/null
+ * （当 stdio 是 tty 且 stdout 未被 --log stdout 占用时）。
+ * 关键参数：isexit 表示是否为正常退出路径。 */
 static void frr_terminal_close(int isexit)
 {
 	int nullfd;
@@ -1159,8 +1286,12 @@ static void frr_terminal_close(int isexit)
 	}
 }
 
+/* 守护化控制 socket 的可读事件对象（在 frr_run 里注册），保存以便管理 */
 static struct event *daemon_ctl_thread = NULL;
 
+/* 处理来自父进程(守护化握手 socket)的控制字节：S=挂起(SIGTSTP)、R=恢复、I=SIGINT 退出、
+ * Q=SIGQUIT 关闭终端。处理完重新注册可读事件，保持持续监听（goto out 亦重新注册）。
+ * 关键参数：t 为事件对象（此处未用）。 */
 static void frr_daemon_ctl(struct event *t)
 {
 	char buf[1];
@@ -1197,12 +1328,18 @@ out:
 		       &daemon_ctl_thread);
 }
 
+/* 与 FRR_DETACH_LATER 配套：清除 nodetach_daemon 并释放守护化控制 socket，正式与父进程分离 */
 void frr_detach(void)
 {
 	nodetach_daemon = false;
 	frr_check_detach();
 }
 
+/* 进入主事件循环，是守护进程启动的最后一步（通常配置已就绪）。
+ * 步骤：非 MANUAL_VTY_START 时启动 VTY 服务；打印启动日志；终端模式下开 vty_stdio 并监听
+ *   守护化控制 socket，守护模式下把 tty 重定向到 /dev/null 并释放控制 socket；
+ *   结束启动期日志后进入 event_fetch/event_call 循环，直到进程退出。
+ * 关键参数：loop 主事件循环（即 frr_init 返回的 master）。 */
 void frr_run(struct event_loop *loop)
 {
 	char instanceinfo[64] = "";
@@ -1258,11 +1395,17 @@ void frr_run(struct event_loop *loop)
 		event_call(&thread);
 }
 
+/* 触发 frr_early_fini 逆序钩子：在协议守护进程自身关闭之前执行 */
 void frr_early_fini(void)
 {
 	hook_call(frr_early_fini);
 }
 
+/* 进程收尾：触发 frr_fini 钩子，然后依次拆掉内存统计、VTY、命令行、北向接口、YANG、
+ * 可选数据库、日志引用、脚本、线程、privs、信号、主事件循环与日志线程缓冲，
+ * 最后（按开关）打印内存统计。
+ * 坑：zlog_fini 被刻意放在 if (0) 中禁用，让 zlog 一直存活到 exit()，代价是内存泄漏，
+ *   这些泄漏由 DEFINE_MGROUP_ACTIVEATEXIT 标记并在退出统计中排除。 */
 void frr_fini(void)
 {
 	hook_call(frr_fini);
@@ -1311,6 +1454,9 @@ void frr_fini(void)
 	zlog_tmpdir_fini();
 }
 
+/* 从磁盘加载守护进程状态 JSON：按 di->state_paths 顺序尝试，返回第一个成功读到的对象。
+ * 返回：解析出的 json 对象；若无任何文件命中则返回空对象。
+ * 坑：di->state_paths 未配置时会 assert 失败；返回对象由调用者释放。 */
 struct json_object *frr_daemon_state_load(void)
 {
 	struct json_object *state;
@@ -1328,6 +1474,10 @@ struct json_object *frr_daemon_state_load(void)
 	return json_object_new_object();
 }
 
+/* 把守护进程状态 JSON 写入磁盘（原子写：先写临时文件再改名）。
+ * 关键参数：statep 指向状态 json 对象的指针（保存后可能被释放或置空）。
+ * 坑：写文件的思路与 command.c 的 file_write_config 类似但不同
+ *   （此处用唯一临时名并保留旧配置备份）。 */
 /* cross-reference file_write_config() in command.c
  * the code there is similar but not identical (configs use a unique temporary
  * name for writing and keep a backup of the previous config.)
@@ -1470,6 +1620,9 @@ out_closedir_free:
 static const char interp[]
 	__attribute__((section(".interp"), used)) = INTERP;
 #endif
+/* libfrr.so 的“可执行入口”：打印 FRR 全名、版本、版权、git 信息与编译配置，然后 _exit(0)。
+ * 关键：此入口跳过 libc 初始化，因此只能调用极少数函数（这里只用 write 与 _exit）。
+ * 用途：让 libfrr.so 也能被直接执行以查看版本。 */
 /*
  * executable entry point for libfrr.so
  *
@@ -1491,6 +1644,7 @@ void _libfrr_version(void)
 	_exit(0);
 }
 
+/* 把打包版本号渲染成 主.次.修订 形式写入 buf（长度 buflen），返回 buf */
 /* Render simple version tuple to string */
 const char *frr_vers2str(uint32_t version, char *buf, int buflen)
 {
@@ -1500,6 +1654,7 @@ const char *frr_vers2str(uint32_t version, char *buf, int buflen)
 	return buf;
 }
 
+/* 判断当前是否已作为守护进程初始化（di 非空即视为是） */
 bool frr_is_daemon(void)
 {
 	if (di)
@@ -1508,12 +1663,14 @@ bool frr_is_daemon(void)
 	return false;
 }
 
+/* 先刷新 zlog 的线程缓冲再退出（FRR_NORETURN，不返回），status 为退出码 */
 FRR_NORETURN void frr_exit_with_buffer_flush(int status)
 {
 	zlog_tls_buffer_flush();
 	exit(status);
 }
 
+/* tcmalloc 归还空闲内存的专有代码：用周期定时器把 tcmalloc 缓存的空闲页还给操作系统 */
 /*
  * Special code for tcmalloc mem lib, releasing free mem back to the OS.
  */
@@ -1521,10 +1678,12 @@ static struct event *t_mem_release_event;
 
 #ifdef HAVE_TCMALLOC
 
+/* tcmalloc 归还内存的相关常量：默认速率 1 MB/秒、触发阈值约 20MB、检查周期 10 秒 */
 #define FRR_MEM_RELEASE_MB_DEFAULT 1 /* In MB/sec */
 #define FRR_MEM_RELEASE_THRESHOLD  20 * 1024 * 1024
 #define FRR_MEM_RELEASE_TIMEOUT    10 /* Seconds */
 
+/* 运行期可调的 tcmalloc 归还速率(MB/秒)与检查周期(秒) */
 static uint32_t mem_release_mb = FRR_MEM_RELEASE_MB_DEFAULT;
 static uint32_t mem_release_timeout = FRR_MEM_RELEASE_TIMEOUT;
 
@@ -1532,6 +1691,8 @@ static uint32_t mem_release_timeout = FRR_MEM_RELEASE_TIMEOUT;
 #include "gperftools/malloc_extension_c.h"
 
 /* Timer handler to release free mem */
+/* tcmalloc 定时回调：重新安排下一次触发；读取 pageheap 空闲字节，若超过阈值则按速率
+ * 释放一部分内存归还系统。关键参数：event 定时事件对象。 */
 static void tcmalloc_timer(struct event *event)
 {
 	size_t release, sval;
@@ -1552,6 +1713,8 @@ static void tcmalloc_timer(struct event *event)
 	}
 }
 
+/* 处理内存归还速率配置变更：速率变化时取消旧定时器；速率为正则按新速率重新安排。
+ * 关键参数：rate 期望速率(MB/秒)。 */
 /* Handle config changes */
 void frr_mem_release_config(uint32_t rate)
 {
@@ -1565,6 +1728,8 @@ void frr_mem_release_config(uint32_t rate)
 				&t_mem_release_event);
 }
 
+/* tcmalloc 库初始化钩子：若速率被禁用则直接返回，否则安排周期性的 tcmalloc_timer。
+ * 返回 0 表示成功。关键参数：loop 事件循环。 */
 static int frr_tcmalloc_lib_init(struct event_loop *loop)
 {
 	/* Using tcmalloc memory-release functions: configure periodic
@@ -1582,6 +1747,7 @@ static int frr_tcmalloc_lib_init(struct event_loop *loop)
 }
 
 #else
+/* tcmalloc 未启用时的空实现：速率配置被忽略。 */
 /* No-op */
 void frr_mem_release_config(uint32_t rate)
 {
@@ -1590,6 +1756,7 @@ void frr_mem_release_config(uint32_t rate)
 
 #endif /* HAVE_TCMALLOC */
 
+/* 初始化与平台相关的内存功能：启用 tcmalloc 时注册 frr_config_post 回调以启动归还定时器。 */
 /* Init memory-related functions for some platforms */
 static void frr_memory_init(struct event_loop *loop)
 {
@@ -1599,6 +1766,7 @@ static void frr_memory_init(struct event_loop *loop)
 #endif
 }
 
+/* 收尾与平台相关的内存功能：取消 tcmalloc 归还定时器（未启用时该事件为空，无害）。 */
 /* De-init memory-related functions for some platforms */
 static void frr_memory_fini(void)
 {
