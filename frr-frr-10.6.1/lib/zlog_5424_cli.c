@@ -3,6 +3,25 @@
  * Copyright (C) 2021  David Lamparter for NetDEF, Inc.
  */
 
+/*
+ * 文件导读（zlog_5424_cli.c）
+ *
+ * zlog_5424 目标的 VTY 配置命令实现，也就是用户在 CLI 下配置"扩展 syslog"
+ * 目标（log extended-syslog NAME ...）的地方。它把用户输入解析成一个
+ * struct zlog_cfg_5424_user 对象（内含 struct zlog_cfg_5424 配置），最终通过
+ * zlog_5424_apply_meta / zlog_5424_apply_dst 生效。
+ *
+ * 结构：
+ *  - 用一棵按名字索引的红黑树 targets 管理所有已定义的目标。
+ *  - ENTER 节点 EXTLOG_NODE 下的子命令（destination file / fifo / unix / fd、
+ *    facility、format 等）逐项修改当前目标配置。
+ *  - "延迟应用"机制：配置块内的改动只置 reconf_dst / reconf_meta 标记，待退出
+ *    该配置块（或读取文件结束）时统一 apply，避免半成品配置生效。
+ *  - unix_special 处理特例：/dev/log 自动按 local 格式、journald 套接字自动按
+ *    journald 格式。
+ *
+ * 命令对象由 clippy 生成的 zlog_5424_cli_clippy.c 提供解析支持。
+ */
 #include "zebra.h"
 #include "zlog_5424.h"
 
@@ -14,24 +33,36 @@
 #include "lib/libfrr.h"
 #include "lib/log_vty.h"
 
+/* 定义本文件私有的内存类型：目标配置对象与其内部字符串数据的内存统计 */
 DEFINE_MTYPE_STATIC(LOG, LOG_5424_CONFIG, "extended syslog config");
 DEFINE_MTYPE_STATIC(LOG, LOG_5424_DATA, "extended syslog config items");
 
+/* 红黑树的排序比较函数：按目标名字典序比较，供 targets 唯一树使用 */
 static int target_cmp(const struct zlog_cfg_5424_user *a,
 		      const struct zlog_cfg_5424_user *b)
 {
 	return strcmp(a->name, b->name);
 }
 
+/* 声明按唯一键（名字）组织的红黑树类型 targets，元素为 zlog_cfg_5424_user */
 DECLARE_RBTREE_UNIQ(targets, struct zlog_cfg_5424_user, targets_item,
 		    target_cmp);
+/* 实例化 zlog_cfg_5424_user 的 QObject 类型 */
 DEFINE_QOBJ_TYPE(zlog_cfg_5424_user);
 
+/* 全局：所有已定义的 5424 目标树，以及它们共享的事件循环 master
+ * （套接字重连等异步操作需要它） */
 static struct targets_head targets = INIT_RBTREE_UNIQ(targets);
 static struct event_loop *log_5424_master;
 
+/* 前向声明：清空目标的"目的地"相关配置（定义在下方） */
 static void clear_dst(struct zlog_cfg_5424_user *cfg);
 
+/*
+ * 一个"布尔型日志选项"的描述：name 是 CLI 关键字，offs 是它在
+ * struct zlog_cfg_5424 中的字节偏移，dflt 是其默认值。
+ * 用偏移表统一处理这些开关，避免为每个开关写一份重复代码。
+ */
 struct log_option {
 	const char *name;
 	ptrdiff_t offs;
@@ -39,6 +70,8 @@ struct log_option {
 };
 
 /* clang-format off */
+/* 布尔日志选项表：code-location、version、unique-id、error-category、
+ * format-args；其中 unique-id 与 error-category 默认开启。以 name==NULL 结尾 */
 static struct log_option log_opts[] = {
 	{ "code-location",	offsetof(struct zlog_cfg_5424, kw_location) },
 	{ "version",		offsetof(struct zlog_cfg_5424, kw_version) },
@@ -48,17 +81,30 @@ static struct log_option log_opts[] = {
 	{},
 };
 
+/* 新目标默认值：时间戳标志（6 位子秒 + UTC）、facility 取 LOG_DAEMON、
+ * 最低级别取 LOG_DEBUG */
 #define DFLT_TS_FLAGS		(6 | ZLOG_TS_UTC)
 #define DFLT_FACILITY		LOG_DAEMON
 #define DFLT_PRIO_MIN		LOG_DEBUG
 /* clang-format on */
 
+/*
+ * Unix 目的地的特殊情形标记：NONE 普通；SYSLOG 表示连的是 /dev/log 这类本地
+ * syslogd 套接字（自动放宽为 local 格式）；JOURNALD 表示连的是 systemd
+ * journald 套接字（自动切到 journald 格式）。
+ */
 enum unix_special {
 	SPECIAL_NONE = 0,
 	SPECIAL_SYSLOG,
 	SPECIAL_JOURNALD,
 };
 
+/*
+ * 分配并初始化一个新的 5424 目标：分配对象、拷贝名字、填入默认配置（master、
+ * kw_location、facility、prio_min、ts_flags），清空目的地，按 log_opts 表设置
+ * 各布尔默认值，初始化其互斥锁；最后注册 QObject 并挂进 targets 树。返回新
+ * 对象。
+ */
 static struct zlog_cfg_5424_user *log_5424_alloc(const char *name)
 {
 	struct zlog_cfg_5424_user *cfg;
@@ -86,6 +132,10 @@ static struct zlog_cfg_5424_user *log_5424_alloc(const char *name)
 	return cfg;
 }
 
+/*
+ * 释放一个 5424 目标：从 targets 树与 QObject 注销，结束其配置（keepopen 透传
+ * 给 zlog_5424_fini），清空目的地，再释放各字符串与对象本身。
+ */
 static void log_5424_free(struct zlog_cfg_5424_user *cfg, bool keepopen)
 {
 	targets_del(&targets, cfg);
@@ -99,6 +149,11 @@ static void log_5424_free(struct zlog_cfg_5424_user *cfg, bool keepopen)
 	XFREE(MTYPE_LOG_5424_CONFIG, cfg);
 }
 
+/*
+ * 清空目标的"目的地"配置：释放 filename（并同步 cfg.filename 指针）、
+ * file_user/file_group/envvar；把 fd/uid/gid 复位为 -1，权限复位为
+ * LOGFILE_MASK & 0666，file_nocreate 置 false，dst 置 NONE。
+ */
 static void clear_dst(struct zlog_cfg_5424_user *cfg)
 {
 	XFREE(MTYPE_LOG_5424_DATA, cfg->filename);
@@ -116,6 +171,10 @@ static void clear_dst(struct zlog_cfg_5424_user *cfg)
 	cfg->cfg.dst = ZLOG_5424_DST_NONE;
 }
 
+/*
+ * 标记"目的地需要重新应用"。首次标记且非读文件时会提示用户改动将在退出配置
+ * 块时生效（避免连续刷屏）。返回 CMD_SUCCESS。
+ */
 static int reconf_dst(struct zlog_cfg_5424_user *cfg, struct vty *vty)
 {
 	if (!cfg->reconf_dst && !cfg->reconf_meta && vty->type != VTY_FILE)
@@ -126,6 +185,7 @@ static int reconf_dst(struct zlog_cfg_5424_user *cfg, struct vty *vty)
 	return CMD_SUCCESS;
 }
 
+/* 标记"元数据需要重新应用"。提示逻辑同 reconf_dst。返回 CMD_SUCCESS。 */
 static int reconf_meta(struct zlog_cfg_5424_user *cfg, struct vty *vty)
 {
 	if (!cfg->reconf_dst && !cfg->reconf_meta && vty->type != VTY_FILE)
@@ -136,6 +196,10 @@ static int reconf_meta(struct zlog_cfg_5424_user *cfg, struct vty *vty)
 	return CMD_SUCCESS;
 }
 
+/*
+ * 清除目的地（若本就没有目的地则直接成功）：先 clear_dst 再按 reconf_dst
+ * 标记待应用，供 "no destination ..." 命令使用。
+ */
 static int reconf_clear_dst(struct zlog_cfg_5424_user *cfg, struct vty *vty)
 {
 	if (cfg->cfg.dst == ZLOG_5424_DST_NONE)
@@ -145,8 +209,14 @@ static int reconf_clear_dst(struct zlog_cfg_5424_user *cfg, struct vty *vty)
 	return reconf_dst(cfg, vty);
 }
 
+/* 引入 clippy 为本文件命令生成的解析代码 */
 #include "lib/zlog_5424_cli_clippy.c"
 
+/*
+ * CLI 命令 "log extended-syslog EXTLOGNAME"：进入某个具名 5424 目标的配置
+ * 上下文。若同名目标已存在则复用，否则新建；随后把该对象压入 VTY 上下文栈
+ * （节点 EXTLOG_NODE），后续子命令通过 VTY_DECLVAR_CONTEXT 取到它。
+ */
 DEFPY_NOSH(log_5424_target,
 	   log_5424_target_cmd,
 	   "log extended-syslog EXTLOGNAME",
@@ -166,6 +236,8 @@ DEFPY_NOSH(log_5424_target,
 	return CMD_SUCCESS;
 }
 
+/* CLI 命令 "no log extended-syslog EXTLOGNAME"：删除具名 5424 目标；找不到则
+ * 告警。删除时 keepopen=false，即真正关闭目标。 */
 DEFPY(no_log_5424_target,
       no_log_5424_target_cmd,
       "no log extended-syslog EXTLOGNAME",
@@ -190,6 +262,8 @@ DEFPY(no_log_5424_target,
 }
 
 /*    "format <rfc3164|rfc5424|local-syslogd|journald>$fmt" */
+/* format 子命令四个可选值的帮助文本（RFC3164 / RFC5424 / local-syslogd /
+ * journald），被多条命令复用 */
 #define FORMAT_HELP                                                            \
 	"Select log message formatting\n"                                      \
 	"RFC3164 (legacy) syslog\n"                                            \
@@ -198,6 +272,10 @@ DEFPY(no_log_5424_target,
 	"journald (systemd log) native format\n"                               \
 	/* end */
 
+/*
+ * 把 format 关键字字符串转成枚举值：rfc5424 / rfc3164 / local-syslogd /
+ * journald；fmt 为空或无法识别时返回默认值 dflt。
+ */
 static enum zlog_5424_format log_5424_fmt(const char *fmt,
 					  enum zlog_5424_format dflt)
 {
@@ -215,6 +293,12 @@ static enum zlog_5424_format log_5424_fmt(const char *fmt,
 	return dflt;
 }
 
+/*
+ * CLI 命令 "[no] destination file PATH [create ... |no-create] [format ...]"：
+ * 把日志写到普通文件。create 选项可指定创建时的属主 / 属组 / 权限，或
+ * no-create 表示不创建；no 前缀表示清除该目的地。
+ * 命令体校验权限八进制值等，并通过 VTY_DECLVAR_CONTEXT 直接操作当前目标对象。
+ */
 DEFPY(log_5424_destination_file,
       log_5424_destination_file_cmd,
       "[no] destination file$type PATH "
@@ -345,6 +429,11 @@ DEFPY(log_5424_destination_file,
  * would need to be reopened when the process at the other end restarts.  None
  * of this is handled - use at your own caution.  It's _HIDDEN for a purpose.
  */
+/*
+ * "destination fifo" 命令：与 destination file 共用同一处理函数，仅把类型换成
+ * fifo。FIFO 面向老的 /dev/log 实现，不推荐使用（日志调用可能意外阻塞、对端
+ * 重启后 fd 需重开等，均未处理），故用 _HIDDEN 隐藏（需输入完整关键字）。
+ */
 ALIAS_HIDDEN(log_5424_destination_file,
 	     log_5424_destination_fifo_cmd,
       "[no] destination fifo$type PATH "
@@ -365,6 +454,11 @@ ALIAS_HIDDEN(log_5424_destination_file,
       "Do not create file if it does not exist\n"
       FORMAT_HELP)
 
+/*
+ * 通用 Unix 套接字目的地设置：no 前缀清除目的地；否则记录 unix_special 标记、
+ * 若配置未变则直接成功；否则清空并设置 filename / dst / fmt，并初始化套接字
+ * 重连退避（初始 25ms，上限 10000ms），最后标记待应用。
+ */
 static int dst_unix(struct vty *vty, const char *no, const char *path,
 		    enum zlog_5424_format fmt, enum unix_special special)
 {
@@ -393,6 +487,8 @@ static int dst_unix(struct vty *vty, const char *no, const char *path,
 	return reconf_dst(cfg, vty);
 }
 
+/* CLI 命令 "[no] destination unix PATH [format ...]"：把日志写到指定 Unix
+ * 套接字路径。解析 format 后交给 dst_unix，special 为 SPECIAL_NONE。 */
 DEFPY(log_5424_destination_unix,
       log_5424_destination_unix_cmd,
       "[no] destination unix PATH "
@@ -409,6 +505,8 @@ DEFPY(log_5424_destination_unix,
 	return dst_unix(vty, no, path, fmtv, SPECIAL_NONE);
 }
 
+/* CLI 命令 "[no] destination journald"：直连 systemd journald 套接字
+ * (/run/systemd/journal/socket)，固定 journald 格式，special 为 SPECIAL_JOURNALD。 */
 DEFPY(log_5424_destination_journald,
       log_5424_destination_journald_cmd,
       "[no] destination journald",
@@ -420,6 +518,8 @@ DEFPY(log_5424_destination_journald,
 			ZLOG_FMT_JOURNALD, SPECIAL_JOURNALD);
 }
 
+/* /dev/log 的默认格式按平台选择：较新的 FreeBSD / NetBSD 支持 RFC5424，其余
+ * 平台退化为本地 syslogd 格式（LOCAL，即不带主机名的 RFC3164 变体）。 */
 #if defined(__FreeBSD_version) && (__FreeBSD_version >= 1200061)
 #define ZLOG_FMT_DEV_LOG	ZLOG_FMT_5424
 #elif defined(__NetBSD_Version__) && (__NetBSD_Version__ >= 500000000)
@@ -428,6 +528,9 @@ DEFPY(log_5424_destination_journald,
 #define ZLOG_FMT_DEV_LOG	ZLOG_FMT_LOCAL
 #endif
 
+/* CLI 命令 "[no] destination syslog [supports-rfc5424]"：直连 /dev/log。
+ * 带 supports-rfc5424 时用 RFC5424，否则用平台默认格式；无法侦测对端是否真支持
+ * 5424，故交给用户声明。special 为 SPECIAL_SYSLOG。 */
 DEFPY(log_5424_destination_syslog,
       log_5424_destination_syslog_cmd,
       "[no] destination syslog [supports-rfc5424]$supp5424",
@@ -455,6 +558,13 @@ DEFPY(log_5424_destination_syslog,
  *    all of this, why reinvent the wheel?
  */
 
+/*
+ * CLI 命令 "[no] destination <fd N | envvar NAME | stdout | stderr>
+ * [format ...]"：把日志写到一个"进程启动时就已打开"的 fd。
+ * fd 可来自常量、$stdout/$stderr，或从环境变量读取；若环境变量缺失或非法会
+ * 给出告警，若 fd 并非启动时打开的也会告警。配置照样保存但不一定立即生效。
+ * 若配置未变则直接成功；否则清空并设置 dst=FD、fd、fmt（及 envvar）。
+ */
 DEFPY(log_5424_destination_fd,
       log_5424_destination_fd_cmd,
       "[no] destination <fd <(0-63)$fd|envvar WORD>|stdout$fd1|stderr$fd2>"
@@ -526,6 +636,8 @@ DEFPY(log_5424_destination_fd,
 	return reconf_dst(cfg, vty);
 }
 
+/* CLI 命令 "[no] destination [none]"：清除当前目标的目的地配置（等价于不再
+ * 输出到任何目的地）。 */
 DEFPY(log_5424_destination_none,
       log_5424_destination_none_cmd,
       "[no] destination [none]",
@@ -540,6 +652,8 @@ DEFPY(log_5424_destination_none,
 
 /* end of destinations */
 
+/* CLI 命令 "[no] priority <级别>"：设置该目标的最低记录级别。级别名用
+ * log_level_match 解析；与当前值相同则不动，否则更新并标记元数据待应用。 */
 DEFPY(log_5424_prio,
       log_5424_prio_cmd,
       "[no] priority <emergencies|alerts|critical|errors|warnings|notifications|informational|debugging>$levelarg",
@@ -557,6 +671,8 @@ DEFPY(log_5424_prio,
 	return reconf_meta(cfg, vty);
 }
 
+/* CLI 命令 "[no] facility <facility>"：设置该目标使用的 syslog facility。
+ * 用 facility_match 解析；相同则不动，否则更新并标记元数据待应用。 */
 DEFPY(log_5424_facility,
       log_5424_facility_cmd,
       "[no] facility <kern|user|mail|daemon|auth|syslog|lpr|news|uucp|cron|local0|local1|local2|local3|local4|local5|local6|local7>$facilityarg",
@@ -574,6 +690,10 @@ DEFPY(log_5424_facility,
 	return reconf_meta(cfg, vty);
 }
 
+/* CLI 命令 "[no] structured-data <选项>"：开关某个结构化数据项
+ * （code-location / version / unique-id / error-category / format-args）。
+ * 先在 log_opts 表里找到对应项，再用其偏移取得 bool 指针；no 表示关闭。
+ * 值未变则成功返回，否则修改并标记元数据待应用。 */
 DEFPY(log_5424_meta,
       log_5424_meta_cmd,
       "[no] structured-data <code-location|version|unique-id|error-category|format-args>$option",
@@ -602,6 +722,9 @@ DEFPY(log_5424_meta,
 	return reconf_meta(cfg, vty);
 }
 
+/* CLI 命令 "[no] timestamp precision (0-9)"：设置时间戳的小数秒位数。
+ * 先清掉 ZLOG_TS_PREC 位，no 时恢复默认位数，否则取用户给的值；变化才标记
+ * 元数据待应用。 */
 DEFPY(log_5424_ts_prec,
       log_5424_ts_prec_cmd,
       "[no] timestamp precision (0-9)",
@@ -626,6 +749,9 @@ DEFPY(log_5424_ts_prec,
 	return reconf_meta(cfg, vty);
 }
 
+/* CLI 命令 "[no] timestamp local-time"：选择用本地时区还是 UTC（默认 UTC）。
+ * 先清掉 ZLOG_TS_UTC 位，no 表示恢复默认（UTC），否则按默认取反设置 UTC 位；
+ * 变化才标记元数据待应用。 */
 DEFPY(log_5424_ts_local,
       log_5424_ts_local_cmd,
       "[no] timestamp local-time",
@@ -649,6 +775,11 @@ DEFPY(log_5424_ts_local,
 	return reconf_meta(cfg, vty);
 }
 
+/*
+ * 退出 EXTLOG_NODE 配置块的回调：若期间有改动，提示 "applying changes"，并按
+ * 标记优先级应用——有目的地变更就 apply_dst（会重建目标），否则仅 apply_meta
+ * （只改元数据，不重开目标），最后清空两个标记。返回 1 表示已处理。
+ */
 static int log_5424_node_exit(struct vty *vty)
 {
 	VTY_DECLVAR_CONTEXT(zlog_cfg_5424_user, cfg);
@@ -665,6 +796,12 @@ static int log_5424_node_exit(struct vty *vty)
 	return 1;
 }
 
+/*
+ * 把某个 5424 目标回写成 CLI 配置（供 show running-config）。按 fmt 生成
+ * format 关键字，按 dst 生成 destination 行（含 fd / file / fifo / unix /
+ * syslog / journald 各分支）；再按需输出 priority、facility、各结构化数据
+ * 开关、时间戳精度 / 本地时间等非默认项，最后以 "!" 结束。
+ */
 static int log_5424_config_write(struct vty *vty)
 {
 	struct zlog_cfg_5424_user *cfg;
@@ -793,6 +930,10 @@ static int log_5424_config_write(struct vty *vty)
 	return 0;
 }
 
+/*
+ * 展示某个 5424 目标的运行状态（供 show 命令）：输出目标名、目的地（不同 dst
+ * 分支给出不同描述）、日志级别与 facility 等。
+ */
 static int log_5424_show(struct vty *vty)
 {
 	struct zlog_cfg_5424_user *cfg;
@@ -897,6 +1038,8 @@ static int log_5424_show(struct vty *vty)
 	return 0;
 }
 
+/* EXTLOG_NODE 的命令节点定义：提示符、父节点 CONFIG_NODE，并挂上配置回写
+ * （log_5424_config_write）与退出回调（log_5424_node_exit）。 */
 static struct cmd_node extlog_node = {
 	.name = "extended",
 	.node = EXTLOG_NODE,
@@ -907,6 +1050,7 @@ static struct cmd_node extlog_node = {
 	.node_exit = log_5424_node_exit,
 };
 
+/* 命令补全：把 targets 里所有目标名加入补全候选（用于 EXTLOGNAME） */
 static void log_5424_autocomplete(vector comps, struct cmd_token *token)
 {
 	struct zlog_cfg_5424_user *cfg;
@@ -915,11 +1059,20 @@ static void log_5424_autocomplete(vector comps, struct cmd_token *token)
 		vector_set(comps, XSTRDUP(MTYPE_COMPLETION, cfg->name));
 }
 
+/* 命令变量处理器表：把 EXTLOGNAME 这个 token 的补全接到 log_5424_autocomplete，
+ * 以 NULL 结尾表示结束。 */
 static const struct cmd_variable_handler log_5424_var_handlers[] = {
 	{.tokenname = "EXTLOGNAME", .completions = log_5424_autocomplete},
 	{.completions = NULL},
 };
 
+/*
+ * 注册所有 5424 相关命令与钩子：
+ *  - 把 log_5424_show 挂到 zlog_cli_show 钩子，使 show logging 能列出目标；
+ *  - 注册 EXTLOGNAME 的补全处理器；
+ *  - 安装 extlog_node 节点及其默认命令，并把顶层 log / no log 命令装到
+ *    CONFIG_NODE、各子命令装到 EXTLOG_NODE。
+ */
 void log_5424_cmd_init(void)
 {
 	hook_register(zlog_cli_show, log_5424_show);
@@ -949,10 +1102,16 @@ void log_5424_cmd_init(void)
 
 /* hooks */
 
+/* 前向声明：早期初始化、轮转（钩子）与收尾（钩子）函数（定义在下方） */
 static int log_5424_early_init(struct event_loop *master);
 static int log_5424_rotate(void);
 static int log_5424_fini(void);
 
+/*
+ * 构造函数（libfrr 加载优先级 475）：把早期初始化挂到 frr_early_init、把
+ * log_5424_rotate 挂到 zlog_rotate 钩子、把 log_5424_fini 挂到 frr_fini，从而
+ * 让 5424 目标随守护进程生命周期自动初始化 / 轮转 / 收尾。
+ */
 __attribute__((_CONSTRUCTOR(475))) static void zlog_5424_startup_init(void)
 {
 	hook_register(frr_early_init, log_5424_early_init);
@@ -960,6 +1119,7 @@ __attribute__((_CONSTRUCTOR(475))) static void zlog_5424_startup_init(void)
 	hook_register(frr_fini, log_5424_fini);
 }
 
+/* frr_early_init 钩子：记录事件循环 master，供后续套接字重连事件使用 */
 static int log_5424_early_init(struct event_loop *master)
 {
 	log_5424_master = master;
@@ -967,6 +1127,8 @@ static int log_5424_early_init(struct event_loop *master)
 	return 0;
 }
 
+/* zlog_rotate 钩子：对每个 5424 目标调用 zlog_5424_rotate 做 SIGHUP 轮转，
+ * 失败则打印错误 */
 static int log_5424_rotate(void)
 {
 	struct zlog_cfg_5424_user *cfg;
@@ -980,6 +1142,8 @@ static int log_5424_rotate(void)
 	return 0;
 }
 
+/* frr_fini 钩子：进程退出时逐个弹出并释放所有 5424 目标，keepopen=true
+ * （关机时只摘配置、日志继续），最后清空 master 指针 */
 static int log_5424_fini(void)
 {
 	struct zlog_cfg_5424_user *cfg;

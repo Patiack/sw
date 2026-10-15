@@ -3,6 +3,32 @@
  * Copyright (c) 2015-19  David Lamparter, for NetDEF, Inc.
  */
 
+/*
+ * 文件导读：zlog.c —— FRR 新日志系统的核心引擎
+ *
+ * 本文件是“一次 zlog 调用到最终落盘”的中枢。它定义了消息对象 struct zlog_msg、
+ * 目标链表，以及把消息分发给各目标的逻辑。整体链路如下：
+ *
+ *   vzlogx(prio, fmt, ap)                 <- 各 zlog_* / flog_* 宏最终都汇到这里
+ *     |-- 若配置了 LTTng，附加一条 trace
+ *     |-- 有 TLS 缓冲：vzlog_tls()，把消息先暂存进本线程的 mmap 缓冲，择机 flush
+ *     |-- 无 TLS 缓冲：vzlog_notls()，直接遍历目标、逐个 logfn 输出
+ *     |-- 如该消息登记了“打印回溯”标志，再调用 zlog_backtrace_msg()
+ *
+ *   目标遍历统一走 RCU 读锁加 frr_each(zlog_targets)，因此目标链可被无锁替换。
+ *   每个目标用自己的 prio_min 过滤；prio 数值越小越严重，输出条件为 prio <= prio_min。
+ *
+ * 关键构件：
+ *   - struct zlog_msg：延迟格式化的消息对象，正文在 zlog_msg_text() 里才真正渲染，
+ *     渲染结果优先放进内联 stackbuf，放不下再另行分配。
+ *   - struct zlog_tls：每线程 mmap 日志缓冲，崩溃时内核可把未写出的日志同步回文件。
+ *   - zlog_target_clone / replace：以“先加后删”的方式原子替换目标，期间可能短暂重复。
+ *   - 时间戳：zlog_msg_ts() 支持 ISO8601 / 传统样式，zlog_msg_ts_3164() 供 syslog 用。
+ *   - 前缀开关：zlog_set_prefix_ec / xid 控制是否输出错误码与事务 ID。
+ *
+ * 阅读建议：从 vzlogx() 入手，顺着 vzlog_notls() / vzlog_tls() 看消息如何被分发；
+ * 再到 zlog_msg_text() 看正文如何按需渲染；目标的具体写出在 zlog_targets.c。
+ */
 #include "zebra.h"
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -54,9 +80,18 @@
 #include "libfrr_trace.h"
 #include "frrevent.h"
 
+/*
+ * 内存类型定义：LOG_MESSAGE 用于 zlog_msg 正文的动态缓冲，LOG_TLSBUF 用于每线程
+ * 日志缓冲结构；都用 DEFINE_MTYPE_STATIC 限制在本文件内。
+ */
 DEFINE_MTYPE_STATIC(LIB, LOG_MESSAGE,  "log message");
 DEFINE_MTYPE_STATIC(LIB, LOG_TLSBUF,   "log thread-local buffer");
 
+/*
+ * 钩子定义：zlog_init / zlog_fini / zlog_aux_init。
+ * 日志核心在初始化、退出与辅助程序初始化时会调用这些钩子，让内置目标（见
+ * zlog_targets.c）有机会把自己挂入 / 摘出目标链。
+ */
 DEFINE_HOOK(zlog_init, (const char *progname, const char *protoname,
 			unsigned short instance, uid_t uid, gid_t gid),
 		       (progname, protoname, instance, uid, gid));
@@ -64,11 +99,21 @@ DEFINE_KOOH(zlog_fini, (), ());
 DEFINE_HOOK(zlog_aux_init, (const char *prefix, int prio_min),
 			   (prefix, prio_min));
 
+/*
+ * 日志全局上下文：
+ *   zlog_prefix / zlog_prefixsz - 每条日志的固定前缀（如 "bgpd[1]: "）及其长度。
+ *   zlog_tmpdirfd - 运行期临时目录的 fd，供崩溃转储与 TLS 缓冲文件使用，开局为 -1。
+ *   zlog_instance - 本进程实例号（非多实例时为 -1）。
+ */
 char zlog_prefix[128];
 size_t zlog_prefixsz;
 int zlog_tmpdirfd = -1;
 int zlog_instance = -1;
 
+/*
+ * zlog_ec / zlog_xid - 两个全局开关（原子变量）：是否在日志前缀里输出错误码（EC）
+ * 与事务 ID（xid）。默认都开启。
+ */
 static atomic_bool zlog_ec = true, zlog_xid = true;
 
 /* these are kept around because logging is initialized (and directories
@@ -76,14 +121,26 @@ static atomic_bool zlog_ec = true, zlog_xid = true;
  * we need to chown() things so we don't get permission errors later when
  * trying to delete things on shutdown
  */
+/*
+ * zlog_uid / zlog_gid - 运行身份。日志目录与文件在权限切换前创建，故记录 uid / gid，
+ * 以便之后 chown，避免退出时以 FRR 用户身份删除文件遇到权限问题。默认 -1。
+ */
 static uid_t zlog_uid = -1;
 static gid_t zlog_gid = -1;
 
+/*
+ * zlog_targets - 全局目标链表（原子链表）。所有线程以 RCU 读锁无锁遍历它；
+ * 增删只通过 zlog_target_replace()（先加后删）进行，因此遍历期间可能短暂看到新旧并存。
+ */
 DECLARE_ATOMLIST(zlog_targets, struct zlog_target, head);
 static struct zlog_targets_head zlog_targets;
 
 /* Global setting for buffered vs immediate output. The default is
  * per-pthread buffering.
+ */
+/*
+ * zlog_default_immediate - 是否默认“立即输出”。默认按线程缓冲（false）。
+ * 置 true 后每条日志即时写出，便于调试。
  */
 static bool zlog_default_immediate;
 
@@ -96,6 +153,18 @@ static bool zlog_default_immediate;
  * Also remember to use va_copy() on args.
  */
 
+/*
+ * struct zlog_msg - 一条日志消息的完整状态（延迟格式化）。
+ * ts 为时间戳；prio 为优先级；fmt / args / xref 保存格式串、参数与元数据；
+ * stackbuf / stackbufsz 是内联渲染缓冲，text / textlen 是最终正文（可能指向 stackbuf
+ * 或另行动态分配），hdrlen 为 "[xid][EC n] " 前缀长度。
+ * pid / tid 仅用于转发来的消息（见 zlog_recirculate_live_msg）。
+ * ts_str / ts_dot / ts_zonetail / ts_flags 缓存 ISO8601 时间戳；
+ * ts_3164_str / ts_3164_flags 缓存 syslog 用的 RFC3164 时间戳。
+ * argpos / n_argpos 记录正文中各参数在输出里的位置，供高亮 / 结构化目标使用。
+ * 坑：不要把 fmt 加 va_list 传给非 FRR 的格式化函数，因为 FRR 扩展了格式串（如 %pI4）；
+ * 复用参数前要 va_copy。
+ */
 struct zlog_msg {
 	struct timespec ts;
 	int prio;
@@ -161,9 +230,21 @@ struct zlog_msg {
 #define CAN_DO_TLS 1
 #endif
 
+/*
+ * CAN_DO_TLS - 仅当平台同时具备 openat 与 unlinkat 时才启用 TLS 缓冲实现。
+ * TLS_LOG_BUF_SIZE - 单线程缓冲区大小（8KB）。
+ * TLS_LOG_MAXMSG - 缓冲内最多暂存的消息条数（64）。
+ */
 #define TLS_LOG_BUF_SIZE	8192
 #define TLS_LOG_MAXMSG		64
 
+/*
+ * struct zlog_tls - 每线程日志缓冲。mmbuf 指向一块 mmap 缓冲（优先落盘到 tmpdir 下的
+ * 共享文件，失败时退化为匿名映射）；bufpos 为当前写入偏移；do_unlink 表示退出时是否
+ * 要删除对应临时文件；nmsgs / msgs / msgp 保存本线程待写出的消息对象。
+ * 设计意图：缓冲访问不需系统调用；崩溃时内核会把 MAP_SHARED 内容同步回磁盘文件，
+ * 从而尽量保留最后若干条尚未写出的日志（消息元数据不在 mmap 区内，崩溃时会丢失）。
+ */
 struct zlog_tls {
 	char *mmbuf;
 	size_t bufpos;
@@ -181,6 +262,10 @@ static inline void zlog_tls_free(void *arg);
  */
 
 #ifdef __OpenBSD__
+/*
+ * OpenBSD 分支：用 pthread key 实现线程私有存储（该平台没有可用的 ELF TLS）。
+ * zlog_tls_key 由构造器 zlog_tls_key_init 创建、析构器 zlog_tls_key_fini 删除。
+ */
 static pthread_key_t zlog_tls_key;
 
 static void zlog_tls_key_init(void) __attribute__((_CONSTRUCTOR(500)));
@@ -209,6 +294,10 @@ static inline void zlog_tls_set(struct zlog_tls *val)
 #  define thread_local __thread
 # endif
 
+/*
+ * 通用分支：用 thread_local（ELF TLS）直接保存线程私有指针 zlog_tls_var，
+ * 比 pthread_[gs]etspecific 更快；zlog_tls_get / zlog_tls_set 即围绕它读写。
+ */
 static thread_local struct zlog_tls *zlog_tls_var
 	__attribute__((tls_model("initial-exec")));
 
@@ -224,6 +313,11 @@ static inline void zlog_tls_set(struct zlog_tls *val)
 #endif
 
 #ifdef CAN_DO_TLS
+/*
+ * zlog_gettid - 取当前线程的内核线程号（tid）。
+ * 在 Linux 上用 syscall(__NR_gettid)，其他平台各有对应接口；结果用 thread_local 缓存，
+ * 避免重复系统调用。返回 tid（失败时可能为 -1）。
+ */
 static intmax_t zlog_gettid(void)
 {
 #ifndef __OpenBSD__
@@ -259,6 +353,12 @@ static intmax_t zlog_gettid(void)
 	return rv;
 }
 
+/*
+ * zlog_tls_buffer_init - 为当前线程初始化 mmap 日志缓冲（幂等；已初始化或 tmpdir 不可用则直接返回）。
+ * 在 tmpdir 下打开名字形如 "logbuf.<tid>" 的文件，设置大小并 mmap（MAP_SHARED），
+ * 成功后记 do_unlink=true；失败则退化为匿名 mmap。完成后把结构挂到 TLS。无返回值。
+ * 坑：任何一步失败都会 goto 清理并降级，最终仍会设置 TLS 指针或清空。
+ */
 void zlog_tls_buffer_init(void)
 {
 	struct zlog_tls *zlog_tls;
@@ -331,6 +431,10 @@ out_anon:
 	zlog_tls_set(zlog_tls);
 }
 
+/*
+ * zlog_tls_buffer_fini - 反初始化当前线程的日志缓冲：先 flush 待写消息，再 munmap 并释放结构、
+ * 清空 TLS 指针，最后按需 unlink 对应的临时文件。
+ */
 void zlog_tls_buffer_fini(void)
 {
 	char mmpath[MAXPATHLEN];
@@ -347,6 +451,9 @@ void zlog_tls_buffer_fini(void)
 		zlog_err("unlink logbuf: %s (%d)", strerror(errno), errno);
 }
 
+/*
+ * 平台不支持 TLS 缓冲（缺 openat / unlinkat）时的空实现占位，用于保持接口一致。
+ */
 #else /* !CAN_DO_TLS */
 void zlog_tls_buffer_init(void)
 {
@@ -357,6 +464,11 @@ void zlog_tls_buffer_fini(void)
 }
 #endif
 
+/*
+ * zlog_msg_pid - 取消息对应的 pid / tid。
+ * 若消息是转发来的（msg->pid 非 0）则直接用其保存的 pid / tid；否则用当前进程 pid 与
+ * 线程 tid，pid 用 thread_local 缓存。
+ */
 void zlog_msg_pid(struct zlog_msg *msg, intmax_t *pid, intmax_t *tid)
 {
 #ifndef __OpenBSD__
@@ -385,6 +497,10 @@ void zlog_msg_pid(struct zlog_msg *msg, intmax_t *pid, intmax_t *tid)
 #endif
 }
 
+/*
+ * zlog_tls_free - 释放一个 zlog_tls 结构：munmap 其缓冲并释放结构本身。
+ * 参数 arg 可为 NULL；作为 pthread key 的析构回调使用。
+ */
 static inline void zlog_tls_free(void *arg)
 {
 	struct zlog_tls *zlog_tls = arg;
@@ -396,6 +512,11 @@ static inline void zlog_tls_free(void *arg)
 	XFREE(MTYPE_LOG_TLSBUF, zlog_tls);
 }
 
+/*
+ * zlog_tls_buffer_flush - 把当前线程缓冲里的全部消息一次性分发给所有目标。
+ * 在 RCU 读锁内遍历目标链，对每个有 logfn 的目标调用它；随后把 bufpos / nmsgs 归零。
+ * 无缓冲或无待写消息时直接返回。
+ */
 void zlog_tls_buffer_flush(void)
 {
 	struct zlog_target *zt;
@@ -420,6 +541,11 @@ void zlog_tls_buffer_flush(void)
 }
 
 
+/*
+ * vzlog_notls - 无 TLS 缓冲时的日志路径：就地构造一个栈上的 zlog_msg（内联 512 字节缓冲），
+ * 在 RCU 读锁内遍历目标链，对 prio <= zt->prio_min 且有 logfn 的目标调用其 logfn。
+ * 结束后释放可能动态分配的正文内存。参数同 vzlogx。
+ */
 static void vzlog_notls(const struct xref_logmsg *xref, int prio,
 			const char *fmt, va_list ap)
 {
@@ -452,6 +578,14 @@ static void vzlog_notls(const struct xref_logmsg *xref, int prio,
 		XFREE(MTYPE_LOG_MESSAGE, msg->text);
 }
 
+/*
+ * vzlog_tls - 有 TLS 缓冲时的日志路径：把消息暂存进本线程缓冲，择机 flush。
+ * 步骤：先快速探测“是否有任何目标想要这条消息”，没有则直接返回；否则取出一个 msg 槽，
+ * 把正文立即渲染进 mmap 缓冲（因为无法长期持有可变参数引用）。
+ * 以下情况会强制立即 flush：缓冲消息数达上限、格式化结果用到了动态分配、缓冲空间将尽、
+ * 或优先级高于 LOG_INFO（数值小于 LOG_INFO，即较严重的消息）。
+ * 参数：zlog_tls 为当前线程缓冲，其余同 vzlogx。
+ */
 static void vzlog_tls(struct zlog_tls *zlog_tls, const struct xref_logmsg *xref,
 		      int prio, const char *fmt, va_list ap)
 {
@@ -524,6 +658,14 @@ static void vzlog_tls(struct zlog_tls *zlog_tls, const struct xref_logmsg *xref,
 /* reinject log message received by zlog_recirculate_recv().  As of writing,
  * only used in the ldpd parent process to proxy messages from lde/ldpe
  * subprocesses.
+ */
+/*
+ * zlog_recirculate_live_msg - 把 zlog_live 收到的一条“线格式”日志重新注入本进程日志系统。
+ * data / len 为原始缓冲；先校验头部长度与正文长度，再从头部填充 ts / pid / tid / prio /
+ * 正文 / 参数位置等字段；随后尝试用 uid 在本进程 xref 表中找回对应的 xref_logmsg，
+ * 找到就用其格式串，找不到则用正文里的格式串兜底（假造 fmt）。
+ * 最后在 RCU 读锁内分发给各目标。坑：正文必须以换行加空字符结尾；仅当收发双方是同一个
+ * daemon（如 ldpd 父进程代理 lde / ldpe 子进程）时 uid 才能命中。
  */
 void zlog_recirculate_live_msg(uint8_t *data, size_t len)
 {
@@ -604,6 +746,12 @@ void zlog_recirculate_live_msg(uint8_t *data, size_t len)
 	rcu_read_unlock();
 }
 
+/*
+ * zlog_backtrace_msg - 针对“被标记为打印回溯”的某条消息，额外打印其调用点与回溯。
+ * 先打印消息所在线程与源位置；随后用 libunwind（或 glibc backtrace）逐帧打印，
+ * 从命中源函数的那一帧开始输出，并在线程入口帧处标注“scheduled from”。每行前缀带 uid。
+ * 参数 xref 为该消息元数据，prio 为优先级。
+ */
 static void zlog_backtrace_msg(const struct xref_logmsg *xref, int prio)
 {
 	struct event *tc = pthread_getspecific(thread_current);
@@ -686,6 +834,9 @@ static void zlog_backtrace_msg(const struct xref_logmsg *xref, int prio)
 }
 
 PRINTFRR(2, 3)
+/*
+ * ezlog - 无 xref 的便捷变参日志：把 va_list 打包后交给 vzlog（xref 为 NULL）。
+ */
 void ezlog(int prio, const char *fmt, ...)
 {
 	va_list ap;
@@ -695,6 +846,12 @@ void ezlog(int prio, const char *fmt, ...)
 	va_end(ap);
 }
 
+/*
+ * vzlogx - 日志总入口（所有 zlog_* / flog_* 宏的最终汇聚点）。
+ * 步骤：若启用 LTTng，按优先级映射出一条 trace；然后依据是否存在 TLS 缓冲，分别走
+ * vzlog_tls 或 vzlog_notls；最后若该消息的 xref 标记了打印回溯，调用 zlog_backtrace_msg。
+ * 参数 xref 可为 NULL，prio 为优先级，fmt 加 ap 为格式串与参数。
+ */
 void vzlogx(const struct xref_logmsg *xref, int prio, const char *fmt, va_list ap)
 {
 	struct zlog_tls *zlog_tls = zlog_tls_get();
@@ -745,6 +902,11 @@ void vzlogx(const struct xref_logmsg *xref, int prio, const char *fmt, va_list a
 	}
 }
 
+/*
+ * zlog_sigsafe - 崩溃路径的日志输出：把文本 text（长 len）按行切分，逐行交给各目标的
+ * logfn_sigsafe（仅当 LOG_CRIT 满足该目标的 prio_min，且目标提供了信号安全写函数）。
+ * 只使用异步信号安全调用。无返回值。
+ */
 void zlog_sigsafe(const char *text, size_t len)
 {
 	struct zlog_target *zt;
@@ -770,6 +932,12 @@ void zlog_sigsafe(const char *text, size_t len)
 	}
 }
 
+/*
+ * _zlog_assert_failed - assert 失败时的处理。
+ * 用 LOG_CRIT 打印断言所在的文件 / 行 / 函数 / 表达式，extra 非空时附带额外信息（%pVA）。
+ * 用静态标志防止断言处理过程再次断言（二次进入直接 abort）。
+ * 坑：本函数最后调用 abort()，不返回；回溯与内存统计由 SIGABRT 处理器输出。
+ */
 void _zlog_assert_failed(const struct xref_assert *xref, const char *extra, ...)
 {
 	va_list ap;
@@ -801,16 +969,29 @@ void _zlog_assert_failed(const struct xref_assert *xref, const char *extra, ...)
 	abort();
 }
 
+/*
+ * zlog_msg_prio - 返回消息优先级。
+ */
 int zlog_msg_prio(struct zlog_msg *msg)
 {
 	return msg->prio;
 }
 
+/*
+ * zlog_msg_xref - 返回消息的 xref 元数据（可能为 NULL）。
+ */
 const struct xref_logmsg *zlog_msg_xref(struct zlog_msg *msg)
 {
 	return msg->xref;
 }
 
+/*
+ * zlog_msg_text - 返回消息正文（按需渲染，结果缓存）。
+ * 首次调用时：先在正文前拼出前缀 "[xid][EC n] "（前缀长度记入 hdrlen），再用
+ * vbprintfrr 渲染格式串；结果能塞进内联 stackbuf 就用它，否则另分配一块更大缓冲重新渲染。
+ * 正文以换行结尾但不额外补空字符（换行不算进 textlen）。
+ * 参数 textlen 可为 NULL。返回正文指针。坑：不要跨线程共享返回的指针。
+ */
 const char *zlog_msg_text(struct zlog_msg *msg, size_t *textlen)
 {
 	if (!msg->text) {
@@ -884,6 +1065,10 @@ const char *zlog_msg_text(struct zlog_msg *msg, size_t *textlen)
 	return msg->text;
 }
 
+/*
+ * zlog_msg_args - 返回正文头部长度、参数位置个数与位置数组（对应指针非 NULL 时填充）。
+ * 若正文尚未渲染则先触发一次 zlog_msg_text。
+ */
 void zlog_msg_args(struct zlog_msg *msg, size_t *hdrlen, size_t *n_argpos,
 		   const struct fmt_outpos **argpos)
 {
@@ -898,9 +1083,21 @@ void zlog_msg_args(struct zlog_msg *msg, size_t *hdrlen, size_t *n_argpos,
 		*argpos = msg->argpos;
 }
 
+/*
+ * ZLOG_TS_FORMAT - 两种时间戳样式的掩码（ISO8601 与 LEGACY）。
+ * ZLOG_TS_FLAGS - 除精度位以外的有效标志掩码（按位取反 ZLOG_TS_PREC）。
+ */
 #define ZLOG_TS_FORMAT		(ZLOG_TS_ISO8601 | ZLOG_TS_LEGACY)
 #define ZLOG_TS_FLAGS		~ZLOG_TS_PREC
 
+/*
+ * zlog_msg_ts - 按 flags 把消息时间戳渲染进 out，返回写入长度。
+ * 若缓存的时间戳样式不符或 UTC 设置变化，则重新用 strftime 生成 ISO8601 基础串
+ * （"%Y-%m-%dT%H:%M:%S"），并据 flags 追加时区尾部（UTC 为 "Z"，否则为 +/-hh:mm），
+ * 再把亚秒精度（ZLOG_TS_PREC 指定的位数）拼上。
+ * ZLOG_TS_LEGACY 时把已缓存串里的连字符换成斜杠、字母 T 换成空格，得到传统样式。
+ * out 为 NULL 时只返回所需长度而不写出。坑：out 空间不足时会把剩余空间清零并返回所需长度。
+ */
 size_t zlog_msg_ts(struct zlog_msg *msg, struct fbuf *out, uint32_t flags)
 {
 	size_t outsz = out ? (out->buf + out->len - out->pos) : 0;
@@ -988,6 +1185,11 @@ size_t zlog_msg_ts(struct zlog_msg *msg, struct fbuf *out, uint32_t flags)
 	}
 }
 
+/*
+ * zlog_msg_ts_3164 - 生成 RFC3164 syslog 用的 "mmm dd hh:mm:ss" 时间戳并写入 out。
+ * 只接受 ZLOG_TS_UTC 标志；结果缓存于 msg->ts_3164_str，标志变化时重新生成。
+ * 月份名硬编码为英文缩写。返回 bputs 的写入长度。
+ */
 size_t zlog_msg_ts_3164(struct zlog_msg *msg, struct fbuf *out, uint32_t flags)
 {
 	flags &= ZLOG_TS_UTC;
@@ -1017,11 +1219,17 @@ size_t zlog_msg_ts_3164(struct zlog_msg *msg, struct fbuf *out, uint32_t flags)
 	return bputs(out, msg->ts_3164_str);
 }
 
+/*
+ * zlog_msg_tsraw - 把消息的原始 struct timespec 拷进 ts，不做渲染。
+ */
 void zlog_msg_tsraw(struct zlog_msg *msg, struct timespec *ts)
 {
 	memcpy(ts, &msg->ts, sizeof(*ts));
 }
 
+/*
+ * zlog_set_prefix_ec / zlog_get_prefix_ec - 设置 / 读取“前缀是否含错误码”开关（原子操作）。
+ */
 void zlog_set_prefix_ec(bool enable)
 {
 	atomic_store_explicit(&zlog_ec, enable, memory_order_relaxed);
@@ -1032,6 +1240,9 @@ bool zlog_get_prefix_ec(void)
 	return atomic_load_explicit(&zlog_ec, memory_order_relaxed);
 }
 
+/*
+ * zlog_set_prefix_xid / zlog_get_prefix_xid - 设置 / 读取“前缀是否含事务 ID”开关（原子操作）。
+ */
 void zlog_set_prefix_xid(bool enable)
 {
 	atomic_store_explicit(&zlog_xid, enable, memory_order_relaxed);
@@ -1044,6 +1255,11 @@ bool zlog_get_prefix_xid(void)
 
 /* setup functions */
 
+/*
+ * zlog_target_clone - 分配并克隆一个 zlog_target（size 字节，内存类型 mt）。
+ * oldzt 非空时复制其 prio_min / logfn / logfn_sigsafe；oldzt 为 NULL 则清零新建。
+ * 返回值：新目标指针。坑：只克隆基类字段，内嵌目标的私有字段需调用方自行补填。
+ */
 struct zlog_target *zlog_target_clone(struct memtype *mt,
 				      struct zlog_target *oldzt, size_t size)
 {
@@ -1059,6 +1275,11 @@ struct zlog_target *zlog_target_clone(struct memtype *mt,
 	return newzt;
 }
 
+/*
+ * zlog_target_replace - 原子更新目标链：newzt 非空先加入链尾，oldzt 非空再从链上摘除。
+ * 返回 oldzt，便于调用方随后 zlog_target_free()。两参数均可为 NULL。
+ * 坑：期间新旧目标可能短暂并存，旧目标必须保持可用直到当前 RCU 周期结束。
+ */
 struct zlog_target *zlog_target_replace(struct zlog_target *oldzt,
 					struct zlog_target *newzt)
 {
@@ -1073,6 +1294,9 @@ struct zlog_target *zlog_target_replace(struct zlog_target *oldzt,
  * Enable or disable 'immediate' output - default is to buffer
  * each pthread's messages.
  */
+/*
+ * zlog_set_immediate / zlog_get_immediate_mode - 设置 / 读取默认“立即输出”模式。
+ */
 void zlog_set_immediate(bool set_p)
 {
 	zlog_default_immediate = set_p;
@@ -1085,10 +1309,18 @@ bool zlog_get_immediate_mode(void)
 
 /* common init */
 
+/*
+ * TMPBASEDIR - 运行期临时目录根（"/var/tmp/frr"）。
+ * zlog_tmpdir - 本进程专属的临时子目录路径（含 pid / 实例号），供 TLS 缓冲文件与崩溃日志使用。
+ */
 #define TMPBASEDIR "/var/tmp/frr"
 
 static char zlog_tmpdir[MAXPATHLEN];
 
+/*
+ * zlog_aux_init - 辅助程序（工具 / 测试）的日志初始化：设置前缀后触发 zlog_aux_init 钩子，
+ * 由目标侧（zlog_targets.c）完成实际的输出目标挂载。
+ */
 void zlog_aux_init(const char *prefix, int prio_min)
 {
 	if (prefix)
@@ -1097,6 +1329,13 @@ void zlog_aux_init(const char *prefix, int prio_min)
 	hook_call(zlog_aux_init, prefix, prio_min);
 }
 
+/*
+ * zlog_init - daemon 的日志核心初始化。
+ * 记录 uid / gid / 实例号；按是否多实例拼出前缀（形如 "name[inst]: " 或 "name: "）与
+ * 临时目录路径；创建 TMPBASEDIR 与进程临时目录并 chown 为运行身份；打开临时目录的 fd，
+ * 最后触发 zlog_init 钩子挂载目标。
+ * 坑：任一步失败会跳到 out_warn，提示“崩溃日志与线程日志缓冲不可用”，但仍继续触发钩子。
+ */
 void zlog_init(const char *progname, const char *protoname,
 	       unsigned short instance, uid_t uid, gid_t gid)
 {
@@ -1160,6 +1399,9 @@ out_warn:
 	hook_call(zlog_init, progname, protoname, instance, uid, gid);
 }
 
+/*
+ * zlog_fini - 关闭日志核心，触发 zlog_fini 钩子（由目标侧做清理）。
+ */
 void zlog_fini(void)
 {
 	hook_call(zlog_fini);
@@ -1167,6 +1409,9 @@ void zlog_fini(void)
 
 /*
  * Remove the process's temp log dir, at shutdown
+ */
+/*
+ * zlog_tmpdir_fini - 退出时删除本进程的临时日志目录：关闭其 fd 并 rmdir。
  */
 void zlog_tmpdir_fini(void)
 {

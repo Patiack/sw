@@ -4,6 +4,27 @@
  * Copyright (C) 1997, 1998, 1999 Kunihiro Ishiguro
  */
 
+/*
+ * 文件导读：log.c —— FRR 传统日志入口与公共辅助的实现
+ *
+ * 本文件实现 log.h 中声明的一批“通用日志与诊断辅助”，可看作新日志核心 zlog.c
+ * 周围的一圈工具函数。它们大多与某一次具体日志输出无直接关系，而是服务于崩溃诊断、
+ * 回溯、时间戳、名字查表与文本清洗等场景。
+ *
+ * 主要内容：
+ *   1. lookup_msg：在 {键, 字符串} 表里按键查名字，是各 *_string 函数的基础。
+ *   2. frr_timestamp：带亚秒精度的时间戳渲染，内部缓存同一秒的 localtime 结果。
+ *   3. 崩溃 / 信号路径：zlog_signal、zlog_backtrace、zlog_backtrace_sigsafe、
+ *      zlog_thread_info，全部只能使用异步信号安全的函数。
+ *   4. safe_strerror、memory_oom：错误字符串兜底与内存耗尽时的致命处理。
+ *   5. 名字表：DESC_ENTRY 宏生成 command_types / route_types / gr_client_cap_types
+ *      等数组，配合 zroute_lookup / zebra_route_string / zserv_command_string 等使用。
+ *   6. proto_name2num / proto_redistnum：协议名与 ZEBRA_ROUTE_* 编号互转。
+ *   7. zlog_hexdump / zlog_sanitize：十六进制转储与不可打印字符转义。
+ *
+ * 阅读建议：本文件与 zlog.c 是“工具 / 辅助”与“核心引擎”的分工；一次 zlog 调用的
+ * 主体流程在 zlog.c，本文件提供周边能力。
+ */
 #define FRR_DEFINE_DESC_TABLE
 
 #include <zebra.h>
@@ -39,6 +60,11 @@
  * @param nf the message to return if not found
  * @return the message
  */
+/*
+ * lookup_msg - 在消息表 mz 中按键 kz 查找对应字符串。
+ * 表中以全零的 struct message 作为结束标志；找到返回其 str，找不到返回 nf
+ * （nf 为 NULL 时用 "(no message found)"）。用 memcmp 与全零模板比较来判断表尾。
+ */
 const char *lookup_msg(const struct message *mz, int kz, const char *nf)
 {
 	static struct message nt = {0};
@@ -53,6 +79,13 @@ const char *lookup_msg(const struct message *mz, int kz, const char *nf)
 }
 
 /* For time string format. */
+/*
+ * frr_timestamp - 把当前时间渲染成 "%Y/%m/%d %H:%M:%S"（可选亚秒）写入 buf。
+ * 参数 timestamp_precision 为亚秒位数（0 表示不要亚秒）；buflen 为 buf 容量。
+ * 返回值：写入的字符数（不含结尾空字符）。内部用 static 缓存同一秒的 strftime 结果，
+ * 以避免同一秒内反复调用 localtime；亚秒部分不缓存。
+ * 坑：若 buflen 不足以容纳（含亚秒），会退化为不带亚秒，或直接返回 0 并置 buf[0] 为 0。
+ */
 size_t frr_timestamp(int timestamp_precision, char *buf, size_t buflen)
 {
 	static struct {
@@ -117,6 +150,13 @@ size_t frr_timestamp(int timestamp_precision, char *buf, size_t buflen)
  */
 
 /* Note: the goal here is to use only async-signal-safe functions. */
+/*
+ * zlog_signal - 崩溃信号处理器中调用，记录收到信号的时间、信号号、si_addr 与 PC。
+ * 参数：signo 信号号，action 动作文本（如 "aborting"），siginfo_v 为 siginfo_t 指针，
+ * program_counter 为出错指令地址（可为 NULL）。
+ * 副作用：先经 zlog_sigsafe 输出头部，再打印信号安全回溯，最后输出线程调度信息。
+ * 坑：只能用异步信号安全函数；访问 siginfo 字段依赖 siginfo_v 有效。
+ */
 void zlog_signal(int signo, const char *action, void *siginfo_v,
 		 void *program_counter)
 {
@@ -159,6 +199,12 @@ void zlog_signal(int signo, const char *action, void *siginfo_v,
 
 /* Log a backtrace using only async-signal-safe functions.
    Needs to be enhanced to support syslog logging. */
+/*
+ * zlog_backtrace_sigsafe - 只用异步信号安全函数打印调用栈回溯。
+ * 优先使用 libunwind（HAVE_LIBUNWIND），否则用 glibc backtrace（HAVE_GLIBC_BACKTRACE）。
+ * 参数 priority 仅作语义标识，program_counter 用于在回溯中标注出错位置。
+ * 坑：会写入 zlog 的文件状态，只应在进程即将退出 / abort 时调用。
+ */
 void zlog_backtrace_sigsafe(int priority, void *program_counter)
 {
 #ifdef HAVE_LIBUNWIND
@@ -224,6 +270,11 @@ void zlog_backtrace_sigsafe(int priority, void *program_counter)
 #endif /* HAVE_STRACK_TRACE */
 }
 
+/*
+ * zlog_backtrace - 打印调用栈回溯，允许使用非异步信号安全的函数（可分配内存等）。
+ * 同样优先 libunwind，其次 glibc backtrace，都没有时打印一行提示。
+ * 参数 priority 决定这些行以什么优先级记录。
+ */
 void zlog_backtrace(int priority)
 {
 #ifdef HAVE_LIBUNWIND
@@ -286,6 +337,11 @@ void zlog_backtrace(int priority)
 #endif
 }
 
+/*
+ * zlog_thread_info - 打印“当前线程从哪个函数 / 文件 / 行调度而来”的信息。
+ * 通过 thread_current 线程特定数据取当前 event；取不到则提示信息不可用。
+ * 参数 log_level 为这些行的日志优先级。
+ */
 void zlog_thread_info(int log_level)
 {
 	struct event *tc;
@@ -300,6 +356,12 @@ void zlog_thread_info(int log_level)
 		zlog(log_level, "Current thread not known/applicable");
 }
 
+/*
+ * memory_oom - 内存分配失败（OOM）时的致命处理。
+ * 以 LOG_CRIT 打印失败对象与字节数，打印回溯与内存统计，然后 abort()。
+ * 参数 size 为失败的字节数，name 为对象类型名。
+ * 坑：本函数不返回，一定会终止进程。
+ */
 void memory_oom(size_t size, const char *name)
 {
 	zlog(LOG_CRIT,
@@ -311,12 +373,22 @@ void memory_oom(size_t size, const char *name)
 }
 
 /* Wrapper around strerror to handle case where it returns NULL. */
+/*
+ * safe_strerror - 包裹 strerror，保证不返回 NULL。
+ * 参数 errnum 为错误码；strerror 返回 NULL 时用 "Unknown error" 兜底。
+ */
 const char *safe_strerror(int errnum)
 {
 	const char *s = strerror(errnum);
 	return (s != NULL) ? s : "Unknown error";
 }
 
+/*
+ * DESC_ENTRY 宏与名字表：
+ *   DESC_ENTRY(T) 生成形如 { T, "T", '\0' } 的表项，成员依次为 type、string、chr。
+ *   command_types 以 zserv 命令号作下标，把命令枚举映射为名字字符串，
+ *   供 zserv_command_string() 使用；新增 zserv 命令时必须在此补一行。
+ */
 #define DESC_ENTRY(T) [(T)] = { (T), (#T), '\0' }
 static const struct zebra_desc_table command_types[] = {
 	DESC_ENTRY(ZEBRA_INTERFACE_ADD),
@@ -470,6 +542,12 @@ static const struct zebra_desc_table command_types[] = {
 
 static const struct zebra_desc_table unknown = {0, "unknown", '?'};
 
+/*
+ * zroute_lookup - 按路由类型编号在 route_types 表中查出对应描述项。
+ * 正常情况下 route_types 以 type 值为下标，可直接命中；为稳健起见还会线性搜索，
+ * 若发现表“乱序”会告警但仍返回；越界或查不到时告警并返回 unknown 兜底项。
+ * 参数 zroute 为路由类型编号；返回指向表中项（或 unknown）的只读指针。
+ */
 static const struct zebra_desc_table *zroute_lookup(unsigned int zroute)
 {
 	unsigned int i;
@@ -494,16 +572,26 @@ static const struct zebra_desc_table *zroute_lookup(unsigned int zroute)
 	return &unknown;
 }
 
+/*
+ * zebra_route_string - 返回路由类型编号对应的名字字符串（经 zroute_lookup）。
+ */
 const char *zebra_route_string(unsigned int zroute)
 {
 	return zroute_lookup(zroute)->string;
 }
 
+/*
+ * zebra_route_char - 返回路由类型编号对应的单字符（经 zroute_lookup）。
+ */
 char zebra_route_char(unsigned int zroute)
 {
 	return zroute_lookup(zroute)->chr;
 }
 
+/*
+ * zserv_command_string - 返回 zserv 命令编号对应的名字字符串。
+ * 越界时告警并返回 "unknown"。
+ */
 const char *zserv_command_string(unsigned int command)
 {
 	if (command >= array_size(command_types)) {
@@ -514,6 +602,10 @@ const char *zserv_command_string(unsigned int command)
 	return command_types[command].string;
 }
 
+/*
+ * gr_client_cap_types - 把 GR（Graceful Restart）客户端能力枚举映射为名字字符串，
+ * 供 zserv_gr_client_cap_string() 使用；DESC_ENTRY 用法同上。
+ */
 #define DESC_ENTRY(T) [(T)] = {(T), (#T), '\0'}
 static const struct zebra_desc_table gr_client_cap_types[] = {
 	DESC_ENTRY(ZEBRA_CLIENT_GR_CAPABILITIES),
@@ -524,6 +616,10 @@ static const struct zebra_desc_table gr_client_cap_types[] = {
 };
 #undef DESC_ENTRY
 
+/*
+ * zserv_gr_client_cap_string - 返回 GR 客户端能力 zcc 对应的名字字符串。
+ * 越界时告警并返回 "unknown"。
+ */
 const char *zserv_gr_client_cap_string(uint32_t zcc)
 {
 	if (zcc >= array_size(gr_client_cap_types)) {
@@ -534,6 +630,10 @@ const char *zserv_gr_client_cap_string(uint32_t zcc)
 	return gr_client_cap_types[zcc].string;
 }
 
+/*
+ * proto_name2num - 用不区分大小写的比较，把协议名翻译成 ZEBRA_ROUTE_* 编号。
+ * 参数 s 为协议名；遍历 route_types 表匹配 string 字段；找不到返回 -1。
+ */
 int proto_name2num(const char *s)
 {
 	unsigned i;
@@ -544,6 +644,12 @@ int proto_name2num(const char *s)
 	return -1;
 }
 
+/*
+ * proto_redistnum - 把 redistribute 命令里的协议名翻成编号，支持缩写并可按地址族限定。
+ * 参数 afi 为地址族（AFI_IP / AFI_IP6），s 为协议名（如 "ospf"、"ospf6"）。
+ * s 为 NULL 或无法识别时返回 ZEBRA_ROUTE_ERROR。
+ * 坑：同一名字在 IPv4 / IPv6 下可能对应不同编号（如 rip 与 ripng、ospf 与 ospf6）。
+ */
 uint8_t proto_redistnum(int afi, const char *s)
 {
 	if (!s)
@@ -622,6 +728,11 @@ uint8_t proto_redistnum(int afi, const char *s)
 	return ZEBRA_ROUTE_ERROR;
 }
 
+/*
+ * zlog_hexdump - 以每行 8 字节的十六进制加 ASCII 形式转储 mem 处 len 字节内存。
+ * 每行用一条 zlog_debug 打印；len 为 0 时只打印一行“零长度”提示。
+ * 参数 mem 为起始地址，len 为字节数。
+ */
 void zlog_hexdump(const void *mem, size_t len)
 {
 	char line[64];
@@ -673,6 +784,11 @@ void zlog_hexdump(const void *mem, size_t len)
  * but there is not much we can do since we cannot go
  * backwards(HA!) to fix poorly choosen data types
  */
+/*
+ * frr_time_t_to_uint32_t - 把 time_t 截断为 uint32_t（历史遗留的 32 位时间格式）。
+ * 参数 value 为输入时间；超过 UINT32_MAX 时返回 UINT32_MAX，否则原样返回。
+ * 坑：这是有损转换，2038 之后语义会出问题，仅为兼容旧格式而保留。
+ */
 uint32_t frr_time_t_to_uint32_t(time_t value)
 {
 	if (value > (time_t)UINT32_MAX)
@@ -680,6 +796,12 @@ uint32_t frr_time_t_to_uint32_t(time_t value)
 	return (uint32_t)value;
 }
 
+/*
+ * zlog_sanitize - 把可能含不可打印字符的输入清洗成可安全打印的文本。
+ * 参数：输出缓冲 buf、容量 bufsz、输入 in、输入长度 inlen。
+ * 把换行 / 回车 / 制表转成对应两字符转义，其他控制字符、双引号及 >=127 的字节转成 \xHH。
+ * 返回值：buf。坑：为避免写出半截转义序列，剩余空间不足 5 字节即停止。
+ */
 const char *zlog_sanitize(char *buf, size_t bufsz, const void *in, size_t inlen)
 {
 	const char *inbuf = in;

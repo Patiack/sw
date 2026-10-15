@@ -12,6 +12,26 @@
  * since it's quite resource intensive.
  */
 
+/*
+ * 文件导读（zlog_5424.c）
+ *
+ * 实现 zlog_5424.h 声明的"扩展日志目标"：把日志按 RFC5424 / RFC3164 / 本地 /
+ * journald 四种格式之一封装，投递到文件、fd、FIFO 或 Unix 套接字。这是 FRR
+ * 新一代日志中相对独立、可配置的目标实现，也是 log immediate / journald 等
+ * 场景的底层。
+ *
+ * 核心机制：
+ *  - RCU：目标对象 struct zlt_5424 受 RCU 保护；任何配置变更都是"新建一个
+ *    结构、填好、挂上、再摘除旧的"，读路径无需加锁。
+ *  - 缓冲：把一批消息（batch）格式化进一个 fbuf，再用尽量少的系统调用发出；
+ *    缓冲大小按消息数与是否带 args 估算（见 zlog_5424_bufsz）。
+ *  - 格式化：zlog_5424_one 负责把单条消息按所选格式写进缓冲并生成 iovec
+ *    （头部 + 正文两段）。
+ *  - 目标类型：文件类走 open / write，套接字类记录 packet 边界并处理重连。
+ *
+ * 各数据结构与关键函数见下方注释。作者强烈建议改动本文件时用 fuzzer（如
+ * AFL）配合 tests/lib/fuzz_zlog.c 跑，因为最容易出的是缓冲区边界的差一错误。
+ */
 #include "zebra.h"
 #include <fcntl.h>
 
@@ -34,6 +54,7 @@
 #include "lib/version.h"
 #include "lib/lib_errors.h"
 
+/* 定义本文件私有的内存类型：日志目标对象与其轮转辅助对象的内存统计 */
 DEFINE_MTYPE_STATIC(LOG, LOG_5424, "extended log target");
 DEFINE_MTYPE_STATIC(LOG, LOG_5424_ROTATE, "extended log rotate helper");
 
@@ -42,6 +63,20 @@ DEFINE_MTYPE_STATIC(LOG, LOG_5424_ROTATE, "extended log rotate helper");
  * remember this is RCU'd by the core zlog functions.  Changing anything
  * works by allocating a new struct, filling it, adding it, and removing the
  * old one.
+ */
+/*
+ * 5424 目标的运行期对象（受 RCU 保护）。zt 为框架基类，必须作为首成员。
+ *  - fd：原子保存的目标 fd（-1 表示未打开 / 已失效）。
+ *  - fmt/ts_flags/facility：输出格式、时间戳标志、facility。
+ *  - kw_version/kw_location/kw_uid/kw_ec/kw_args：各结构化关键字的开关。
+ *  - use_nl：某些格式是否需要补尾部换行。
+ *  - packets：对 DGRAM / SEQPACKET 套接字按"一条日志一个数据包"发送。
+ *  - sa/sa_len：DGRAM 场景的目的地址（避免依赖 connect 的连接状态）。
+ *  - last_err/current_err：上次错误与本次错误；成功时清空 current_err，
+ *    据此判断错误是"当前"还是"历史"。
+ *  - lost_msgs：丢弃消息计数（原子）。
+ *  - last_err_ts：上次错误发生的时间戳。
+ *  - head_close：RCU 延迟关闭 fd 用。
  */
 struct zlt_5424 {
 	struct zlog_target zt;
@@ -88,6 +123,7 @@ struct zlt_5424 {
 	struct rcu_head_close head_close;
 };
 
+/* 前向声明：打开目标（定义在下方），被 apply_dst 等调用 */
 static int zlog_5424_open(struct zlog_cfg_5424 *zcf, int sock_type);
 
 /* rough header length estimate
@@ -140,6 +176,12 @@ static int zlog_5424_open(struct zlog_cfg_5424 *zcf, int sock_type);
  * the min *3 multiplier quite useful.
  */
 
+/*
+ * 估算本次批量需要的格式化缓冲区大小。基础 128 字节，若启用 args 关键字再
+ * 加 128；调用方会拿它乘上消息数（至少按 3 条计，以平滑长短消息）。
+ * 通过出参 low_space 回填"低水位"：剩余空间不足此值时就不再尝试塞入下一条
+ * 消息。返回值即总缓冲大小。
+ */
 static inline size_t zlog_5424_bufsz(struct zlt_5424 *zte, size_t nmsgs,
 				     size_t *low_space)
 {
@@ -151,12 +193,15 @@ static inline size_t zlog_5424_bufsz(struct zlt_5424 *zte, size_t nmsgs,
 	return ret * MAX(nmsgs, 3);
 }
 
+/* 单条消息格式化时使用的游标：fbuf 为输出缓冲，iov 指向下一个可用的 iovec */
 struct state {
 	struct fbuf *fbuf;
 	struct iovec *iov;
 };
 
 /* stack-based keyword support is likely to bump this to 3 or 4 */
+/* 每条消息最多占用 2 个 iovec（头部 + 正文）。若将来把关键字改成栈上拼装，
+ * 这里可能增至 3 或 4；但必须保证不超过 IOV_MAX。 */
 #define IOV_PER_MSG 2
 _Static_assert(IOV_MAX >= IOV_PER_MSG,
 	       "this code won't work with IOV_MAX < IOV_PER_MSG");
@@ -171,6 +216,17 @@ _Static_assert(IOV_MAX >= IOV_PER_MSG,
  * journald	ISO8601(unused)	yes		(unused)
  */
 
+/*
+ * 把一条日志按 RFC5424 风格格式化写入缓冲，并占用两个 iovec。
+ *
+ * 生成的头部形如：<优先级>1 时间戳 主机名 程序名 pid 前缀 [origin 信息]
+ * [location@50145 tid=... id=... ec=... file=... line=... func=...]
+ * [args@50145 arg1=...]，随后跟消息正文（跳过文本自带的 texthdrlen 前缀）。
+ *
+ * 返回仍需追加的字节数；若缓冲空间不足，则回退 fbuf->pos 并返回所需大小，
+ * 由调用方（zlog_5424）负责腾挪空间后重试（此时返回非 0）。返回 0 表示已成
+ * 功写入缓冲并生成好 iovec。
+ */
 static size_t zlog_5424_one(struct zlt_5424 *zte, struct zlog_msg *msg,
 			    struct state *state)
 {
@@ -259,6 +315,11 @@ static size_t zlog_5424_one(struct zlt_5424 *zte, struct zlog_msg *msg,
 	return 0;
 }
 
+/*
+ * 按 RFC3164 风格格式化一条日志并占用两个 iovec。头部形如：
+ * <优先级>时间戳 [主机名] 程序名[pid]: 正文。
+ * 当格式为 LOCAL 时省略主机名。缓冲不足时同样回退 fbuf->pos 并返回所需大小。
+ */
 static size_t zlog_3164_one(struct zlt_5424 *zte, struct zlog_msg *msg,
 			    struct state *state)
 {
@@ -299,6 +360,12 @@ static size_t zlog_3164_one(struct zlt_5424 *zte, struct zlog_msg *msg,
 	return 0;
 }
 
+/*
+ * 按 systemd journald 原生格式格式化一条日志：输出一组"键=值\n"行，如
+ * PRIORITY、SYSLOG_FACILITY、TID、FRR_DAEMON、SYSLOG_TIMESTAMP、FRR_ID、
+ * FRR_EC、CODE_FILE/CODE_LINE/CODE_FUNC、FRR_ARGn，最后以 MESSAGE= 起头接
+ * 正文。正文段的 iov_len 固定多加 1 个字节（结尾换行）。
+ */
 static size_t zlog_journald_one(struct zlt_5424 *zte, struct zlog_msg *msg,
 				struct state *state)
 {
@@ -385,6 +452,10 @@ static size_t zlog_journald_one(struct zlt_5424 *zte, struct zlog_msg *msg,
 	return 0;
 }
 
+/*
+ * 分派器：按 zte->fmt 选择 5424 / 3164(含 LOCAL) / journald 的格式化函数。
+ * 返回所选单条格式化函数的结果（0 表示成功，非 0 表示所需字节数）。
+ */
 static size_t zlog_one(struct zlt_5424 *zte, struct zlog_msg *msg,
 		       struct state *state)
 {
@@ -400,6 +471,13 @@ static size_t zlog_one(struct zlt_5424 *zte, struct zlog_msg *msg,
 	return 0;
 }
 
+/*
+ * 记录一次发送错误。count 为丢失的消息数：
+ *  - count 为 0 表示本次成功，清空 current_err（表示错误已成历史值）。
+ *  - 否则把 count 累加进 lost_msgs（唯一的原子量），并把 errno 记到 last_err
+ *    与 current_err，同时记录时间戳。
+ * last_err/current_err/last_err_ts 非原子，仅用于调试展示，读到脏值可接受。
+ */
 static void zlog_5424_err(struct zlt_5424 *zte, size_t count)
 {
 	if (!count) {
@@ -417,6 +495,19 @@ static void zlog_5424_err(struct zlt_5424 *zte, size_t count)
 	monotime(&zte->last_err_ts);
 }
 
+/*
+ * 目标的日志发送回调：把一批消息格式化后写入目标。
+ *
+ * 流程：估算并分配栈上格式化缓冲 hdr_buf；为 DGRAM 场景预填目的地址；逐条
+ * 调用 zlog_one 生成 iovec（每条最多 IOV_PER_MSG 段）。当某条需要更多空间、
+ * 或剩余空间低于 low_space、或到最后一条、或 iovec 将溢出时，就把已积累的
+ * 消息一次性发出（packets 模式用 sendmmsg 按包发，否则用 writev 或带地址的
+ * sendmsg），随后重置游标继续。
+ *
+ * 易踩的坑：iov 容量取 MIN(IOV_PER_MSG*nmsgs, IOV_MAX)；packets 为真时 mmsg
+ * 数组按 nmsgs 计，否则只用一个。发送失败的差额经 zlog_5424_err 计入丢失数。
+ * 缓冲区都在栈上，大小由 zlog_5424_bufsz 估算，故 nmsgs 不宜过大。
+ */
 static void zlog_5424(struct zlog_target *zt, struct zlog_msg *msgs[],
 		      size_t nmsgs)
 {
@@ -565,6 +656,12 @@ static void zlog_5424(struct zlog_target *zt, struct zlog_msg *msgs[],
 /* strftime(), gmtime_r() and localtime_r() aren't AS-Safe (they access locale
  * data), but we need an AS-Safe timestamp below :(
  */
+/*
+ * 不依赖 locale / 可重入的 gmtime 替代实现：把 Unix 时间戳拆成 UTC 的
+ * struct tm（秒/分/时/年/月/日）。之所以自己算，是因为 strftime / gmtime_r 不是
+ * 异步信号安全的（会访问 locale 数据），而信号安全路径需要它。
+ * 其内部从 2020-03-01 起算、按"3 平年 + 1 闰年"处理，2100 年前有效。
+ */
 static void gmtime_assafe(time_t ts, struct tm *res)
 {
 	res->tm_sec = ts % 60;
@@ -613,6 +710,13 @@ static void gmtime_assafe(time_t ts, struct tm *res)
 
 /* one of the greatest advantages of this logging target:  unlike syslog(),
  * which is not AS-Safe, we can send crashlogs to syslog here.
+ */
+/*
+ * 信号安全发送回调：在崩溃 / 信号上下文中输出一条日志。
+ * 相比常规路径，这里受限严重：只用固定大小栈缓冲(256)、不使用 locale，只按
+ * 格式拼接一段头部，然后用 writev（或带地址 sendmsg）发出 2~3 段 iovec
+ * （头部 + 正文 + 可选换行）。优先级固定 LOG_CRIT。
+ * 这也是本目标优于 syslog() 之处：syslog() 非信号安全，无法在崩溃时投递。
  */
 static void zlog_5424_sigsafe(struct zlog_target *zt, const char *text,
 			      size_t len)
@@ -701,11 +805,13 @@ static void zlog_5424_sigsafe(struct zlog_target *zt, const char *text,
 
 /* housekeeping & configuration */
 
+/* 初始化 5424 配置对象：仅初始化其互斥锁（不做内存分配，便于静态对象） */
 void zlog_5424_init(struct zlog_cfg_5424 *zcf)
 {
 	pthread_mutex_init(&zcf->cfg_mtx, NULL);
 }
 
+/* 释放一个 zlt_5424 目标：通过 RCU 延迟关闭其 fd 并释放对象内存 */
 static void zlog_5424_target_free(struct zlt_5424 *zlt)
 {
 	if (!zlt)
@@ -715,6 +821,11 @@ static void zlog_5424_target_free(struct zlt_5424 *zlt)
 	rcu_free(MTYPE_LOG_5424, zlt, zt.rcu_head);
 }
 
+/*
+ * 结束 / 摘除 5424 配置。keepopen=true（关机场景）时先把 active 置空，从而不
+ * 真正关闭目标、日志继续输出；否则把当前 active 目标从框架摘除并释放。
+ * 最后销毁配置互斥锁。
+ */
 void zlog_5424_fini(struct zlog_cfg_5424 *zcf, bool keepopen)
 {
 	if (keepopen)
@@ -731,6 +842,12 @@ void zlog_5424_fini(struct zlog_cfg_5424 *zcf, bool keepopen)
 	pthread_mutex_destroy(&zcf->cfg_mtx);
 }
 
+/*
+ * 新建一个目标实例并（由 zlog_target_replace）原子替换旧目标。
+ * 把 zcf 上的配置（关键字开关、facility、socket 类型、目的地址、格式、最低
+ * 级别等）拷进新对象；packets 在 DGRAM / SEQPACKET 时为真（每包一条）。
+ * 仅当 fd >= 0 才建立新目标；旧目标会在 replace 之后被 RCU 释放。
+ */
 static void zlog_5424_cycle(struct zlog_cfg_5424 *zcf, int fd)
 {
 	struct zlog_target *old;
@@ -793,6 +910,13 @@ static void zlog_5424_cycle(struct zlog_cfg_5424 *zcf, int fd)
 	rcu_free(MTYPE_LOG_5424, oldt, zt.rcu_head);
 }
 
+/*
+ * 套接字读事件回调：日志套接字对端关闭 / 出错时触发重连。
+ * 读到的数据（若有）表示对端异常；ret==0 表示对端关闭，<0 表示错误，均告警。
+ * 关键：此处绝不 close() 旧 fd——其它线程可能还在往它写，宁可使这些消息丢失，
+ * 也不能让它们写到一个随后被复用的随机 fd（比如某条 BGP 会话）上。
+ * 于是重新 zlog_5424_open 打开新连接，加锁后用 zlog_5424_cycle 替换目标。
+ */
 static void zlog_5424_reconnect(struct event *t)
 {
 	struct zlog_cfg_5424 *zcf = EVENT_ARG(t);
@@ -828,6 +952,12 @@ static void zlog_5424_reconnect(struct event *t)
 	}
 }
 
+/*
+ * 打开到给定 Unix 地址的套接字并尝试调大发送缓冲：socket -> connect（失败则
+ * 关闭并保留 errno 返回 -1）-> 读当前 SO_SNDBUF，再在不超过上限的前提下反复
+ * 对半尝试放大（失败就减半），只增不减。
+ * 返回 fd，失败返回 -1（errno 已保留，供上层 zlog_5424_open 打印）。
+ */
 static int zlog_5424_unix(struct sockaddr_un *suna, int sock_type)
 {
 	int fd;
@@ -861,6 +991,19 @@ static int zlog_5424_unix(struct sockaddr_un *suna, int sock_type)
 	return fd;
 }
 
+/*
+ * 按配置打开目标，返回用于日志的 fd（失败返回 -1，同时设置 zcf->sock_type、
+ * zcf->sa_len、need_reconnect 等）。按 dst 分支：
+ *  - FD：dup 预打开的 fd，并用 getsockopt(SO_TYPE) 探测套接字类型；
+ *  - FIFO：按需用受限权限 mkfifo，随后以非阻塞方式打开；
+ *  - FILE：用受限权限 open（先试已存在，再 O_CREAT|O_EXCL 创建），并记下是否
+ *    需要 chown；
+ *  - UNIX：连接 Unix 路径，未指定类型时依次尝试 STREAM / SEQPACKET / DGRAM。
+ * 随后对 DGRAM 记录对端地址（getpeername），必要时 fchown，并在需要时建立重连
+ * 事件监听。
+ * 易踩的坑：文件与 fifo 的创建 / 属主变更都在 lib_privs 权限下完成；连接失败
+ * 时 UNIX 分支不直接返回，而是触发下面的重连逻辑。
+ */
 static int zlog_5424_open(struct zlog_cfg_5424 *zcf, int sock_type)
 {
 	int fd = -1;
@@ -1059,6 +1202,12 @@ static int zlog_5424_open(struct zlog_cfg_5424 *zcf, int sock_type)
 	return fd;
 }
 
+/*
+ * 应用需要（重新）打开目标的变更：先取消可能存在的重连事件，再（若未禁用）
+ * 调用 zlog_5424_open 打开目标，加锁后 cycle 替换。返回 fd 是否有效。
+ * 注意：这会新建目标，另一线程此刻若正好在打日志，可能出现重复日志（见
+ * zlog_5424_rotate 中的说明）。
+ */
 bool zlog_5424_apply_dst(struct zlog_cfg_5424 *zcf)
 {
 	int fd = -1;
@@ -1075,6 +1224,11 @@ bool zlog_5424_apply_dst(struct zlog_cfg_5424 *zcf)
 }
 
 
+/*
+ * 应用元数据变更（不重新打开目标）：加锁后，若已有 active 目标就复用其 fd，
+ * 否则（未禁用时）新开一个，然后 cycle 把新配置（关键字、facility、格式等的
+ * 变化）原子替换进去。总是返回 true。
+ */
 bool zlog_5424_apply_meta(struct zlog_cfg_5424 *zcf)
 {
 	int fd;
@@ -1093,6 +1247,13 @@ bool zlog_5424_apply_meta(struct zlog_cfg_5424 *zcf)
 	return true;
 }
 
+/*
+ * 查询运行状态，所有输出参数均可为 NULL：
+ *  - lost_msgs：active 目标的累计丢失消息数（无 active 时为 0）。
+ *  - last_errno：最近一次错误 errno（无 active 为 0）。
+ *  - stale_errno：错误是否为历史值（current_err 为空即视为 stale）。
+ *  - err_ts：最近一次错误的时间戳。
+ */
 void zlog_5424_state(struct zlog_cfg_5424 *zcf, size_t *lost_msgs,
 		     int *last_errno, bool *stale_errno, struct timeval *err_ts)
 {
@@ -1110,11 +1271,18 @@ void zlog_5424_state(struct zlog_cfg_5424 *zcf, size_t *lost_msgs,
 		*err_ts = zcf->active->last_err_ts;
 }
 
+/* 轮转时用于 RCU 延迟关闭旧 fd 的辅助结构：一个关闭头 + 一个自释放头 */
 struct rcu_close_rotate {
 	struct rcu_head_close head_close;
 	struct rcu_head head_self;
 };
 
+/*
+ * SIGHUP 轮转：为当前 active 目标重新打开（用原 socket 类型）得到新 fd，然后
+ * 原子地替换 active->fd，旧 fd 交给 RCU 延迟关闭。这样在线切换既不丢日志也
+ * 不重复（若改用 apply_dst 重建目标，则并发日志可能重复）。
+ * 无 active 目标时直接返回 true；打开失败返回 false。
+ */
 bool zlog_5424_rotate(struct zlog_cfg_5424 *zcf)
 {
 	struct rcu_close_rotate *rcr;

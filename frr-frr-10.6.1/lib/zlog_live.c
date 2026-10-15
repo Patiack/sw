@@ -3,6 +3,27 @@
  * Copyright (c) 2019-22  David Lamparter, for NetDEF, Inc.
  */
 
+/*
+ * 文件导读（zlog_live.c）
+ *
+ * 实现 zlog_live.h 声明的"实时日志流"目标。核心思路：用一对 Unix 套接字，
+ * 一端作为日志目标 fd，另一端交给调用方（如 vtysh 会话）去读取；每当有日志
+ * 产生，zlog 框架就回调本文件的 zlog_live，把消息以"头部 + 可选参数位置 +
+ * 正文"这 1~3 段 iovec 一次性（sendmmsg）投递给客户端。
+ *
+ * 关键点：
+ *  - struct zlt_live：目标对象，内嵌 struct zlog_target（框架句柄），持有
+ *    fd（原子）、丢失计数（原子）、状态（原子）以及 RCU 回收头。
+ *  - 非阻塞、尽力而为：套接字写满时不阻塞日志线程，而是把未发出的消息计入
+ *    lost_msgs 后放弃（best-effort）。
+ *  - 两条回调：zlog_live 走常规批量（sendmmsg）；zlog_live_sigsafe 走信号安全
+ *    路径（只用 writev 与 clock_gettime）。
+ *  - 状态机 STATE_NORMAL / STATE_FD_DEAD / STATE_DISOWNED 用于协调"写失败要
+ *    关闭"与"用户主动 disown"两种清理时机，避免重复释放对象。
+ *
+ * 使用流程：zlog_live_open / zlog_live_open_fd 建立目标 -> 运行期由 zlog 框架
+ * 回调投递 -> zlog_live_close 或 zlog_live_disown 收尾。
+ */
 #include "zebra.h"
 
 #include "frrsendmmsg.h"
@@ -17,14 +38,29 @@
 #include "printfrr.h"
 #include "network.h"
 
+/* 定义本文件私有的内存类型：用于统计实时日志流目标对象的内存占用 */
 DEFINE_MTYPE_STATIC(LOG, LOG_LIVE, "log vtysh live target");
 
+/*
+ * 目标生命周期状态（原子变量）。NORMAL=正常工作；FD_DEAD=写失败后 fd 已被
+ * 关闭、目标待回收；DISOWNED=调用方已 disown，对象的所有权已交出。
+ * 用 CAS 在两条清理路径之间协调，确保只有一方真正释放对象。
+ */
 enum {
 	STATE_NORMAL = 0,
 	STATE_FD_DEAD,
 	STATE_DISOWNED,
 };
 
+/*
+ * 实时日志流目标对象。zt 是框架要求的基类（zlog_target），必须作为首成员，
+ * 以便用 container_of 从基类反查回本结构。
+ *  - fd：原子保存的目标套接字 fd，-1 表示已失效。
+ *  - head_close：RCU 延迟关闭 fd 用的回收头。
+ *  - head_self：RCU 延迟释放本对象用的回收头。
+ *  - state：见上面的 STATE_* 状态机。
+ *  - lost_msgs：因非阻塞写失败而丢弃的消息计数（原子）。
+ */
 struct zlt_live {
 	struct zlog_target zt;
 
@@ -36,6 +72,18 @@ struct zlt_live {
 	atomic_uint_fast32_t lost_msgs;
 };
 
+/*
+ * 常规投递回调：批量把 nmsgs 条日志推给客户端。
+ *
+ * 对每条消息先按 prio_min 过滤，再构造 1~3 个 iovec（头部、可选的 printf
+ * 参数位置数组、正文），用 sendmmsg 一次发送多条。未发完的消息（套接字写满
+ * 或 EAGAIN/EWOULDBLOCK）计入 lost_msgs 后放弃，保证不阻塞日志线程。若
+ * sendmmsg 返回真实错误，则走 out_err：原子地关闭 fd、从框架摘除目标，并按
+ * 状态决定是否立即释放对象。
+ *
+ * 易踩的坑：栈上用了变长数组 hdrs / mmhs / iovs，nmsgs 由调用方限定；iovs
+ * 的容量是 nmsgs*3（每条消息最多 3 段）。
+ */
 static void zlog_live(struct zlog_target *zt, struct zlog_msg *msgs[],
 		      size_t nmsgs)
 {
@@ -149,6 +197,12 @@ out_err:
 		rcu_free(MTYPE_LOG_LIVE, zte, head_self);
 }
 
+/*
+ * 信号安全投递回调：在信号处理上下文中输出一条文本日志。
+ * 只能使用异步信号安全的系统调用（clock_gettime 与 writev），因此只发两段
+ * iovec（小头部 + 正文），不发送参数位置、也不批量。头部时间戳直接取自
+ * CLOCK_REALTIME，优先级固定为 LOG_CRIT。
+ */
 static void zlog_live_sigsafe(struct zlog_target *zt, const char *text,
 			      size_t len)
 {
@@ -181,6 +235,13 @@ static void zlog_live_sigsafe(struct zlog_target *zt, const char *text,
 	writev(fd, iovs, iov - iovs);
 }
 
+/*
+ * 打开实时日志流目标：创建一对 Unix 套接字，一端用于日志输出，另一端通过
+ * other_fd 返回给调用方读取（如 vtysh 会话）。优先使用 SOCK_SEQPACKET（能
+ * 收到对端关闭通知，避免僵尸 fd），失败再退回 SOCK_DGRAM；SEQPACKET 成功时
+ * 会把读方向 shutdown 掉。prio_min 为 ZLOG_DISABLED 时直接返回（不启用）。
+ * 若已有 target 会先关闭旧的。
+ */
 void zlog_live_open(struct zlog_live_cfg *cfg, int prio_min, int *other_fd)
 {
 	int sockets[2];
@@ -211,6 +272,11 @@ void zlog_live_open(struct zlog_live_cfg *cfg, int prio_min, int *other_fd)
 	zlog_live_open_fd(cfg, prio_min, sockets[0]);
 }
 
+/*
+ * 用一个已存在的 fd（如调用方已建好的套接字）打开实时日志流目标：分配
+ * zlt_live、把 fd 设为非阻塞、填写回调函数，并注册到 zlog 框架。
+ * 若已有 target 会先关闭旧的。
+ */
 void zlog_live_open_fd(struct zlog_live_cfg *cfg, int prio_min, int fd)
 {
 	struct zlt_live *zte;
@@ -232,6 +298,10 @@ void zlog_live_open_fd(struct zlog_live_cfg *cfg, int prio_min, int fd)
 	zlog_target_replace(NULL, zt);
 }
 
+/*
+ * 关闭实时日志流目标：摘除 FD、从框架注销目标，并通过 RCU 释放对象，
+ * cfg->target 置空。若本来就没有 target 则直接返回。
+ */
 void zlog_live_close(struct zlog_live_cfg *cfg)
 {
 	struct zlt_live *zte;
@@ -252,6 +322,11 @@ void zlog_live_close(struct zlog_live_cfg *cfg)
 	rcu_free(MTYPE_LOG_LIVE, zte, head_self);
 }
 
+/*
+ * 放弃对目标的所有权但不主动关闭 fd：把对象状态置为 DISOWNED 并从 cfg 摘除。
+ * 若此刻对象已处于 FD_DEAD（写失败路径已判定待回收），则由本函数负责释放，
+ * 避免泄漏。
+ */
 void zlog_live_disown(struct zlog_live_cfg *cfg)
 {
 	struct zlt_live *zte;
