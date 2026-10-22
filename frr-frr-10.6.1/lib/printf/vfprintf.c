@@ -37,10 +37,37 @@
  * SUCH DAMAGE.
  */
 
+/* ============================================================================
+ * 【文件导读】printf/vfprintf.c —— FRR 内嵌 printf 的格式化主循环
+ * ============================================================================
+ * 【它在 FRR 里干什么】本文件是 FRR 从 FreeBSD 引入的整份 printf 实现里最核心的一块：
+ * 实现 vbprintfrr —— 解析格式串并生成输出的主循环。glue.c 里的 snprintfrr /
+ * asprintfrr 等对外 API 最终都汇聚到这里。
+ *
+ * 【为什么内嵌】FRR 需要自定义 %p 转换符（printfrr 扩展）与更严格的格式把关，故不
+ * 直接用 libc 的 printf，而是自带一份并在此扩展。
+ *
+ * 【核心数据结构与机制】
+ *   - struct fbuf：输出缓冲（经 io_state 封装），而非 FILE。
+ *   - 转换标志位(flags)：ALT / LADJUST / ZEROPAD / LONGINT / INTMAXT 等，见
+ *     printflocal.h，在主循环里随格式串逐字符累积。
+ *   - union arg / argtable：出现位置参数（形如 %n$）时，在此构建参数表再按下标取参。
+ *   - 一组局部宏（PRINT、PAD、PRINTANDPAD、GETARG、SARG、UARG、SJARG、UJARG、
+ *     GETASTER）承担“输出原语”与“按长度修饰取参”两类工作。
+ *
+ * 【两个函数】__wcsconv 负责把宽字符(%ls)转多字节；vbprintfrr 是主循环。
+ *
+ * 【阅读顺序】先读文件头的宏与函数内局部变量说明，再顺 vbprintfrr 主循环读：
+ * 普通字符输出 → % 之后的标志宽度精度与长度修饰解析 → 各转换符分派 → 统一填充收尾；
+ * 最后看 done / error 清理。
+ * ============================================================================
+ */
+
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
 
+/* 某些平台需 <sys/cdefs.h> 提供的宏（如 __restrict）才能编译。 */
 #ifdef HAVE_SYS_CDEFS_H
 #include <sys/cdefs.h>
 #endif
@@ -66,12 +93,22 @@
 
 #include <stdarg.h>
 
+/* printflocal.h 提供内部常量（转换标志位、union arg 等）；随后把 CHAR 定义为 char
+ * 并包含 printfcommon.h，即实例化“窄字符版”的公共例程（宽字符版由 wprintf 侧以
+ * wchar_t 包含同一头生成）。
+ */
 #include "printflocal.h"
 
 #define	CHAR	char
 #include "printfcommon.h"
 
 #ifdef WCHAR_SUPPORT
+/* 【函数】__wcsconv —— 把宽字符串参数（%ls / %lc）转换为多字节串。prec 指定最多输出
+ * 的字节数（<0 表示无限制，此时假定宽串以 NUL 结尾）。返回 malloc 分配的转换结果，
+ * 失败返回 NULL（由调用者负责 free）。
+ * 易踩的坑：prec<128 时走“直接按上界分配”的快路径，否则需逐字符 wcrtomb 试探长度；
+ * 转换中途遇非法序列返回 NULL。
+ */
 /*
  * Convert a wide character string argument for the %ls format to a multibyte
  * string representation. If not -1, prec specifies the maximum number of
@@ -132,6 +169,9 @@ __wcsconv(wchar_t *wcsarg, int prec)
 }
 #endif /* WCHAR_SUPPORT */
 
+/* 【常量】BUF —— 整数转换等使用的临时缓冲字节数；必须足以容纳以八进制表示的最大
+ * uintmax_t 再加一个字节。编译期用预处理判断，不满足则直接 #error。
+ */
 /*
  * The size of the buffer we use as scratch space for integer
  * conversions, among other things.  We need enough space to
@@ -143,12 +183,30 @@ __wcsconv(wchar_t *wcsarg, int prec)
 #error "BUF must be large enough to format a uintmax_t"
 #endif
 
+/* 【函数】vbprintfrr —— 本文件的核心：printf 格式化主循环（FRR 扩展版，接收 fbuf）。
+ *   cb_in : 输出缓冲；为 NULL 表示只计算长度不实际写出。
+ *   fmt0  : 格式串；ap : 参数列表。
+ * 返回值：写入或本应写入的字节数；出错返回 EOF 并置 errno（多为 EOVERFLOW）。
+ * 副作用：写 cb_in；结束时把写指针同步回 cb_in->pos；内部 va_copy 出 orgap 供位置
+ *        参数解析，必要时在堆上构建参数表(会 free)。
+ * 主循环：先原样输出普通字符，遇到 '%' 后解析标志/宽度/精度/长度修饰，再按转换符
+ * 生成字段、做左右填充；%p 命中 printfrr 扩展时改走扩展回调（见 ext_printed 标签）。
+ */
 /*
  * Non-MT-safe version
  */
 ssize_t
 vbprintfrr(struct fbuf *cb_in, const char *fmt0, va_list ap)
 {
+	/* 【局部变量一览】fmt 当前解析位置；ch 当前字符；n / n2 临时整数；cp 临时字符
+	 * 指针；flags 已累积的标志位；ret 返回值累计；width / prec 宽度与精度(prec<0 表示
+	 * 未给出)；sign 符号前缀(空格/+/-/\0)；ulval / ujval 两种宽度的无符号值；ptrval
+	 * 指针参数(%p)；base 进制；dprec 整数用的精度副本；realsz / size / prsize 字段
+	 * 尺寸；xdigs 十六进制数字表；io 输出缓冲状态；buf 数字转换临时缓冲；ox 存 "0x"；
+	 * argtable / statargtable 位置参数表；nextarg 下一个参数下标(从 1 起)；orgap 原始
+	 * va_list；convbuf 宽转多字节结果；extstart 记录 %p 扩展开始写的位置；cb / cb_copy
+	 * 实际使用的 fbuf。
+	 */
 	const char *fmt;	/* format string */
 	int ch;			/* character from fmt */
 	int n, n2;		/* handy integer (short term usage) */
@@ -184,6 +242,10 @@ vbprintfrr(struct fbuf *cb_in, const char *fmt0, va_list ap)
 	static const char *xdigs_lower = "0123456789abcdef";
 	static const char *xdigs_upper = "0123456789ABCDEF";
 
+	/* 【宏】输出原语：PRINT 把 (ptr,len) 写入；PAD 用 with(blanks 或 zeroes) 填充；
+	 * PRINTANDPAD 恰好输出 len 个字符（不足补、超出截）。三者出错一律 goto error。
+	 * FLUSH 在当前实现里是空操作（数据即时写入 fbuf，无需显式刷新）。
+	 */
 	/* BEWARE, these `goto error' on error. */
 #define	PRINT(ptr, len) { \
 	if (io_print(&io, (ptr), (len)))	\
@@ -199,6 +261,9 @@ vbprintfrr(struct fbuf *cb_in, const char *fmt0, va_list ap)
 }
 #define	FLUSH() do { } while (0)
 
+	/* 【宏】GETARG(type) —— 取下一个参数：若已构建位置参数表(argtable)则按下标取，
+	 * 否则用 va_arg 顺序取；两种情况都推进 nextarg。类型由调用处决定。
+	 */
 	/*
 	 * Get the argument indexed by nextarg.   If the argument table is
 	 * built, use it to get the argument.  If its not, get the next
@@ -208,6 +273,13 @@ vbprintfrr(struct fbuf *cb_in, const char *fmt0, va_list ap)
 	((argtable != NULL) ? *((type*)(&argtable[nextarg++])) : \
 	    (nextarg++, va_arg(ap, type)))
 
+	/* 【宏】SARG / UARG —— 按长度修饰(flags)取出有符号 / 无符号整型参数并统一提升到
+	 * long / u_long，分别处理 long、short、char 三种宽度。
+	 * 【宏】INTMAX_SIZE —— 判定是否走“宽整数”取值路径（INTMAXT、SIZET、PTRDIFFT、
+	 * LLONGINT、LONGDBL 任一置位）。
+	 * 【宏】SJARG / UJARG —— 宽整数版取参，按修饰选 intmax_t / ssize_t / ptrdiff_t /
+	 * long long（或对应无符号）并统一到 intmax_t / uintmax_t。
+	 */
 	/*
 	 * To extend shorts properly, we need both signed and unsigned
 	 * argument extraction methods.
@@ -236,6 +308,10 @@ vbprintfrr(struct fbuf *cb_in, const char *fmt0, va_list ap)
 	    flags&PTRDIFFT ? (uintmax_t)GETARG(ptrdiff_t) : \
 	    (uintmax_t)GETARG(unsigned long long))
 
+	/* 【宏】GETASTER(val) —— 解析“星号”参数：可能是下一个参数，也可能是 *nn$ 形式
+	 * 引用第 nn 个位置参数。若是位置参数，会临时构建 argtable、把 nextarg 切到 nn
+	 * 取值后再复位，并前移 fmt 越过 "nn$"。
+	 */
 	/*
 	 * Get * arguments, including the form *nn$.  Preserve the nextarg
 	 * that the argument can be gotten once the type is determined.
@@ -284,6 +360,12 @@ vbprintfrr(struct fbuf *cb_in, const char *fmt0, va_list ap)
 	io_init(&io, cb);
 	ret = 0;
 
+	/* 【解析阶段】主循环每轮先把 fmt 到下一个 %(或结尾) 之间的普通字符原样打印；
+	 * 遇到 % 后进入 rflag / reswitch 状态机，逐个识别前置标志(空格、+、-、#、0、'
+	 * 等)、字段宽度(数字或 *)、精度(点号加数字或 *)、长度修饰(h、hh、l、ll、j、t、
+	 * z、L、w8..64、q)与转换符，并借助上面的宏完成取参与转换。标签 rflag 用于继续
+	 * 读取标志字符，reswitch 用于“无标志可读后”跳到转换符分派。
+	 */
 	/*
 	 * Scan the format for conversions (`%' character).
 	 */
@@ -737,6 +819,11 @@ invalid:
 			break;
 		}
 
+		/* 【统一收尾填充】此处 cp 指向待输出的字符串或数字，按 width / dprec / sign /
+		 * ox 算出实际尺寸(realsz)，再决定填充：默认右对齐补空格；ZEROPAD 时先写符号与
+		 * 前缀再在数字前补零；LADJUST 时改为末尾补空格。opos 用于回填 %p 扩展在输出中的
+		 * 起止偏移（供 printfrr 嵌套定位）。
+		 */
 		/*
 		 * All reasonable formats wind up here.  At this point, `cp'
 		 * points to a string which (if not flags&LADJUST) should be
@@ -808,6 +895,11 @@ invalid:
 		continue;
 
 ext_printed:
+		/* 【%p 扩展收尾】扩展已把内容写进 cb（可能为 NULL），extstart 记录扩展写入
+		 * 前的 cb->pos，size 为扩展返回的长度。这里仍需处理字段宽度：默认右对齐补空
+		 * 格时要把扩展已写入的字符整体右移；最后同样做左对齐填空并累加 ret。刻意与上
+		 * 方普通路径保持一致（详见下方英文注释）。
+		 */
 		/* when we arrive here, a printfrr extension has written to cb
 		 * (if non-NULL), but we still need to handle padding.  The
 		 * original cb->pos is in extstart;  the return value from the
@@ -868,6 +960,10 @@ ext_printed:
 
 		FLUSH();	/* copy out the I/O vectors */
 	}
+/* 【收尾】done 为正常结束（先 FLUSH），error 为出错结束。两处都汇合到统一清理：
+ * 结束 orgap、释放宽字符转换缓冲 convbuf，以及堆上构建的 argtable（若与静态表不同），
+ * 并把写指针同步回 cb_in（若给了输出缓冲），最后返回 ret（出错时为 EOF）。
+ */
 done:
 	FLUSH();
 error:

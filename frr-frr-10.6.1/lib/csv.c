@@ -3,6 +3,38 @@
  * Copyright (C) 2013,2020  Cumulus Networks, Inc.
  */
 
+/*
+ * 文件导读：csv.c —— 逗号分隔值（CSV）编解码实现
+ *
+ * 一、这个文件做什么
+ *   实现 csv.h 声明的 CSV 编解码：把若干字段拼成以逗号分隔、以换行结尾的一行
+ *   （记录），或把这样的文本切分成记录链表与字段链表。FRR 中主要用于进程间 /
+ *   节点间的结构化消息传递。
+ *
+ * 二、核心数据结构
+ *   - csv_field_t：一个字段，field 指向所属字符串中的子串，field_len 为其长度。
+ *   - csv_record_t：一条记录，内部是字段的 TAILQ 链表；record 指向整行文本。
+ *   - csv_t：会话，含记录 TAILQ 链表、底层缓冲 buf、容量 buflen、已用长度
+ *     csv_len、写指针 pointer、记录数 num_recs。
+ *   三者都用 TAILQ 串成链表（见 sys/queue.h）。
+ *
+ * 三、两种缓冲模式（重要）
+ *   1. 单一连续缓冲：csv_init 时传入 buf，多条记录共用同一块内存，只能顺序追加。
+ *   2. 独立记录缓冲（discrete bufs）：csv_init 时 buf 传 NULL，每条记录单独
+ *      分配内存；append / serialize / clone / insert / remove / concat 仅在
+ *      该模式下可用，单缓冲模式下这些函数会直接报错返回。
+ *
+ * 四、编解码约定
+ *   编码：各字段直接拼接，字段之间与记录末尾分别补逗号和换行。
+ *   解码：以逗号切分字段、以换行切分记录；注意本实现不做引号 / 转义处理，
+ *   字段内不应包含未转义的逗号或换行。
+ *
+ * 五、阅读顺序
+ *   先看三个结构体与 csv_safe_snprintf，再看 csv_encode 与 csv_decode 主干，
+ *   然后是各种 record 操作（insert / remove / concat / clone / serialize），
+ *   最后看文件末尾 #ifdef TEST_CSV 下的自测代码。
+ */
+
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
@@ -19,9 +51,19 @@
 #include <unistd.h>
 #include "csv.h"
 
+/*
+ * DEBUG_E — 错误日志开关：非 0 时 log_error 才会真正打印。
+ */
 #define DEBUG_E 1
+/*
+ * DEBUG_V — 详细日志开关：非 0 时 log_verbose 才会真正打印。
+ */
 #define DEBUG_V 1
 
+/*
+ * log_error — 打印带 文件:行号:函数名 前缀的错误日志到 stderr，受 DEBUG_E 控制。
+ * 用法同 printf；仅用于本文件内部诊断。
+ */
 #define log_error(fmt, ...)                                                    \
 	do {                                                                   \
 		if (DEBUG_E)                                                   \
@@ -29,6 +71,12 @@
 				__LINE__, __func__, ##__VA_ARGS__);            \
 	} while (0)
 
+/*
+ * csv_safe_snprintf — 安全的 vsnprintf 包装。
+ * buf / size：目标缓冲与大小；fmt / ...：格式串与参数。
+ * 返回实际写入的字符数（不超过 size-1）；size<=0 时直接返回 0。
+ * 副作用：临时关闭 -Wformat-nonliteral 警告（fmt 来自调用方的字面量）。
+ */
 static inline int csv_safe_snprintf(char *buf, int size, const char *fmt, ...)
 {
 	va_list args;
@@ -50,6 +98,10 @@ static inline int csv_safe_snprintf(char *buf, int size, const char *fmt, ...)
 	return MIN(ret, size - 1);
 }
 
+/*
+ * log_verbose — 与 log_error 类似的详细日志宏，受 DEBUG_V 控制。
+ * 注意：该宏的格式串后必须有参数（未使用 ## 拼接），不能只传 fmt。
+ */
 #define log_verbose(fmt, ...)                                                  \
 	do {                                                                   \
 		if (DEBUG_V)                                                   \
@@ -57,12 +109,25 @@ static inline int csv_safe_snprintf(char *buf, int size, const char *fmt, ...)
 				__LINE__, __func__, __VA_ARGS__);              \
 	} while (0)
 
+/*
+ * csv_field_t — 单个 CSV 字段。
+ * next_field：同记录内下一字段的链表钩子（TAILQ）。
+ * field：指向该字段在字符串中的起始位置（不复制内容）。
+ * field_len：字段长度（字节）。
+ */
 struct _csv_field_t_ {
 	TAILQ_ENTRY(_csv_field_t_) next_field;
 	char *field;
 	int field_len;
 };
 
+/*
+ * csv_record_t — 一条 CSV 记录（一行）。
+ * fields：本记录内字段的 TAILQ 链表头。
+ * next_record：同 CSV 内下一条记录的链表钩子。
+ * record：指向该行整段文本。
+ * rec_len：本行文本长度。
+ */
 struct _csv_record_t_ {
 	TAILQ_HEAD(, _csv_field_t_) fields;
 	TAILQ_ENTRY(_csv_record_t_) next_record;
@@ -70,6 +135,15 @@ struct _csv_record_t_ {
 	int rec_len;
 };
 
+/*
+ * csv_t — 一次 CSV 编解码会话。
+ * records：所有记录的 TAILQ 链表头。
+ * buf：底层字符串缓冲（单缓冲模式使用；独立缓冲模式下为 NULL）。
+ * buflen：缓冲容量。
+ * csv_len：已编码内容总长度。
+ * pointer：顺序写入位置（单缓冲模式下的写指针）。
+ * num_recs：记录条数。
+ */
 struct _csv_t_ {
 	TAILQ_HEAD(, _csv_record_t_) records;
 	char *buf;
@@ -80,11 +154,20 @@ struct _csv_t_ {
 };
 
 
+/*
+ * csvlen — 返回本 CSV 已编码内容的字符总长度。
+ */
 int csvlen(csv_t *csv)
 {
 	return (csv->csv_len);
 }
 
+/*
+ * csv_init — 初始化 CSV 会话并绑定缓冲。
+ * csv：NULL 时内部 malloc 一个新的；buf / buflen：底层字符串与容量。
+ * 返回会话指针。副作用：清零整个结构、初始化 records 链表。
+ * 注意：buf 传 NULL 表示启用"独立记录缓冲"模式，见文件导读。
+ */
 csv_t *csv_init(csv_t *csv, char *buf, int buflen)
 {
 	if (csv == NULL) {
@@ -102,6 +185,10 @@ csv_t *csv_init(csv_t *csv, char *buf, int buflen)
 	return (csv);
 }
 
+/*
+ * csv_clean — 清空会话中的所有记录（逐条调用 csv_remove_record 释放）。
+ * 副作用：记录链表、num_recs、csv_len、pointer 被一并复位。
+ */
 void csv_clean(csv_t *csv)
 {
 	csv_record_t *rec;
@@ -115,6 +202,9 @@ void csv_clean(csv_t *csv)
 	}
 }
 
+/*
+ * csv_free — 释放会话结构本身（不释放底层 buf，buf 由调用方管理）。
+ */
 void csv_free(csv_t *csv)
 {
 	if (csv != NULL) {
@@ -122,17 +212,26 @@ void csv_free(csv_t *csv)
 	}
 }
 
+/*
+ * csv_init_record — 初始化一条记录：清空其字段链表并把 rec_len 置 0。
+ */
 static void csv_init_record(csv_record_t *record)
 {
 	TAILQ_INIT(&(record->fields));
 	record->rec_len = 0;
 }
 
+/*
+ * csv_record_iter — 返回 CSV 的第一条记录（无则 NULL）。
+ */
 csv_record_t *csv_record_iter(csv_t *csv)
 {
 	return (TAILQ_FIRST(&(csv->records)));
 }
 
+/*
+ * csv_record_iter_next — 返回下一条记录；rec 为 NULL 时返回 NULL。
+ */
 csv_record_t *csv_record_iter_next(csv_record_t *rec)
 {
 	if (!rec)
@@ -140,6 +239,11 @@ csv_record_t *csv_record_iter_next(csv_record_t *rec)
 	return (TAILQ_NEXT(rec, next_record));
 }
 
+/*
+ * csv_field_iter — 取记录内第一个字段，并把字段迭代器写入 *fld。
+ * 返回字段字符串；rec 为 NULL 时返回 NULL。
+ * 注意：记录无字段时会对空指针 ( *fld ) 解引用，调用前应确认记录含字段。
+ */
 char *csv_field_iter(csv_record_t *rec, csv_field_t **fld)
 {
 	if (!rec)
@@ -148,6 +252,9 @@ char *csv_field_iter(csv_record_t *rec, csv_field_t **fld)
 	return ((*fld)->field);
 }
 
+/*
+ * csv_field_iter_next — 推进字段迭代器并返回下一字段字符串；到末尾返回 NULL。
+ */
 char *csv_field_iter_next(csv_field_t **fld)
 {
 	*fld = TAILQ_NEXT(*fld, next_field);
@@ -157,6 +264,9 @@ char *csv_field_iter_next(csv_field_t **fld)
 	return ((*fld)->field);
 }
 
+/*
+ * csv_field_len — 返回字段长度；fld 为 NULL 时返回 0。
+ */
 int csv_field_len(csv_field_t *fld)
 {
 	if (fld) {
@@ -165,6 +275,12 @@ int csv_field_len(csv_field_t *fld)
 	return 0;
 }
 
+/*
+ * csv_decode_record — 把一条记录文本按逗号切分成字段链表。
+ * 逐段用 strpbrk 找逗号建立字段，最后以换行收尾；缺少换行时提前返回。
+ * 副作用：为记录分配并挂接 csv_field_t，填充 field 与 field_len。
+ * 注意：不做引号 / 转义处理，字段内出现逗号会被误切分。
+ */
 static void csv_decode_record(csv_record_t *rec)
 {
 	char *curr = rec->record;
@@ -194,6 +310,12 @@ static void csv_decode_record(csv_record_t *rec)
 	}
 }
 
+/*
+ * csv_add_field_to_record — 把字符串 col 作为一个字段追加到记录 rec。
+ * csv：所属会话（提供缓冲长度）；rec：目标记录；col：字段内容。
+ * 返回新字段；内存分配失败返回 NULL。
+ * 副作用：在 rec->record 的写入位置拼接 col，并更新 rec_len。
+ */
 static csv_field_t *csv_add_field_to_record(csv_t *csv, csv_record_t *rec,
 					    char *col)
 {
@@ -216,6 +338,13 @@ static csv_field_t *csv_add_field_to_record(csv_t *csv, csv_record_t *rec,
 	return fld;
 }
 
+/*
+ * csv_encode — 编码一条新记录：把 count 个字符串参数拼成一行并追加。
+ * csv：会话；count：字段个数；...：各字段字符串（char *）。
+ * 返回新记录指针；失败返回 NULL（并回收已分配资源）。
+ * 副作用：写入底层缓冲，更新 rec_len / csv_len / pointer / num_recs。
+ * 注意：字段之间自动补逗号，行末补换行；空字段用 NULL 传入。
+ */
 csv_record_t *csv_encode(csv_t *csv, int count, ...)
 {
 	int tempc;
@@ -276,6 +405,9 @@ csv_record_t *csv_encode(csv_t *csv, int count, ...)
 	return (rec);
 }
 
+/*
+ * csv_num_records — 返回记录条数；csv 为 NULL 时返回 0。
+ */
 int csv_num_records(csv_t *csv)
 {
 	if (csv) {
@@ -284,6 +416,12 @@ int csv_num_records(csv_t *csv)
 	return 0;
 }
 
+/*
+ * csv_encode_record — 用新值就地覆写一条已编码记录的字段内容。
+ * csv：会话；rec：先前由 csv_encode 返回的记录；count / ...：新字段值。
+ * 返回 rec；失败返回 NULL。
+ * 注意：按原各字段长度逐字节拷贝，新值不应加长字段（不做一致性检查）。
+ */
 csv_record_t *csv_encode_record(csv_t *csv, csv_record_t *rec, int count, ...)
 {
 	int tempc;
@@ -311,6 +449,11 @@ csv_record_t *csv_encode_record(csv_t *csv, csv_record_t *rec, int count, ...)
 	return (rec);
 }
 
+/*
+ * csv_append_record — 向已有记录追加字段；rec 为 NULL 时新建一条记录。
+ * 返回该记录；失败或处于单缓冲模式返回 NULL。
+ * 注意：仅独立记录缓冲模式可用；会先把行末换行改回逗号再接续字段。
+ */
 csv_record_t *csv_append_record(csv_t *csv, csv_record_t *rec, int count, ...)
 {
 	int tempc;
@@ -371,6 +514,11 @@ csv_record_t *csv_append_record(csv_t *csv, csv_record_t *rec, int count, ...)
 	return (rec);
 }
 
+/*
+ * csv_serialize — 把所有记录顺序序列化写入 msgbuf（容量 msglen）。
+ * 成功返回 0；csv / msgbuf 为空或缓冲不足返回 -1。
+ * 注意：仅独立记录缓冲模式下有意义。
+ */
 int csv_serialize(csv_t *csv, char *msgbuf, int msglen)
 {
 	csv_record_t *rec;
@@ -390,6 +538,11 @@ int csv_serialize(csv_t *csv, char *msgbuf, int msglen)
 	return 0;
 }
 
+/*
+ * csv_clone_record — 克隆记录 in_rec，结果写入 *out_rec。
+ * 副作用：为新记录分配内存并解码出字段链表。
+ * 注意：仅独立记录缓冲模式可用，且 in_rec 必须属于本 csv；出错时不修改 *out_rec。
+ */
 void csv_clone_record(csv_t *csv, csv_record_t *in_rec, csv_record_t **out_rec)
 {
 	char *curr;
@@ -431,6 +584,10 @@ void csv_clone_record(csv_t *csv, csv_record_t *in_rec, csv_record_t **out_rec)
 	*out_rec = rec;
 }
 
+/*
+ * csv_remove_record — 从 CSV 中删除一条记录及其所有字段并释放内存。
+ * 注意：rec 必须属于本 csv；单缓冲模式下不释放底层 buf，仅移除链表节点。
+ */
 void csv_remove_record(csv_t *csv, csv_record_t *rec)
 {
 	csv_field_t *fld = NULL, *p_fld;
@@ -460,6 +617,10 @@ void csv_remove_record(csv_t *csv, csv_record_t *rec)
 	free(rec);
 }
 
+/*
+ * csv_insert_record — 把一条记录插入 CSV 尾部。
+ * 注意：仅独立记录缓冲模式可用；rec 不能已在 csv 中；超出缓冲容量时拒绝插入。
+ */
 void csv_insert_record(csv_t *csv, csv_record_t *rec)
 {
 	/* first check if rec already in csv */
@@ -487,6 +648,11 @@ void csv_insert_record(csv_t *csv, csv_record_t *rec)
 	csv->pointer += rec->rec_len;
 }
 
+/*
+ * csv_concat_record — 把 rec1 与 rec2 拼成一条新记录并返回；rec1 / rec2 会被移除。
+ * 失败返回 NULL（出错时通过 goto 回收已分配的临时内存）。
+ * 注意：仅独立记录缓冲模式可用；两条记录都须属于本 csv 且以换行结尾。
+ */
 csv_record_t *csv_concat_record(csv_t *csv, csv_record_t *rec1,
 				csv_record_t *rec2)
 {
@@ -565,6 +731,12 @@ out_rec:
 	return NULL;
 }
 
+/*
+ * csv_decode — 解码一段 CSV 文本为记录 / 字段链表。
+ * csv：会话；inbuf：待解码文本（NULL 则改用 csv->buf，单缓冲模式常用）。
+ * 副作用：按换行切分记录、逐条解码字段，更新 num_recs。
+ * 注意：单缓冲模式下 rec->record 直接指向共享 buf，独立模式则各自拷贝一份。
+ */
 void csv_decode(csv_t *csv, char *inbuf)
 {
 	char *buf;
@@ -600,6 +772,9 @@ void csv_decode(csv_t *csv, char *inbuf)
 	}
 }
 
+/*
+ * csv_is_record_valid — 判断记录 in_rec 是否属于 csv。返回 1 有效 / 0 无效。
+ */
 int csv_is_record_valid(csv_t *csv, csv_record_t *in_rec)
 {
 	csv_record_t *rec;
@@ -617,6 +792,9 @@ int csv_is_record_valid(csv_t *csv, csv_record_t *in_rec)
 	return valid;
 }
 
+/*
+ * csv_dump — 把解码后每条记录的每个字段打印到 stderr（调试用）。
+ */
 void csv_dump(csv_t *csv)
 {
 	csv_record_t *rec;
@@ -634,8 +812,17 @@ void csv_dump(csv_t *csv)
 	}
 }
 
+/*
+ * 自测区：以下代码仅在编译时定义 TEST_CSV 宏才会被纳入，用于手工验证 CSV
+ * 编解码与内存使用，正常构建下不参与编译。
+ */
 #ifdef TEST_CSV
 
+/*
+ * get_memory_usage — 读取 /proc/<pid>/status，返回该进程 VmData 与 VmStk 之和
+ * （近似内存占用，仅 Linux）。打开失败返回 -1。
+ * 仅自测使用。
+ */
 static int get_memory_usage(pid_t pid)
 {
 	int fd, data, stack;
@@ -665,6 +852,10 @@ static int get_memory_usage(pid_t pid)
 	return data + stack;
 }
 
+/*
+ * main — 自测入口：依次演示编码、覆写记录、清理、解码与打印，并打印内存占用。
+ * 仅当定义 TEST_CSV 时参与编译。
+ */
 int main()
 {
 	char buf[10000];

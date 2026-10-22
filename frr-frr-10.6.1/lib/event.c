@@ -3,7 +3,37 @@
  * Copyright (C) 1998, 2000 Kunihiro Ishiguro <kunihiro@zebra.org>
  */
 
+/* 取消下面这行的注释即可打开事件子系统的编译期调试输出。 */
 /* #define DEBUG */
+
+/* ==================== 文件导读 ====================
+ * 本文件是 FRR 事件子系统（旧名 thread 子系统）的核心实现，是几乎所有
+ * 守护进程的“心脏”。它实现了事件主循环 event_loop（旧名 thread_master），
+ * 把定时器、文件描述符可读 / 可写、一次性事件、跨线程投递的事件统一排队
+ * 调度，并逐一回调注册的处理函数。
+ *
+ * 关键数据结构：
+ *   - struct event_loop：一个事件循环实例。持有 read / write 两个 fd 事件
+ *     槽数组、定时器最小堆 timer、以及 event / ready / unuse 三条链表；
+ *     还持有跨线程取消请求链表 cancel_req、cpu 统计 cpu_records、唤醒用
+ *     的 io_pipe 与归属线程 owner 等。
+ *   - struct event：一次被调度的具体事件（见 frrevent.h）。
+ *   - struct fd_handler：fd 监听后端，EPOLL_ENABLED 时用 epoll，否则用
+ *     poll；分别维护 fd 集合 / pollfd 数组。
+ *
+ * 主循环怎么跑：
+ *   1. 每轮先取出已到期的定时器，转入 ready 队列；
+ *   2. 调用后端（epoll_wait / poll）等待 fd 就绪，把就绪 fd 对应的事件也
+ *      转入 ready 队列；
+ *   3. 按链表中顺序执行 ready 队列里的事件回调；
+ *   4. 处理跨线程取消请求与唤醒管道。
+ *
+ * 线程与主循环的关系：
+ *   - 每个 event_loop 归属于某个 pthread（owner）；event_master_create
+ *     在主线程创建，工作线程通过 frr_pthread 创建自己的循环。
+ *   - 其它线程往某循环投递 / 取消事件时，若目标不是本线程，会走
+ *     cancel_req 异步队列并用 io_pipe 唤醒目标循环（见 event_cancel_async）。
+ * ================================================ */
 
 #include <zebra.h>
 
@@ -26,6 +56,7 @@
 #include "libfrr_trace.h"
 #include "libfrr.h"
 
+/* 为事件对象、事件循环、poll 信息、统计记录分别登记内存类型，便于统计排查。 */
 DEFINE_MTYPE_STATIC(LIB, THREAD, "Thread");
 DEFINE_MTYPE_STATIC(LIB, EVENT_MASTER, "Thread master");
 DEFINE_MTYPE_STATIC(LIB, EVENT_POLL, "Thread Poll Info");
@@ -36,6 +67,10 @@ DEFINE_MTYPE_STATIC(LIB, EVENT_STATS, "Thread stats");
 PREDECL_HASH(epoll_event_hash);
 PREDECL_DLIST(epoll_revent_list);
 
+/* epoll 版：每个被监听的 fd 对应一个 frr_epoll_event，既挂进哈希表（按 fd
+ * 查找）又挂进“常规文件”链表。ev 是原始 epoll_event，flags 见
+ * FRR_EV_FD_IS_REGULAR。
+ */
 struct frr_epoll_event {
 	struct epoll_event ev;
 	int flags;
@@ -44,8 +79,13 @@ struct frr_epoll_event {
 };
 
 /* Flags values */
+/* 标志位：该 fd 是常规文件（epoll 不能监听，需走常规事件链表）。 */
 #define FRR_EV_FD_IS_REGULAR 0x01
 
+/* epoll 后端的 fd 处理器：epoll_fd 为 epoll 实例；epoll_event_hash 按 fd
+ * 登记被监听事件；revents 是 epoll_wait 的结果缓冲区；epoll_revents_list
+ * 存放无法加入 epoll 的常规文件事件；fd_poll_counter 统计每个 fd 的事件数。
+ */
 struct fd_handler {
 	/* The epoll set file descriptor */
 	int epoll_fd;
@@ -72,6 +112,10 @@ struct fd_handler {
 	unsigned long *fd_poll_counter;
 };
 #else
+/* poll 后端的 fd 处理器：pfds 是待监听的 pollfd 数组（容量 pfdsize，已用
+ * pfdcount），copy 是轮询前对 pfds 的临时拷贝（容量同 pfdsize，已用
+ * copycount）。
+ */
 struct fd_handler {
 	/* number of pfd that fit in the allocated space of pfds. This is a
 	 * constant and is the same for both pfds and copy.
@@ -91,6 +135,21 @@ struct fd_handler {
 #endif
 
 /* Master of the theads. */
+/* 事件主循环（event_master）。字段要点：
+ *   name：循环名（日志 / 统计用）。
+ *   read、write：按 fd 索引的读 / 写事件指针数组（同一 fd 单事件）。
+ *   timer：定时器最小堆，按到期时间排序。
+ *   event、ready、unuse：待处理、就绪、空闲三条事件链表。
+ *   cancel_req：来自其它线程的取消请求；canceled 与 cancel_cond 配合。
+ *   cpu_records：按回调函数聚合的 cpu / 墙钟统计哈希表。
+ *   io_pipe：自唤醒管道，向写端写字节即可唤醒阻塞中的 poll / epoll。
+ *   fd_limit：fd 上限；handler：fd 监听后端；selectpoll_timeout：超时；
+ *     spin：忙等标记。
+ *   handle_signals：本循环是否处理进程信号。
+ *   mtx：保护本结构的互斥锁；owner：归属线程（pthread）。
+ *   ready_run_loop：主循环是否已进入就绪运行态。
+ *   last_getrusage / last_tardy_warning：统计与迟到告警限速的时间记录。
+ */
 struct event_loop {
 	char *name;
 
@@ -123,12 +182,14 @@ struct event_loop {
 #if EPOLL_ENABLED
 DEFINE_MTYPE_STATIC(LIB, EVENT_EPOLL, "Thread epoll events");
 
+/* 比较两个 epoll 事件所属 fd，供哈希表判等用。 */
 static int epoll_event_hash_cmp(const struct frr_epoll_event *f,
 				const struct frr_epoll_event *s)
 {
 	return f->ev.data.fd - s->ev.data.fd;
 }
 
+/* 以 fd 计算 epoll 事件哈希键（jhash 加固定种子）。 */
 static uint32_t epoll_event_hash_key(const struct frr_epoll_event *e)
 {
 	uint32_t val, initval = 0xd4297c53;
@@ -137,17 +198,23 @@ static uint32_t epoll_event_hash_key(const struct frr_epoll_event *e)
 	return jhash_1word(val, initval);
 }
 
+/* 展开 epoll 事件哈希表实现（键为 fd）。 */
 /* Hash of epoll events (by fd) */
 DECLARE_HASH(epoll_event_hash, struct frr_epoll_event, hlink, epoll_event_hash_cmp,
 	     epoll_event_hash_key);
 
+/* 展开“常规文件”事件链表实现（这些对象不加入 epoll 集）。 */
 /* List of "regular" epoll objects, that are not added to the epoll set. */
 DECLARE_DLIST(epoll_revent_list, struct frr_epoll_event, rlink);
 
 #endif
 
+/* 展开 event_list（struct event 的 eventitem 成员）链表实现。 */
 DECLARE_LIST(event_list, struct event, eventitem);
 
+/* 一条跨线程取消请求：flags 见 EVENT_CANCEL_FLAG_READY；event 为待取消事件；
+ * eventobj 为附带数据；threadref 为调用方保存的事件句柄指针。
+ */
 struct cancel_req {
 	int flags;
 	struct event *event;
@@ -155,9 +222,11 @@ struct cancel_req {
 	struct event **threadref;
 };
 
+/* 取消请求标志：目标事件当前位于 ready 队列。 */
 /* Flags for task cancellation */
 #define EVENT_CANCEL_FLAG_READY 0x01
 
+/* 定时器最小堆比较函数：按到期时间（先 tv_sec 后 tv_usec）升序。 */
 static int event_timer_cmp(const struct event *a, const struct event *b)
 {
 	if (a->u.sands.tv_sec < b->u.sands.tv_sec)
@@ -171,8 +240,10 @@ static int event_timer_cmp(const struct event *a, const struct event *b)
 	return 0;
 }
 
+/* 展开 event_timer_list 最小堆实现（比较函数见上）。 */
 DECLARE_HEAP(event_timer_list, struct event, timeritem, event_timer_cmp);
 
+/* 唤醒主循环：向 io_pipe 写端写一个字节，使 poll / epoll_wait 立即返回。 */
 #define AWAKEN(m)                                                              \
 	do {                                                                   \
 		const unsigned char wakebyte = 0x01;                           \
@@ -180,21 +251,27 @@ DECLARE_HEAP(event_timer_list, struct event, timeritem, event_timer_cmp);
 	} while (0)
 
 /* control variable for initializer */
+/* init_once 保证本文件的初始化逻辑只执行一次；thread_current 为线程局部键。 */
 static pthread_once_t init_once = PTHREAD_ONCE_INIT;
 pthread_key_t thread_current;
 
+/* 所有事件循环组成全局链表 masters，保护它的是 masters_mtx。 */
 static pthread_mutex_t masters_mtx = PTHREAD_MUTEX_INITIALIZER;
 static struct list *masters;
 
+/* 内部函数：释放一个事件及其关联资源（前置声明）。 */
 static void thread_free(struct event_loop *master, struct event *event);
 
+/* cpu / 墙钟时间统计的开关与阈值（详见 frrevent.h 中同名 extern 说明）。 */
 bool cputime_enabled = true;
 unsigned long cputime_threshold = CONSUMED_TIME_CHECK;
 unsigned long walltime_threshold = CONSUMED_TIME_CHECK;
 
+/* CLI 相关代码区：下面 include 的 clippy 文件提供 "show event cpu" 等命令。 */
 /* CLI start ---------------------------------------------------------------- */
 #include "lib/event_clippy.c"
 
+/* cpu 统计哈希表以回调函数地址为键。 */
 static uint32_t cpu_record_hash_key(const struct cpu_event_history *a)
 {
 	int size = sizeof(a->func);
@@ -202,15 +279,18 @@ static uint32_t cpu_record_hash_key(const struct cpu_event_history *a)
 	return jhash(&a->func, size, 0);
 }
 
+/* cpu 统计哈希表的判等函数：比较回调函数地址。 */
 static int cpu_record_hash_cmp(const struct cpu_event_history *a,
 			       const struct cpu_event_history *b)
 {
 	return numcmp((uintptr_t)a->func, (uintptr_t)b->func);
 }
 
+/* 展开 cpu_records 哈希表实现。 */
 DECLARE_HASH(cpu_records, struct cpu_event_history, item, cpu_record_hash_cmp,
 	     cpu_record_hash_key);
 
+/* 按回调函数在 loop 的统计表里查找记录，不存在则新建并挂入；funcname 用于显示。 */
 static struct cpu_event_history *cpu_records_get(struct event_loop *loop,
 						 void (*func)(struct event *e),
 						 const char *funcname)
@@ -227,16 +307,21 @@ static struct cpu_event_history *cpu_records_get(struct event_loop *loop,
 	return res;
 }
 
+/* 清零一条统计记录的“可清除区间”（由零长数组标出的字段范围）。 */
 static void cpu_records_clear(struct cpu_event_history *p)
 {
 	memset(p->_clear_begin, 0, p->_clear_end - p->_clear_begin);
 }
 
+/* 释放一条统计记录。 */
 static void cpu_records_free(struct cpu_event_history **p)
 {
 	XFREE(MTYPE_EVENT_STATS, *p);
 }
 
+/* 把一条 cpu 统计记录格式化输出：先是各计数与均值 / 峰值，再以 R / W / T /
+ * E / X 字母标出该回调涉及的事件类型，最后是函数名。
+ */
 static void vty_out_cpu_event_history(struct vty *vty,
 				      struct cpu_event_history *a)
 {
@@ -254,6 +339,9 @@ static void vty_out_cpu_event_history(struct vty *vty,
 		a->types & (1 << EVENT_EXECUTE) ? 'X' : ' ', a->funcname);
 }
 
+/* 打印一条统计记录（按 filter 过滤类型），并把它的各计数累加到 totals，
+ * 以便最后打印总计行。先用原子读把记录快照到局部 copy，避免并发竞争。
+ */
 static void cpu_record_print_one(struct vty *vty, uint8_t filter,
 				 struct cpu_event_history *totals,
 				 const struct cpu_event_history *a)
@@ -297,6 +385,9 @@ static void cpu_record_print_one(struct vty *vty, uint8_t filter,
 		totals->cpu.max = copy.cpu.max;
 }
 
+/* 打印所有事件循环的 cpu / 墙钟统计：先按 pthread 逐个输出其统计表，再输出
+ * 汇总行。若 cputime 统计被关闭会先给出提示（墙钟统计始终有效）。
+ */
 static void cpu_record_print(struct vty *vty, uint8_t filter)
 {
 	struct cpu_event_history tmp;
@@ -362,6 +453,9 @@ static void cpu_record_print(struct vty *vty, uint8_t filter)
 		vty_out_cpu_event_history(vty, &tmp);
 }
 
+/* 按 filter 清零各循环统计表中匹配记录的可清除字段。注意这里只清零不释放
+ * 内存，因为其中一些记录可能正在被使用（如当前正在运行的记录）。
+ */
 static void cpu_record_clear(uint8_t filter)
 {
 	struct event_loop *m;
@@ -385,6 +479,9 @@ static void cpu_record_clear(uint8_t filter)
 	}
 }
 
+/* 把命令里的过滤字符串（R / W / T / E / X 等字母）解析成一个位掩码，用于
+ * 选择要显示 / 清理的事件类型。未知字符忽略。返回掩码。
+ */
 static uint8_t parse_filter(const char *filterstr)
 {
 	int i = 0;
@@ -420,6 +517,7 @@ static uint8_t parse_filter(const char *filterstr)
 	return filter;
 }
 
+/* 命令 "show event cpu [FILTER]"：按可选过滤器显示各线程的事件 cpu 统计。 */
 DEFUN_NOSH (show_event_cpu,
             show_event_cpu_cmd,
             "show event cpu [FILTER]",
@@ -445,6 +543,7 @@ DEFUN_NOSH (show_event_cpu,
 	return CMD_SUCCESS;
 }
 
+/* 命令 "[no] service cputime-stats"：开关 cpu 时间统计（cputime_enabled）。 */
 DEFPY (service_cputime_stats,
        service_cputime_stats_cmd,
        "[no] service cputime-stats",
@@ -456,6 +555,7 @@ DEFPY (service_cputime_stats,
 	return CMD_SUCCESS;
 }
 
+/* 命令 "[no] service cputime-warning <毫秒>"：设置 cpu 超时告警阈值；no 时清零。 */
 DEFPY (service_cputime_warning,
        service_cputime_warning_cmd,
        "[no] service cputime-warning ![(1-4294967295)]",
@@ -471,6 +571,7 @@ DEFPY (service_cputime_warning,
 	return CMD_SUCCESS;
 }
 
+/* 命令 "[no] service walltime-warning <毫秒>"：设置墙钟超时告警阈值；no 时清零。 */
 DEFPY (service_walltime_warning,
        service_walltime_warning_cmd,
        "[no] service walltime-warning ![(1-4294967295)]",
@@ -487,11 +588,15 @@ DEFPY (service_walltime_warning,
 }
 
 #if EPOLL_ENABLED
+/* "show event poll" 辅助迭代器的参数：vty 与目标事件循环。 */
 struct show_event_poll_helper_iter_arg_t {
 	struct vty *vty;
 	struct event_loop *master;
 };
 
+/* 打印一个 epoll 事件的 fd、监听事件位与对应的读 / 写回调函数名（缺省显示
+ * ERROR），用于 "show event poll" 调试。
+ */
 static void show_epoll_event_helper(struct vty *vty, const struct frr_epoll_event *ev,
 				    struct event_loop *m)
 {
@@ -520,6 +625,9 @@ static void show_epoll_event_helper(struct vty *vty, const struct frr_epoll_even
 		vty_out(vty, "\n");
 }
 
+/* epoll 版：打印某事件循环的 fd 监听概况——每个 fd 的事件计数、注册的事件
+ * 总数（哈希 + 常规链表）与 fd 上限，再逐个列出 epoll 事件。
+ */
 static void show_event_poll_helper(struct vty *vty, struct event_loop *m)
 {
 	const char *name = m->name ? m->name : "main";
@@ -548,6 +656,9 @@ static void show_event_poll_helper(struct vty *vty, struct event_loop *m)
 		show_epoll_event_helper(vty, ev, m);
 }
 #else
+/* poll 版：打印某事件循环监听的 pollfd 数组（fd、监听事件位、就绪事件位与
+ * 对应读写回调名）以及已监听个数 / fd 上限。
+ */
 static void show_event_poll_helper(struct vty *vty, struct event_loop *m)
 {
 	const char *name = m->name ? m->name : "main";
@@ -590,6 +701,7 @@ static void show_event_poll_helper(struct vty *vty, struct event_loop *m)
 }
 #endif
 
+/* 命令 "show event poll"：遍历所有事件循环，输出各自的 fd 监听详情。 */
 DEFUN_NOSH (show_event_poll,
             show_event_poll_cmd,
             "show event poll",
@@ -611,6 +723,7 @@ DEFUN_NOSH (show_event_poll,
 	return CMD_SUCCESS;
 }
 
+/* 命令 "clear event cpu [FILTER]"：按过滤器清零各线程的事件 cpu 统计。 */
 DEFUN (clear_event_cpu,
        clear_event_cpu_cmd,
        "clear event cpu [FILTER]",
@@ -636,6 +749,7 @@ DEFUN (clear_event_cpu,
 	return CMD_SUCCESS;
 }
 
+/* 打印某个事件循环当前挂着的所有定时器（函数名 + 剩余时间）。 */
 static void show_event_timers_helper(struct vty *vty, struct event_loop *m)
 {
 	const char *name = m->name ? m->name : "main";
@@ -653,6 +767,7 @@ static void show_event_timers_helper(struct vty *vty, struct event_loop *m)
 	}
 }
 
+/* 命令 "show event timers"：显示所有事件循环中的定时器及其剩余时间。 */
 DEFPY_NOSH (show_event_timers,
             show_event_timers_cmd,
             "show event timers",
@@ -674,6 +789,7 @@ DEFPY_NOSH (show_event_timers,
 	return CMD_SUCCESS;
 }
 
+/* 注册事件子系统相关的 CLI 命令（在守护进程启动时调用）。 */
 void event_cmd_init(void)
 {
 	install_element(VIEW_NODE, &show_event_cpu_cmd);
@@ -689,18 +805,21 @@ void event_cmd_init(void)
 /* CLI end ------------------------------------------------------------------ */
 
 
+/* 释放一条取消请求对象（作为链表删除回调使用）。 */
 static void cancelreq_del(void *cr)
 {
 	XFREE(MTYPE_TMP, cr);
 }
 
 /* initializer, only ever called once */
+/* 一次性初始化：创建线程局部键 thread_current。由 pthread_once 保证只跑一次。 */
 static void initializer(void)
 {
 	pthread_key_create(&thread_current, NULL);
 }
 
 #if EPOLL_ENABLED
+/* 分配 / 释放 epoll 包装结构 frr_epoll_event */
 /* Alloc, free epoll wrapper structs */
 static struct frr_epoll_event *frr_epoll_event_new(int fd, uint32_t events)
 {
@@ -711,11 +830,15 @@ static struct frr_epoll_event *frr_epoll_event_new(int fd, uint32_t events)
 	return ev;
 }
 
+/* 释放一个 frr_epoll_event。 */
 static void frr_epoll_event_del(struct frr_epoll_event **ev)
 {
 	XFREE(MTYPE_EVENT_EPOLL, *ev);
 }
 
+/* 取 fd 的 stat 信息；若 fstat 因 EBADF 失败则认为 fd 已关闭，通过 fd_closed
+ * 报告（其它 errno 仅打调试日志）。
+ */
 static void get_fd_stat(int fd, struct stat *fd_stat, bool *fd_closed)
 {
 	assert(fd_stat != NULL);
@@ -734,8 +857,21 @@ static void get_fd_stat(int fd, struct stat *fd_stat, bool *fd_closed)
 }
 #endif
 
+/* fd_limit 的硬上限：超过则截断，避免为超大 fd 表分配过多内存。 */
 #define STUPIDLY_LARGE_FD_SIZE 100000
 
+/* 创建一个事件主循环（event_master）。要点：
+ *   - 通过 pthread_once 做一次性初始化（创建 thread_current 键）；
+ *   - 初始化互斥量 / 取消条件变量，复制名字；
+ *   - 确定 fd 上限：优先配置值，否则 ulimit，并截断到 STUPIDLY_LARGE_FD_SIZE；
+ *   - 分配 read / write 两个按 fd 索引的事件指针数组；
+ *   - 初始化 cpu 统计哈希表、event / ready / unuse 链表与定时器堆；
+ *   - spin、handle_signals 置真，设定迟到告警基准时间，记录 owner；
+ *   - 创建唤醒管道 io_pipe（非阻塞）；
+ *   - 按后端初始化 fd_handler（epoll 版创建 epoll 实例并把管道读端加入；
+ *     poll 版分配 pfds 与 copy 数组）；
+ *   - 最后把本循环加入全局 masters 链表。返回新建的事件循环。
+ */
 struct event_loop *event_master_create(const char *name)
 {
 	struct event_loop *rv;
@@ -848,6 +984,7 @@ struct event_loop *event_master_create(const char *name)
 	return rv;
 }
 
+/* 修改事件循环的名字（加锁替换 name 字符串）。 */
 void event_master_set_name(struct event_loop *master, const char *name)
 {
 	frr_with_mutex (&master->mtx) {
@@ -856,9 +993,16 @@ void event_master_set_name(struct event_loop *master, const char *name)
 	}
 }
 
+/* unuse（空闲事件缓存）链表的最大保留深度：复用已分配事件对象，减少频繁的
+ * malloc / free。
+ */
 #define EVENT_UNUSED_DEPTH 10
 
 /* Move thread to unuse list. */
+/* 把一个事件放回 unuse 空闲缓存链表以便复用；超过 EVENT_UNUSED_DEPTH 则真正
+ * 释放。会先把事件清零（保留 type=EVENT_UNUSED 与原互斥量），并递减其活跃
+ * 计数 total_active。
+ */
 static void thread_add_unuse(struct event_loop *m, struct event *event)
 {
 	pthread_mutex_t mtxc = event->mtx;
@@ -881,6 +1025,7 @@ static void thread_add_unuse(struct event_loop *m, struct event *event)
 }
 
 /* Free all unused thread. */
+/* 释放一条事件链表里的全部事件。 */
 static void thread_list_free(struct event_loop *m, struct event_list_head *list)
 {
 	struct event *t;
@@ -889,6 +1034,7 @@ static void thread_list_free(struct event_loop *m, struct event_list_head *list)
 		thread_free(m, t);
 }
 
+/* 释放 fd 事件数组（read / write）里的全部事件并释放数组本身。 */
 static void thread_array_free(struct event_loop *m, struct event **thread_array)
 {
 	struct event *t;
@@ -905,6 +1051,11 @@ static void thread_array_free(struct event_loop *m, struct event **thread_array)
 }
 
 /* Stop thread scheduler. */
+/* 销毁事件循环：从全局 masters 摘除；释放 read / write 数组、定时器堆、三条
+ * 事件链表中的所有事件；销毁互斥量 / 条件变量；关闭唤醒管道；释放取消请求
+ * 链表与 cpu 统计；按后端释放 fd_handler（epoll 释放实例与哈希 / 链表，
+ * poll 释放 pfds / copy）；最后释放循环结构。
+ */
 void event_master_free(struct event_loop *m)
 {
 	struct cpu_event_history *record;
@@ -962,6 +1113,7 @@ void event_master_free(struct event_loop *m)
 }
 
 /* Return remain time in milliseconds. */
+/* 返回定时器剩余毫秒数；对非定时器 / 未调度返回 0，剩余为负也归 0。 */
 unsigned long event_timer_remain_msec(struct event *event)
 {
 	int64_t remain;
@@ -977,11 +1129,13 @@ unsigned long event_timer_remain_msec(struct event *event)
 }
 
 /* Return remain time in seconds. */
+/* 返回定时器剩余秒数（由毫秒换算）。 */
 unsigned long event_timer_remain_second(struct event *event)
 {
 	return event_timer_remain_msec(event) / 1000LL;
 }
 
+/* 返回定时器剩余时间（timeval）。注意这里不判空，传入非定时器需小心。 */
 struct timeval event_timer_remain(struct event *event)
 {
 	struct timeval remain;
@@ -992,6 +1146,9 @@ struct timeval event_timer_remain(struct event *event)
 	return remain;
 }
 
+/* 把秒数格式化成 hh:mm:ss 写入 buf。返回非 0 表示未按 8 字节写出（异常），
+ * 正常返回 0。要求 buf_size 至少 8。
+ */
 static int time_hhmmss(char *buf, int buf_size, long sec)
 {
 	long hh;
@@ -1010,6 +1167,9 @@ static int time_hhmmss(char *buf, int buf_size, long sec)
 	return wr != 8;
 }
 
+/* 把定时器剩余时间格式化成 hh:mm:ss 到 buf；传入 NULL 时输出 "--:--:--"。
+ * 返回 buf 以便链式使用。
+ */
 char *event_timer_to_hhmmss(char *buf, int buf_size, struct event *t_timer)
 {
 	if (t_timer)
@@ -1021,6 +1181,10 @@ char *event_timer_to_hhmmss(char *buf, int buf_size, struct event *t_timer)
 }
 
 /* Get new thread.  */
+/* 从 unuse 缓存取一个事件（没有则新建），填入类型、master、arg、回调、yield、
+ * 迟到阈值等字段，并在回调或 funcname 变化时更新其 cpu 统计记录，递增活跃
+ * 计数。返回初始化好的事件对象。注意这里不设置 ref。
+ */
 static struct event *event_get(struct event_loop *m, uint8_t type,
 				void (*func)(struct event *), void *arg,
 				const struct xref_eventsched *xref)
@@ -1066,6 +1230,7 @@ static struct event *event_get(struct event_loop *m, uint8_t type,
 	return event;
 }
 
+/* 真正释放一个事件对象：销毁其互斥量并释放内存。 */
 static void thread_free(struct event_loop *master, struct event *event)
 {
 	/* Free allocated resources. */
@@ -1073,6 +1238,15 @@ static void thread_free(struct event_loop *master, struct event *event)
 	XFREE(MTYPE_THREAD, event);
 }
 
+/* 后端轮询：调用 epoll_wait / ppoll / poll 等待 fd 就绪或超时，返回就绪的事件
+ * 数。要点：
+ *   - 进入前先释放 RCU 读锁、刷新线程局部日志缓冲；
+ *   - 处理信号竞争：主线程先屏蔽关键信号，若已有待处理信号则直接返回；
+ *   - poll 后端把唤醒管道 io_pipe[0] 临时作为最后一个 pollfd；
+ *   - 返回后清空管道、按需修正就绪计数，再重新获取 RCU 读锁。
+ * timer_wait 为等待超时（NULL 时由 selectpoll_timeout 决定或无限阻塞）；
+ * *eintr_p 在因信号中断时置真。
+ */
 static int fd_poll(struct event_loop *m, const struct timeval *timer_wait,
 		   bool *eintr_p)
 {
@@ -1220,6 +1394,9 @@ done:
 }
 
 #if EPOLL_ENABLED
+/* epoll 平台上注册读 / 写事件的辅助函数（调用前须持有循环锁）。会把 fd 加入
+ * epoll 集合并登记到哈希表；常规文件不能加入 epoll，改登记到常规事件链表。
+ */
 /*
  * Helper for event add read/write on epoll platforms; we expect the loop's lock
  * to be held.
@@ -1310,6 +1487,11 @@ static void add_epoll_rw_helper(struct event_loop *m, int fd, int dir)
 }
 #endif /* EPOLL */
 
+/* 注册 / 更新一个 fd 的读或写事件（dir 由 xref->event_type 指定 READ / WRITE）。
+ * 若 t_ptr 指向的事件已存在则不重复注册。epoll 后端调用 add_epoll_rw_helper；
+ * poll 后端复用已有 pollfd 槽或追加新槽。随后用 event_get 取事件、填入 fd 并
+ * 存入 m->read / m->write 数组，回填 *t_ptr 与 event->ref，最后 AWAKEN 唤醒循环。
+ */
 /* Add new read thread. */
 void _event_add_read_write(const struct xref_eventsched *xref,
 			   struct event_loop *m, void (*func)(struct event *),
@@ -1405,6 +1587,10 @@ void _event_add_read_write(const struct xref_eventsched *xref,
 	}
 }
 
+/* 注册定时器（timeval 相对时间）的内部实现：计算绝对到期时刻（当前时间 +
+ * 相对值），在锁内取事件并加入定时器堆，若成为最早到期者则 AWAKEN 让循环
+ * 重新计算等待超时；相对时间超过一年会告警。
+ */
 static void _event_add_timer_timeval(const struct xref_eventsched *xref,
 				     struct event_loop *m,
 				     void (*func)(struct event *), void *arg,
@@ -1451,6 +1637,7 @@ static void _event_add_timer_timeval(const struct xref_eventsched *xref,
 		if (event_timer_list_first(&m->timer) == event)
 			AWAKEN(m);
 	}
+/* 一年的秒数，用于对过长的定时器给出告警。 */
 #define ONEYEAR2SEC (60 * 60 * 24 * 365)
 	if (time_relative->tv_sec > ONEYEAR2SEC)
 		flog_err(EC_LIB_TIMER_TOO_LONG,
@@ -1460,6 +1647,7 @@ static void _event_add_timer_timeval(const struct xref_eventsched *xref,
 
 
 /* Add timer event thread. */
+/* 注册一个相对定时器（单位秒），转成 timeval 后交给内部实现。 */
 void _event_add_timer(const struct xref_eventsched *xref, struct event_loop *m,
 		      void (*func)(struct event *), void *arg, long timer,
 		      struct event **t_ptr)
@@ -1475,6 +1663,7 @@ void _event_add_timer(const struct xref_eventsched *xref, struct event_loop *m,
 }
 
 /* Add timer event thread with "millisecond" resolution */
+/* 注册一个相对定时器（单位毫秒），换算后交给内部实现。 */
 void _event_add_timer_msec(const struct xref_eventsched *xref,
 			   struct event_loop *m, void (*func)(struct event *),
 			   void *arg, long timer, struct event **t_ptr)
@@ -1490,6 +1679,7 @@ void _event_add_timer_msec(const struct xref_eventsched *xref,
 }
 
 /* Add timer event thread with "timeval" resolution */
+/* 注册一个相对定时器（直接给定 timeval）。 */
 void _event_add_timer_tv(const struct xref_eventsched *xref,
 			 struct event_loop *m, void (*func)(struct event *),
 			 void *arg, struct timeval *tv, struct event **t_ptr)
@@ -1498,6 +1688,9 @@ void _event_add_timer_tv(const struct xref_eventsched *xref,
 }
 
 /* Add simple event thread. */
+/* 注册一个一次性事件（EVENT_EVENT），val 由回调从事件里取出。若 t_ptr 已存在
+ * 则不重复注册；成功后回填句柄与 ref 并 AWAKEN。
+ */
 void _event_add_event(const struct xref_eventsched *xref, struct event_loop *m,
 		      void (*func)(struct event *), void *arg, int val,
 		      struct event **t_ptr)
@@ -1530,8 +1723,13 @@ void _event_add_event(const struct xref_eventsched *xref, struct event_loop *m,
 	}
 }
 
+/* 事件取消相关实现区。 */
 /* Thread cancellation ------------------------------------------------------ */
 
+/* epoll 版：清除某 fd 上指定的监听事件位（state 为 EPOLLIN / EPOLLOUT 或其相或）。
+ * 若清除后不再监听任何事件，则把 fd 从 epoll 集合 / 哈希表（常规文件从链表）
+ * 中彻底移除；否则更新 epoll 与哈希表中的事件位。参数 idx_hint 在 epoll 版未用。
+ */
 /**
  * NOT's out the .events field of pollfd corresponding to the given file
  * descriptor. The event to be NOT'd is passed in the 'state' parameter.
@@ -1611,6 +1809,10 @@ static void event_cancel_rw(struct event_loop *master, int fd, short state,
 	}
 }
 #else
+/* poll 版：清除某 pollfd 上指定的事件位（state 或上 POLLHUP）。idx_hint >= 0
+ * 时直接用该下标，否则在 pfds 中查找 fd。若某 pollfd 事件全被清除则从数组中
+ * 移除（memmove 压缩）；对 copy 数组做同样处理（若其中也存在该 fd）。
+ */
 static void event_cancel_rw(struct event_loop *master, int fd, short state,
 			    int idx_hint)
 {
@@ -1677,6 +1879,7 @@ static void event_cancel_rw(struct event_loop *master, int fd, short state,
 #endif
 
 #if EPOLL_ENABLED
+/* epoll 取消辅助：判断某 epoll 事件对应的读 / 写回调的 arg 是否等于给定的 arg。 */
 /*
  * Helper for epoll task cancellation; check for match with cancelled 'arg' value.
  */
@@ -1716,6 +1919,10 @@ static bool epoll_cancel_arg_helper(struct frr_epoll_event *ev, struct event_loo
 }
 #endif
 
+/* 按 arg 取消：遍历各任务容器（event、ready、io、timer），把 arg 匹配的事件从
+ * 相应容器摘除、清空调用方句柄并放回 unuse 缓存。若 cr->flags 带
+ * EVENT_CANCEL_FLAG_READY，则只处理 event / ready 两条链表后返回。
+ */
 /*
  * Process task cancellation given a task argument: iterate through the
  * various lists of tasks, looking for any that match the argument.
@@ -1823,6 +2030,11 @@ static void cancel_arg_helper(struct event_loop *master,
 	}
 }
 
+/* 处理取消请求队列：仅允许由拥有该 event_master 的线程调用（须持 master->mtx）。
+ * 对每个请求：若带 eventobj 走 arg 取消；否则按事件类型（读写 / 定时器 /
+ * 事件 / 就绪）从对应容器摘除并释放。处理完清空请求链表，置 canceled 并广播
+ * cancel_cond 唤醒 event_cancel_async 的等待者。
+ */
 /**
  * Process cancellation requests.
  *
@@ -1917,6 +2129,9 @@ static void do_event_cancel(struct event_loop *master)
 	pthread_cond_broadcast(&master->cancel_cond);
 }
 
+/* arg 取消的公共入口：断言在所属线程调用；构造 cancel_req 入队后在锁内直接
+ * 调用 do_event_cancel 处理。arg 为 NULL 时直接返回。
+ */
 /*
  * Helper function used for multiple flavors of arg-based cancellation.
  */
@@ -1941,6 +2156,7 @@ static void cancel_event_helper(struct event_loop *m, void *arg, int flags)
 	}
 }
 
+/* 取消所有 arg 匹配的事件（含 io 与定时器）。非线程安全，须在所属线程调用。 */
 /**
  * Cancel any events which have the specified argument.
  *
@@ -1954,6 +2170,7 @@ void event_cancel_event(struct event_loop *master, void *arg)
 	cancel_event_helper(master, arg, 0);
 }
 
+/* 只取消就绪（event / ready 链表）中 arg 匹配的任务。非线程安全。 */
 /*
  * Cancel ready tasks with an arg matching 'arg'
  *
@@ -1969,6 +2186,10 @@ void event_cancel_event_ready(struct event_loop *m, void *arg)
 	cancel_event_helper(m, arg, EVENT_CANCEL_FLAG_READY);
 }
 
+/* 取消一个具体事件（句柄指针，安全处理 NULL）。非线程安全，须在事件所属线程
+ * 调用。内部构造 cancel_req 入队并立即 do_event_cancel 处理，最后清空调用方
+ * 的句柄 *event。
+ */
 /**
  * Cancel a specific task.
  *
@@ -2002,6 +2223,11 @@ void event_cancel(struct event **event)
 	}
 }
 
+/* 异步取消：可由任意线程调用（MT-Safe）。根据参数要么针对事件句柄（thread），
+ * 要么针对 arg（eventobj），两者互斥。把 cancel_req 放入目标循环队列并 AWAKEN
+ * 唤醒其主线程，然后阻塞等待 master->canceled 被置真（目标线程处理完取消）。
+ * 返回前把 *thread 置空。若目标事件已不存在，取消是空操作。
+ */
 /**
  * Asynchronous cancellation.
  *
@@ -2070,6 +2296,9 @@ void event_cancel_async(struct event_loop *master, struct event **thread,
 }
 /* ------------------------------------------------------------------------- */
 
+/* 计算下一次等待超时：若定时器堆为空返回 NULL（无限等待），否则取最早到期
+ * 定时器，算出相对当前的剩余时间写入 timer_val 并返回。
+ */
 static struct timeval *thread_timer_wait(struct event_timer_list_head *timers,
 					 struct timeval *timer_val)
 {
@@ -2082,6 +2311,9 @@ static struct timeval *thread_timer_wait(struct event_timer_list_head *timers,
 	return timer_val;
 }
 
+/* 把从调度容器取出的 event 复制到 fetch 供应用执行，原 event 放回 unuse 缓存，
+ * 返回 fetch（指向调用方提供的临时事件副本）。
+ */
 static struct event *event_run(struct event_loop *m, struct event *event, struct event *fetch)
 {
 	*fetch = *event;
@@ -2089,10 +2321,16 @@ static struct event *event_run(struct event_loop *m, struct event *event, struct
 	return fetch;
 }
 
+/* 下面给出两套 io 处理循环：EPOLL 版与 POLL 版。 */
 /*
  * Note two versions of the io handling loops: one for EPOLL, and one for the POLL apis.
  */
 #if EPOLL_ENABLED
+/* epoll 版：处理某 fd 的一个就绪 io 事件（state 为 EPOLLIN / EPOLLOUT）。先把
+ * 该方向从 epoll 集合 / 哈希表清除（避免对不吃的事件反复触发），再把对应读 /
+ * 写事件转入 ready 队列并置类型为 EVENT_READY；无事件时按情况打错误日志。
+ * 返回 1 表示有事件被处理。
+ */
 static int thread_process_io_helper(struct event_loop *m, struct event *event,
 				    short state, short actual_state,
 				    int fd, struct frr_epoll_event *hash_ev)
@@ -2146,6 +2384,11 @@ static int thread_process_io_helper(struct event_loop *m, struct event *event,
 	return 1;
 }
 
+/* epoll 版：处理单个 epoll 结果项。跳过唤醒管道 fd；对事件先查哈希表（查不到
+ * 说明已被取消，忽略为 stale）；遇到 fd 关闭或 EPOLLHUP / ERR / RDHUP 则把读 /
+ * 写事件都转入 ready（表示连接结束），并清理 epoll / 哈希表；正常情况按
+ * EPOLLIN / EPOLLOUT 调 thread_process_io_helper。
+ */
 static inline void thread_process_io_inner_loop(struct event_loop *m,
 						const struct epoll_event *revent)
 {
@@ -2235,6 +2478,7 @@ static inline void thread_process_io_inner_loop(struct event_loop *m,
 	}
 }
 
+/* epoll 版入口：先处理常规文件事件链表，再处理 epoll_wait 返回的 num 个事件。 */
 /**
  * Process I/O events.
  *
@@ -2259,6 +2503,10 @@ static void thread_process_io(struct event_loop *m, int num)
 #else
 /*
  * version for poll family of apis
+ */
+/* poll 版：处理某 pollfd（下标 pos）的一个就绪 io 事件。同步 pfds 与 copy 的
+ * 事件位、必要时把该槽 fd 置 -1，再把对应事件转入 ready 队列。返回 1 表示有
+ * 事件被处理。
  */
 static int thread_process_io_helper(struct event_loop *m, struct event *event,
 				    short state, short actual_state, int pos)
@@ -2304,6 +2552,11 @@ static int thread_process_io_helper(struct event_loop *m, struct event *event,
 	return 1;
 }
 
+/* poll 版：处理 copy 数组中下标 *i 的 pollfd。revents 为空则跳过；对
+ * POLLIN / POLLHUP / POLLERR 按读事件处理，对 POLLOUT 按写事件处理（都调用
+ * thread_process_io_helper）；若 revents 含 POLLNVAL 则把该槽从 pfds 与 copy 中
+ * 移除以清理非法 fd，并回退下标 *i。
+ */
 static inline void thread_process_io_inner_loop(struct event_loop *m,
 						unsigned int num,
 						struct pollfd *pfds, nfds_t *i,
@@ -2358,6 +2611,10 @@ static inline void thread_process_io_inner_loop(struct event_loop *m,
 	}
 }
 
+/* poll 版入口：轮询 copy 中的 pollfd，跳过无效 fd，对就绪的逐个处理。为了公平，
+ * 起点用 m->last_read 在数组上循环（先走 last_read..末尾，再走开头..），处理完
+ * 把 last_read 加一，使下次轮询从不同 fd 开始，避免固定顺序导致的饥饿。
+ */
 /**
  * Process I/O events.
  *
@@ -2388,6 +2645,9 @@ static void thread_process_io(struct event_loop *m, unsigned int num)
 #endif
 
 /* Add all timers that have popped to the ready list. */
+/* 把所有已到期的定时器从堆中弹出并转入 ready 队列（按到期时间顺序），返回转
+ * 入的数量。
+ */
 static unsigned int thread_process_timers(struct event_loop *m,
 					  struct timeval *timenow)
 {
@@ -2408,6 +2668,9 @@ static unsigned int thread_process_timers(struct event_loop *m,
 }
 
 /* process a list en masse, e.g. for event thread lists */
+/* 把一条事件链表整体搬到所属 master 的 ready 队列（类型改为 EVENT_READY），
+ * 返回搬迁数量。常用于把 m->event（一次性事件）一次性就绪化。
+ */
 static unsigned int thread_process(struct event_list_head *list)
 {
 	struct event *event;
@@ -2421,6 +2684,17 @@ static unsigned int thread_process(struct event_list_head *list)
 	return ready;
 }
 
+/* 取事件的核心循环（须在所属线程运行）。流程：
+ *   - 先处理信号（若是信号处理循环）；
+ *   - 处理挂起的取消请求 do_event_cancel；
+ *   - 若 ready 队列非空，直接取一个事件运行并返回（性能关键路径）；
+ *   - 否则把 m->event 里的事件搬入 ready；
+ *   - 计算等待超时：有待处理事件则超时 0；否则取最早定时器剩余时间；都无则无限
+ *     阻塞；若既无定时器也无事件 / fd 则判定“无事可做”直接退出（die）；
+ *   - 释放锁后调用 fd_poll 等待，再取锁，处理出错与中断；
+ *   - 把到期定时器与就绪 io 迁入 ready。
+ * 通过 broken / continued 告知调用者：是否结束或需重来一轮。
+ */
 static void event_fetch_inner_loop(struct event_loop *m, struct event *event,
 				   struct event *fetch, bool *broken,
 				   bool *continued)
@@ -2557,6 +2831,9 @@ static void event_fetch_inner_loop(struct event_loop *m, struct event *event,
 }
 
 /* Fetch next ready thread. */
+/* 取下一个就绪事件的主入口：循环调用 event_fetch_inner_loop，直到拿到事件、
+ * 判定结束（broken）或需要继续（continued）。spin 控制是否持续重试。返回 fetch。
+ */
 struct event *event_fetch(struct event_loop *m, struct event *fetch)
 {
 	struct event *event = NULL;
@@ -2576,6 +2853,9 @@ struct event *event_fetch(struct event_loop *m, struct event *fetch)
 	return fetch;
 }
 
+/* 计算自 start 到 now 的墙钟耗时（微秒），并通过 cputime 返回 CPU 耗时。
+ * 对 FreeBSD 做了修正，避免时间回退导致的巨大差值。
+ */
 unsigned long event_consumed_time(RUSAGE_T *now, RUSAGE_T *start,
 				  unsigned long *cputime)
 {
@@ -2604,6 +2884,9 @@ unsigned long event_consumed_time(RUSAGE_T *now, RUSAGE_T *start,
 	return timeval_elapsed(now->real, start->real);
 }
 
+/* 判断事件是否已运行到该让出 CPU：用墙钟时间衡量（默认 EVENT_YIELD_TIME_SLOT
+ * 毫秒），超过则返回真。用墙钟而非 CPU 时间的理由见原注释。
+ */
 /*
  * We should aim to yield after yield milliseconds, which defaults
  * to EVENT_YIELD_TIME_SLOT .
@@ -2627,6 +2910,7 @@ int event_should_yield(struct event *event)
 	return result;
 }
 
+/* 设置事件的让出时间（微秒，加锁修改 event->yield）。 */
 void event_set_yield_time(struct event *event, unsigned long yield_time)
 {
 	frr_with_mutex (&event->mtx) {
@@ -2634,6 +2918,9 @@ void event_set_yield_time(struct event *event, unsigned long yield_time)
 	}
 }
 
+/* 取当前资源使用量：real 始终填墙钟时间；cpu 时间仅在 cputime_enabled 时用
+ * CLOCK_THREAD_CPUTIME_ID 读取，否则清零。
+ */
 void event_getrusage(RUSAGE_T *r)
 {
 	monotime(&r->real);
@@ -2648,6 +2935,9 @@ void event_getrusage(RUSAGE_T *r)
 	clock_gettime(CLOCK_THREAD_CPUTIME_ID, &r->cpu);
 }
 
+/* 打印一次“定时器迟到”告警（含系统负载均值），用于诊断 CPU 饥饿 / 系统过载。
+ * 由 event_call 在迟到超过阈值且过了限速间隔时调用。
+ */
 static void event_tardy_warn(struct event *event, unsigned long since_us)
 {
 	char buf[64];
@@ -2675,6 +2965,15 @@ static void event_tardy_warn(struct event *event, unsigned long since_us)
 		  event, (since_us + 999) / 1000, (event->tardy_threshold + 999) / 1000, &fb);
 }
 
+/* 执行一个事件：这是事件回调真正被调用的地方，同时负责统计。
+ *   - 若为定时器且迟到超过 tardy_threshold，按限速间隔打印迟到告警；
+ *   - 记录执行前的时间基准（复用上次 rusage 以省一次系统调用）；
+ *   - 把当前事件存入线程局部键 thread_current，调用回调，再清空；
+ *   - 取执行后 rusage，累加 / 更新该回调的墙钟与 cpu 的 total 与 max，
+ *     递增调用计数并或上事件类型位；
+ *   - 若 CPU 或墙钟耗时超过阈值则打印 CPU HOG 或 STARVATION 告警
+ *     （suppress_warnings 为真时跳过告警）。max 用 CAS 保证单调递增。
+ */
 /*
  * Call a thread.
  *
@@ -2813,6 +3112,10 @@ void event_call(struct event *event)
 }
 
 /* Execute thread */
+/* 同步立即执行一个事件：若有 eref 先取消旧事件；在锁内取 EVENT_EXECUTE 事件、
+ * 填 val 与 ref，随后直接 event_call，最后放回 unuse 缓存。用于不经过主循环
+ * 排队的即时回调（如 CLI、初始化路径）。
+ */
 void _event_execute(const struct xref_eventsched *xref, struct event_loop *m,
 		    void (*func)(struct event *), void *arg, int val,
 		    struct event **eref)
@@ -2842,6 +3145,9 @@ void _event_execute(const struct xref_eventsched *xref, struct event_loop *m,
 }
 
 /* Debug signal mask - if 'sigs' is NULL, use current effective mask. */
+/* 打印信号掩码内容（逗号分隔的信号编号）供调试；sigs 为 NULL 时用当前线程的
+ * 有效掩码。只扫描到 LAST_SIGNAL（实时信号起始或 32）。输出到 debug 日志。
+ */
 void debug_signals(const sigset_t *sigs)
 {
 	int i, found;
@@ -2888,22 +3194,28 @@ void debug_signals(const sigset_t *sigs)
 }
 
 /* Accessors for event loop pthread */
+/* 返回事件循环的归属线程。 */
 pthread_t frr_event_loop_get_pthread_owner(struct event_loop *loop)
 {
 	return loop->owner;
 }
 
+/* 设置事件循环的归属线程。 */
 void frr_event_loop_set_pthread_owner(struct event_loop *loop, pthread_t pth)
 {
 	loop->owner = pth;
 }
 
+/* 设置该事件循环是否负责处理进程信号。 */
 /* Control whether 'loop' is the signal-handler for a process */
 void frr_event_loop_set_handle_sigs(struct event_loop *loop, bool handle_p)
 {
 	loop->handle_signals = handle_p;
 }
 
+/* "%pTHD" 的调试格式化：输出事件指针、arg、类型名、fd 或定时器剩余时间，以及
+ * 回调名、目的地与来源文件:行号，用于日志 / 调试打印事件。
+ */
 static ssize_t printfrr_thread_dbg(struct fbuf *buf, struct printfrr_eargs *ea,
 				   const struct event *event)
 {
@@ -2948,6 +3260,9 @@ static ssize_t printfrr_thread_dbg(struct fbuf *buf, struct printfrr_eargs *ea,
 	return rv;
 }
 
+/* 注册 "%pTH" 打印扩展：把事件格式化为其定时器剩余 / 到期时间（"%pTHD" 则走
+ * 调试详细格式）。event 为 NULL 时跳过时间格式标记并输出 '-'。
+ */
 printfrr_ext_autoreg_p("TH", printfrr_thread);
 static ssize_t printfrr_thread(struct fbuf *buf, struct printfrr_eargs *ea,
 			       const void *ptr)

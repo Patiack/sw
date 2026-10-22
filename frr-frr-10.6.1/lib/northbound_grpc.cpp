@@ -5,6 +5,39 @@
 //                     Renato Westphal
 //
 
+/* 【文件导读】northbound_grpc.cpp —— FRR northbound 层的 gRPC 可选后端
+ *
+ * 职责：
+ *   实现 FRR northbound（北向）接口的 gRPC 服务端。它把 FRR 的配置 / 运维数据通过
+ *   gRPC（protobuf 定义的 frr.Northbound 服务）暴露给外部客户端，并提供对候选配置
+ *   （candidate）的创建 / 编辑 / 提交（两阶段提交）等操作。属于构建时可选特性，
+ *   仅在编译配置启用了 gRPC 时才会被编入。
+ *
+ * 核心数据结构 / 类型：
+ *   - enum CallState / call_states[]：RPC 状态机的取值与名字。
+ *   - struct candidate / class Candidates：候选配置仓库（id 到 candidate 的映射）。
+ *   - class RpcStateBase：一次 RPC 的公共基类，负责线程切换与状态同步。
+ *   - class UnaryRpcState<Q,S>：一元（Unary）RPC 的状态封装（模板）。
+ *   - class StreamRpcState<Q,S,X>：流式（Streaming）RPC 的状态封装（模板）。
+ *
+ * 与其他模块的关系：
+ *   - frr-northbound.grpc.pb.h：protobuf / gRPC 生成的服务与消息类型。
+ *   - northbound.h / northbound_db.h：FRR 北向核心（配置、事务、提交）。
+ *   - libyang：配置数据以 lyd_node 树表示，与 DataTree（protobuf）互转。
+ *   - frr_pthread / frrevent：gRPC 在自己的 pthread 上跑，回调则切回主线程。
+ *
+ * 阅读顺序：
+ *   1) 先看 CallState / candidate / Candidates，理解状态与候选配置仓库。
+ *   2) 看 RpcStateBase 的 run() 与 c_callback()，理解 grpc 线程与主线程如何协作。
+ *   3) 看若干 HandleUnary 与 HandleStreaming 回调，理解每个 RPC 的语义。
+ *   4) 最后看 grpc_pthread_start 与 module 初始化 / 收尾函数。
+ *
+ * 易踩的坑：
+ *   - RPC 回调（Handle 函数）运行在主线程；gRPC 收发在 grpc-io-thread，两者通过
+ *     event_add_event 与互斥锁 / 条件变量同步，改动时要保持这套同步不变。
+ *   - gRPC 库内部会创建线程，故初始化被推迟到 fork 之后（见 very_late_init）。
+ *   - 关闭时先在主线程 Shutdown 服务器，让 CQ 的 Next() 返回空以便回收线程退出。
+ */
 #include <zebra.h>
 #include <grpcpp/grpcpp.h>
 #include "grpc/frr-northbound.grpc.pb.h"
@@ -19,18 +52,24 @@
 #include "northbound_db.h"
 #include "frr_pthread.h"
 
+/* C++ 标准库：iostream/sstream 用于调试输出与地址拼接，memory 用智能指针管理
+ * 服务器 / 完成队列，string 处理路径与字符串。 */
 #include <iostream>
 #include <sstream>
 #include <memory>
 #include <string>
 
+/* gRPC 服务端默认监听端口，可在模块加载参数里覆盖（见 very_late_init）。 */
 #define GRPC_DEFAULT_PORT 50051
 
 
+/* 本文件私有的全局变量。 */
 // ------------------------------------------------------
 //                 File Local Variables
 // ------------------------------------------------------
 
+/* nb_dbg_client_grpc：gRPC 调试开关。因为 FRR 的调试设施基于 atomics，而 C++ 的
+ * atomics API 与 C 不同，这里无法直接复用，故用一个普通 bool 做开关。 */
 /*
  * NOTE: we can't use the FRR debugging infrastructure here since it uses
  * atomics and C++ has a different atomics API. Enable gRPC debugging
@@ -38,31 +77,49 @@
  */
 static bool nb_dbg_client_grpc = 0;
 
+/* main_master：主线程的事件循环（event loop）。RPC 回调通过它投递到主线程执行。 */
 static struct event_loop *main_master;
 
+/* fpt：承载 gRPC 服务器运行的那个 FRR 线程对象（在自己的线程里处理 gRPC 收发）。 */
 static struct frr_pthread *fpt;
 
+/* grpc_running：gRPC 服务器是否正在运行的标志。 */
 static bool grpc_running;
 
+/* grpc_debug(...)：仅当 nb_dbg_client_grpc 为真时，用 zlog_debug 打印调试信息。 */
 #define grpc_debug(...)                                                        \
 	do {                                                                   \
 		if (nb_dbg_client_grpc)                                        \
 			zlog_debug(__VA_ARGS__);                               \
 	} while (0)
 
+/* 本文件定义的新类型：RPC 状态机枚举、候选配置仓库及其记录。 */
 // ------------------------------------------------------
 //                      New Types
 // ------------------------------------------------------
 
+/* enum CallState：一次 RPC 的状态机取值。
+ *   CREATE 刚创建；PROCESS 正在（主线程）处理；MORE 流式 RPC 还有后续数据；
+ *   FINISH 结束；DELETED 已删除。 */
 enum CallState { CREATE, PROCESS, MORE, FINISH, DELETED };
+/* call_states：与 CallState 一一对应的名字数组，仅用于调试日志打印。 */
 const char *call_states[] = {"CREATE", "PROCESS", "MORE", "FINISH", "DELETED"};
 
+/* struct candidate：一条候选配置记录。id 是候选编号；config 是候选配置快照；
+ * transaction 指向进行中的事务（无则为 NULL）。 */
 struct candidate {
 	uint64_t id;
 	struct nb_config *config;
 	struct nb_transaction *transaction;
 };
 
+/* class Candidates：候选配置仓库，用 std::map 维护 id 到 candidate 的映射。
+ *   ~Candidates()      —— 析构时删除所有候选（逐个 delete_candidate）；
+ *   create_candidate() —— 生成新 id，以运行配置 running_config 的快照初始化，返回记录；
+ *   contains(id)       —— 判断给定候选 id 是否存在；
+ *   delete_candidate() —— 释放该候选的配置，若在事务中则中止事务，再从表中移除；
+ *   get_candidate(id)  —— 按 id 取记录，不存在返回 NULL；
+ *   成员 _next_id（自增 id 计数器）、_cdb（id 到 candidate 的映射）。 */
 class Candidates
 {
       public:
@@ -113,6 +170,18 @@ class Candidates
 	std::map<uint64_t, struct candidate> _cdb;
 };
 
+/* class RpcStateBase：所有 RPC 状态类的公共基类，负责一次 RPC 的生命周期与线程同步。
+ *   do_request()         —— 纯虚，向 gRPC 服务投递下一个该类型的请求（可能新建副本）；
+ *   RpcStateBase(name)   —— 构造，记录 RPC 名字；
+ *   ~RpcStateBase()      —— 虚析构；
+ *   get_state()          —— 取当前 CallState；
+ *   is_initial_process() —— 是否处于首次处理（entered_state 为 CREATE；Unary 恒为真）；
+ *   run()                —— 在 grpc 线程调用：把状态置为 PROCESS，用 event_add_event 把
+ *                           回调调度到主线程，然后阻塞等待主线程把状态改成 MORE 或 FINISH；
+ *                           若为 FINISH 则重新 do_request 以接收下一个同类请求；
+ *   run_mainthread()     —— 纯虚，主线程里真正执行业务逻辑并返回新状态；
+ *   c_callback()         —— 主线程事件回调：持锁调用 run_mainthread、更新状态、唤醒等待者；
+ *   成员 ctx（gRPC 上下文）、cmux/cond（互斥锁与条件变量）、state/entered_state、name。 */
 /*
  * RpcStateBase is the common base class used to track a gRPC RPC.
  */
@@ -215,6 +284,12 @@ class RpcStateBase
 	const char *name;
 };
 
+/* class UnaryRpcState<Q,S>：一元 RPC 的状态封装（Q 请求类型，S 响应类型）。
+ *   reqfunc_t        —— 指向 AsyncService 中该 RPC 请求函数的成员指针类型；
+ *   UnaryRpcState()  —— 构造，保存候选仓库、请求函数、业务回调与名字；
+ *   do_request()     —— 按需新建副本并调用请求函数投递请求；
+ *   run_mainthread() —— 调用业务回调后直接 Finish 响应并返回 FINISH（一元 RPC 必结束）；
+ *   成员 cdb、request、response、responder、callback、requestf。 */
 /*
  * The UnaryRpcState class is used to track the execution of a Unary RPC.
  *
@@ -267,6 +342,12 @@ template <typename Q, typename S> class UnaryRpcState : public RpcStateBase
 	reqfunc_t requestf = NULL;
 };
 
+/* class StreamRpcState<Q,S,X>：流式 RPC 的状态封装（X 为跟踪流式进度的上下文类型）。
+ *   reqsfunc_t       —— 指向 AsyncService 中该流式 RPC 请求函数的成员指针类型；
+ *   StreamRpcState() —— 构造，保存请求函数、业务回调与名字；
+ *   do_request()     —— 按需新建副本并投递请求；
+ *   run_mainthread() —— 调用回调，返回 true 则状态转 MORE（继续流），false 转 FINISH；
+ *   成员 request、response、async_responder、callback、requestsf、context。 */
 /*
  * The StreamRpcState class is used to track the execution of a Streaming RPC.
  *
@@ -319,10 +400,13 @@ class StreamRpcState : public RpcStateBase
 	X context;
 };
 
+/* 工具函数：编码转换、libyang 数据树编辑 / 删除、dnode 与 DataTree 互转、配置 / 运维数据获取。 */
 // ------------------------------------------------------
 //                    Utility Functions
 // ------------------------------------------------------
 
+/* encoding2lyd_format：把 gRPC 侧的编码枚举换算成 libyang 的 LYD_FORMAT。
+ * 目前支持 JSON / XML，遇到未知编码则记录错误并退出进程。 */
 static LYD_FORMAT encoding2lyd_format(enum frr::Encoding encoding)
 {
 	switch (encoding) {
@@ -338,6 +422,8 @@ static LYD_FORMAT encoding2lyd_format(enum frr::Encoding encoding)
 	}
 }
 
+/* yang_dnode_edit：在给定数据树上按 XPath 新建 / 更新节点（LYD_NEW_PATH_UPDATE）。
+ * 成功返回 0，失败返回 -1 并记录警告。 */
 static int yang_dnode_edit(struct lyd_node *dnode, const std::string &path,
 			   const char *value)
 {
@@ -352,6 +438,7 @@ static int yang_dnode_edit(struct lyd_node *dnode, const std::string &path,
 	return 0;
 }
 
+/* yang_dnode_delete：按 XPath 找到节点并释放该子树。找到并删除返回 0，否则返回 -1。 */
 static int yang_dnode_delete(struct lyd_node *dnode, const std::string &path)
 {
 	dnode = yang_dnode_get(dnode, path.c_str());
@@ -363,6 +450,8 @@ static int yang_dnode_delete(struct lyd_node *dnode, const std::string &path)
 	return 0;
 }
 
+/* data_tree_from_dnode：把 libyang 的 lyd_node 树序列化为字符串写入 DataTree（protobuf）。
+ * 按 lyd_format 选择格式，with_defaults 决定是否输出默认节点。 */
 static LY_ERR data_tree_from_dnode(frr::DataTree *dt,
 				   const struct lyd_node *dnode,
 				   LYD_FORMAT lyd_format, bool with_defaults)
@@ -386,6 +475,8 @@ static LY_ERR data_tree_from_dnode(frr::DataTree *dt,
 	return err;
 }
 
+/* dnode_from_data_tree：把 DataTree 中的字符串解析成 libyang 的 lyd_node 树。
+ * config_only 为真时按"配置数据"解析（排除状态节点）且不做额外校验，否则严格解析。 */
 static struct lyd_node *dnode_from_data_tree(const frr::DataTree *dt,
 					     bool config_only)
 {
@@ -411,6 +502,8 @@ static struct lyd_node *dnode_from_data_tree(const frr::DataTree *dt,
 	return dnode;
 }
 
+/* get_dnode_config：从运行配置 running_config 中按 XPath 复制出配置子树（path 为空表示整树）。
+ * 不存在则返回 NULL。 */
 static struct lyd_node *get_dnode_config(const std::string &path)
 {
 	struct lyd_node *dnode;
@@ -427,6 +520,7 @@ static struct lyd_node *get_dnode_config(const std::string &path)
 	return dnode;
 }
 
+/* get_dnode_state：通过北向 legacy 迭代接口按 XPath 取得运维（状态）数据子树。 */
 static struct lyd_node *get_dnode_state(const std::string &path)
 {
 	struct lyd_node *dnode = NULL;
@@ -436,6 +530,8 @@ static struct lyd_node *get_dnode_state(const std::string &path)
 	return dnode;
 }
 
+/* get_path：Get RPC 的核心实现。按 type（ALL / CONFIG / STATE）分别取配置与/或运维数据，
+ * 需要时把两者合并成一棵树，做校验补齐隐式默认，再按请求格式序列化进 DataTree。 */
 static grpc::Status get_path(frr::DataTree *dt, const std::string &path,
 			     int type, LYD_FORMAT lyd_format,
 			     bool with_defaults)
@@ -517,10 +613,15 @@ static grpc::Status get_path(frr::DataTree *dt, const std::string &path,
 }
 
 
+/* 以下是各 RPC 的业务回调。它们都运行在主线程（由 RpcStateBase::c_callback 调度），
+ * 每个函数对应 frr.Northbound 服务中的一个 RPC。命名规律：
+ *   HandleUnary<名字>     —— 一元 RPC；HandleStreaming<名字> —— 流式 RPC。 */
 // ------------------------------------------------------
 //       RPC Callback Functions: run on main thread
 // ------------------------------------------------------
 
+/* HandleUnaryGetCapabilities：返回能力信息——FRR 版本、是否支持回滚（编译期决定）、
+ * 所有已加载 YANG 模块（名 / 修订 / 组织）以及支持的编码（JSON 与 XML）。 */
 grpc::Status HandleUnaryGetCapabilities(
 	UnaryRpcState<frr::GetCapabilitiesRequest, frr::GetCapabilitiesResponse>
 		*tag)
@@ -555,8 +656,11 @@ grpc::Status HandleUnaryGetCapabilities(
 }
 
 // Define the context variable type for this streaming handler
+/* GetContextType：Get 流式 RPC 的上下文类型，用字符串列表保存待处理的路径队列。 */
 typedef std::list<std::string> GetContextType;
 
+/* HandleStreamingGet：Get 流式 RPC。首次进入时把请求里的路径全部压入上下文队列；之后每次
+ * 处理弹出一个路径，取数据并 Write 回响应，队列空时 Finish。返回 true 表示还需继续处理。 */
 bool HandleStreamingGet(
 	StreamRpcState<frr::GetRequest, frr::GetResponse, GetContextType> *tag)
 {
@@ -613,6 +717,7 @@ bool HandleStreamingGet(
 	}
 }
 
+/* HandleUnaryCreateCandidate：创建一个新的候选配置，把其 id 放入响应返回给客户端。 */
 grpc::Status HandleUnaryCreateCandidate(
 	UnaryRpcState<frr::CreateCandidateRequest, frr::CreateCandidateResponse>
 		*tag)
@@ -627,6 +732,7 @@ grpc::Status HandleUnaryCreateCandidate(
 	return grpc::Status::OK;
 }
 
+/* HandleUnaryDeleteCandidate：删除指定 id 的候选配置（不存在则返回 NOT_FOUND）。 */
 grpc::Status HandleUnaryDeleteCandidate(
 	UnaryRpcState<frr::DeleteCandidateRequest, frr::DeleteCandidateResponse>
 		*tag)
@@ -644,6 +750,7 @@ grpc::Status HandleUnaryDeleteCandidate(
 	return grpc::Status::OK;
 }
 
+/* HandleUnaryUpdateCandidate：用当前运行配置刷新指定候选配置（须不在事务中）。 */
 grpc::Status HandleUnaryUpdateCandidate(
 	UnaryRpcState<frr::UpdateCandidateRequest, frr::UpdateCandidateResponse>
 		*tag)
@@ -670,6 +777,8 @@ grpc::Status HandleUnaryUpdateCandidate(
 	return grpc::Status::OK;
 }
 
+/* HandleUnaryEditCandidate：在候选配置副本上依次应用 update（新建 / 改值）与 delete
+ * （删除）操作，全部成功后才用 nb_config_replace 原子替换候选配置；任一步失败即整体放弃。 */
 grpc::Status HandleUnaryEditCandidate(
 	UnaryRpcState<frr::EditCandidateRequest, frr::EditCandidateResponse>
 		*tag)
@@ -714,6 +823,8 @@ grpc::Status HandleUnaryEditCandidate(
 	return grpc::Status::OK;
 }
 
+/* HandleUnaryLoadToCandidate：把请求里携带的整棵配置树载入候选配置。type 为 REPLACE 时整体
+ * 替换，否则与现有候选配置合并。 */
 grpc::Status HandleUnaryLoadToCandidate(
 	UnaryRpcState<frr::LoadToCandidateRequest, frr::LoadToCandidateResponse>
 		*tag)
@@ -750,6 +861,9 @@ grpc::Status HandleUnaryLoadToCandidate(
 	return grpc::Status::OK;
 }
 
+/* HandleUnaryCommit：提交（两阶段提交）相关操作。按 phase 分别执行 VALIDATE / PREPARE /
+ * ABORT / APPLY / ALL；并在提交前检查两阶段提交协议的误用（如重复 PREPARE 或对不存在的事务
+ * APPLY）。最后把 northbound 错误码映射成 gRPC 状态码，并回填事务 id 与错误信息。 */
 grpc::Status
 HandleUnaryCommit(UnaryRpcState<frr::CommitRequest, frr::CommitResponse> *tag)
 {
@@ -872,6 +986,7 @@ HandleUnaryCommit(UnaryRpcState<frr::CommitRequest, frr::CommitResponse> *tag)
 	return status;
 }
 
+/* HandleUnaryLockConfig：锁定运行配置，防止其他客户端并发修改。 */
 grpc::Status HandleUnaryLockConfig(
 	UnaryRpcState<frr::LockConfigRequest, frr::LockConfigResponse> *tag)
 {
@@ -883,6 +998,7 @@ grpc::Status HandleUnaryLockConfig(
 	return grpc::Status::OK;
 }
 
+/* HandleUnaryUnlockConfig：解锁运行配置。 */
 grpc::Status HandleUnaryUnlockConfig(
 	UnaryRpcState<frr::UnlockConfigRequest, frr::UnlockConfigResponse> *tag)
 {
@@ -895,6 +1011,8 @@ grpc::Status HandleUnaryUnlockConfig(
 	return grpc::Status::OK;
 }
 
+/* list_transactions_cb：遍历事务数据库时的回调，把每个事务的
+ * （id, 客户端名, 日期, 注释）打包成 tuple 追加到 arg 指向的列表中。 */
 static void list_transactions_cb(void *arg, int transaction_id,
 				 const char *client_name, const char *date,
 				 const char *comment)
@@ -907,9 +1025,13 @@ static void list_transactions_cb(void *arg, int transaction_id,
 }
 
 // Define the context variable type for this streaming handler
+/* ListTransactionsContextType：ListTransactions 流式 RPC 的上下文类型，
+ * 保存事务元组列表。 */
 typedef std::list<std::tuple<int, std::string, std::string, std::string>>
 	ListTransactionsContextType;
 
+/* HandleStreamingListTransactions：ListTransactions 流式 RPC。首次进入时遍历事务数据库填充
+ * 上下文列表（并追加两条假的示例项）；之后每次弹出一条，组装成响应 Write 回去，列表空则 Finish。 */
 bool HandleStreamingListTransactions(
 	StreamRpcState<frr::ListTransactionsRequest,
 		       frr::ListTransactionsResponse,
@@ -963,6 +1085,8 @@ bool HandleStreamingListTransactions(
 	}
 }
 
+/* HandleUnaryGetTransaction：按 transaction_id 从事务数据库载入历史配置，按请求编码与是否
+ * 含默认值序列化后返回。 */
 grpc::Status HandleUnaryGetTransaction(
 	UnaryRpcState<frr::GetTransactionRequest, frr::GetTransactionResponse>
 		*tag)
@@ -1005,6 +1129,8 @@ grpc::Status HandleUnaryGetTransaction(
 	return grpc::Status::OK;
 }
 
+/* HandleUnaryExecute：执行（RPC 类）操作。按 xpath 找到 nb_node，构造输入数据树、填入请求
+ * 携带的输入参数、校验后调用注册在 XPath 上的 rpc 回调，最后把输出子节点逐个转成 PathValue 返回。 */
 grpc::Status HandleUnaryExecute(
 	UnaryRpcState<frr::ExecuteRequest, frr::ExecuteResponse> *tag)
 {
@@ -1096,10 +1222,13 @@ grpc::Status HandleUnaryExecute(
 }
 
 // ------------------------------------------------------
+/* 线程初始化与运行函数：创建承载 gRPC 的线程、启动 / 结束服务器、以及模块初始化挂接。 */
 //        Thread Initialization and Run Functions
 // ------------------------------------------------------
 
 
+/* REQUEST_NEWRPC(NAME, cdb)：为某个一元 RPC 构造 UnaryRpcState 并立即投递一次请求。
+ * cdb 为该 RPC 需要的候选配置仓库（不需要时传 NULL）。 */
 #define REQUEST_NEWRPC(NAME, cdb)                                              \
 	do {                                                                   \
 		auto _rpcState = new UnaryRpcState<frr::NAME##Request,         \
@@ -1109,6 +1238,8 @@ grpc::Status HandleUnaryExecute(
 		_rpcState->do_request(&service, cq.get(), true);               \
 	} while (0)
 
+/* REQUEST_NEWRPC_STREAMING(NAME)：为某个流式 RPC 构造 StreamRpcState 并投递一次请求。
+ * 上下文类型约定为 NAME##ContextType。 */
 #define REQUEST_NEWRPC_STREAMING(NAME)                                         \
 	do {                                                                   \
 		auto _rpcState = new StreamRpcState<frr::NAME##Request,        \
@@ -1119,15 +1250,20 @@ grpc::Status HandleUnaryExecute(
 		_rpcState->do_request(&service, cq.get(), true);               \
 	} while (0)
 
+/* struct grpc_pthread_attr：FRR 线程属性 + gRPC 监听端口，用于把端口传给新线程。 */
 struct grpc_pthread_attr {
 	struct frr_pthread_attr attr;
 	unsigned long port;
 };
 
+/* s_server_lock / s_server：捕获服务器对象以便在主线程干净地关闭它；
+ * 锁用来保护对 s_server 与 grpc_running 的并发访问。 */
 // Capture these objects so we can try to shut down cleanly
 static pthread_mutex_t s_server_lock = PTHREAD_MUTEX_INITIALIZER;
 static grpc::Server *s_server;
 
+/* grpc_pthread_start：gRPC 线程的入口。创建服务器与完成队列、注册所有 RPC 的处理状态，
+ * 然后进入 while 循环不断从完成队列取事件并分发；退出时关闭服务器与完成队列、排空未处理事件。 */
 static void *grpc_pthread_start(void *arg)
 {
 	struct frr_pthread *fpt = static_cast<frr_pthread *>(arg);
@@ -1225,6 +1361,8 @@ static void *grpc_pthread_start(void *arg)
 }
 
 
+/* frr_grpc_init：创建一个 FRR 线程来跑 gRPC（因为 gRPC 自带事件循环），
+ * 并把端口通过线程的 data 字段传给它。 */
 static int frr_grpc_init(uint port)
 {
 	struct frr_pthread_attr attr = {
@@ -1247,6 +1385,8 @@ static int frr_grpc_init(uint port)
 	return 0;
 }
 
+/* frr_grpc_finish：主线程中的收尾函数。Shutdown 服务器让 CQ 的 Next() 退出，join 并销毁
+ * gRPC 线程，最后调用 ShutdownProtobufLibrary 清理 protobuf 的"内存泄漏"。 */
 static int frr_grpc_finish(void)
 {
 	grpc_debug("%s: entered", __func__);
@@ -1278,6 +1418,9 @@ static int frr_grpc_finish(void)
 	return 0;
 }
 
+/* frr_grpc_module_very_late_init：真正的初始化时机很晚——因为 gRPC 库内部会创建线程，
+ * 必须在 fork 之后才初始化，所以把本函数作为事件任务调度，等 fork 后事件循环启动时才执行。
+ * 它解析模块加载参数里的端口（缺省用 GRPC_DEFAULT_PORT，合法范围 1025 到 UINT16_MAX）。 */
 /*
  * This is done this way because module_init and module_late_init are both
  * called during daemon pre-fork initialization. Because the GRPC library
@@ -1309,6 +1452,8 @@ error:
 	flog_err(EC_LIB_GRPC_INIT, "failed to initialize the gRPC module");
 }
 
+/* frr_grpc_module_late_init：记录主事件循环，注册退出钩子（frr_fini -> frr_grpc_finish），
+ * 并把 very_late_init 作为事件任务排入队列。 */
 static int frr_grpc_module_late_init(struct event_loop *tm)
 {
 	main_master = tm;
@@ -1317,6 +1462,7 @@ static int frr_grpc_module_late_init(struct event_loop *tm)
 	return 0;
 }
 
+/* frr_grpc_module_init：模块初始化钩子，仅注册 late_init 回调（真正的初始化推迟到 fork 后）。 */
 static int frr_grpc_module_init(void)
 {
 	hook_register(frr_late_init, frr_grpc_module_late_init);
@@ -1324,6 +1470,7 @@ static int frr_grpc_module_init(void)
 	return 0;
 }
 
+/* FRR_MODULE_SETUP：声明本模块的元信息（名 frr_grpc、版本、描述）与初始化函数入口。 */
 FRR_MODULE_SETUP(.name = "frr_grpc", .version = FRR_VERSION,
 		 .description = "FRR gRPC northbound module",
 		 .init = frr_grpc_module_init, );

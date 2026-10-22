@@ -4,6 +4,36 @@
  * Copyright (C) 2018 Cumulus Networks, Inc.
  *                    Donald Sharp
  */
+/*
+ * 文件导读：nexthop_group.c —— 下一跳组（nexthop group）的实现。
+ *
+ * 本文件实现 nexthop_group.h 声明的能力，并额外实现“命名 nexthop group”
+ * 的配置命令、RB 树管理与事件回调。
+ *
+ * 一、两类概念
+ *   1) 匿名 nexthop_group：路由临时持有的一组等价出口，核心是成员链表与
+ *      规范排序、比较、哈希、复制；
+ *   2) 命名 nexthop group（nexthop_group_cmd，以下简称 nhgc）：用户可用
+ *      “nexthop-group NAME”配置并命名的一组下一跳，按名字挂在 RB 树
+ *      （nhgc_entries）上，可被策略路由等多处引用。
+ *
+ * 二、规范排序与相等
+ *   成员用 _nexthop_add 追加、nexthop_group_add_sorted 保序插入。相等判定
+ *   （nexthop_group_equal）与哈希（nexthop_group_hash）都“假定已排序”，
+ *   顺序不一致会导致比较结果错误。
+ *
+ * 三、回调机制
+ *   nhg_hooks 保存上层注册的 5 个回调（new / modify / add_nexthop /
+ *   del_nexthop / delete），在命名组发生相应变化时被调用，供 zebra 等同步
+ *   转发面。
+ *
+ * 四、易踩的坑
+ *   - nexthop_group 的哈希 / 相等对顺序敏感，务必先排序；
+ *   - nexthop_group_delete 接受“指针的指针”，调用后 *nhg 被置 NULL；
+ *   - 命名组涉及引用计数与 VRF / 接口状态变化，需配合 enable/disable_vrf
+ *     与 interface_state_change 使用。
+ */
+
 #include <zebra.h>
 
 #include <vrf.h>
@@ -23,6 +53,12 @@ DEFINE_MTYPE_STATIC(LIB, NEXTHOP_GROUP, "Nexthop Group");
 /*
  * Internal struct used to hold nhg config strings
  */
+/* 内部结构：临时保存从配置命令解析出的“单条 nexthop 配置串”的各字段，
+ * 待校验 / 归一后再构造真正的 struct nexthop。
+ *   nhvrf_name  VRF 名；addr  网关地址；intf  出接口名；
+ *   onlink      是否 onlink；labels  标签配置串；vni  VXLAN VNI；
+ *   weight      权重；backup_str 备份索引串。
+ */
 struct nexthop_hold {
 	char *nhvrf_name;
 	union sockunion *addr;
@@ -34,6 +70,10 @@ struct nexthop_hold {
 	char *backup_str;
 };
 
+/* 上层（通常 zebra）注册到命名 nexthop group 的一组事件回调：
+ *   new         新建组；modify      仅改属性（如 resilience）；
+ *   add_nexthop 新增成员；del_nexthop 删除成员；delete 删除组。
+ */
 struct nexthop_group_hooks {
 	void (*new)(const char *name);
 	void (*modify)(const struct nexthop_group_cmd *nhgc);
@@ -44,16 +84,22 @@ struct nexthop_group_hooks {
 	void (*delete)(const char *name);
 };
 
+/* 全局唯一的回调表实例；默认全为 NULL（未注册即不通知）。 */
 static struct nexthop_group_hooks nhg_hooks;
 
+/* RB 树（红黑树）按组名排序的实现：先声明比较函数，再用 RB_GENERATE 生成
+ * 插入 / 查找 / 删除等模板代码，类型为 nhgc_entry_head。
+ */
 static inline int
 nexthop_group_cmd_compare(const struct nexthop_group_cmd *nhgc1,
 			  const struct nexthop_group_cmd *nhgc2);
 RB_GENERATE(nhgc_entry_head, nexthop_group_cmd, nhgc_entry,
 	    nexthop_group_cmd_compare)
 
+/* 全部命名 nexthop group 的 RB 树根。 */
 static struct nhgc_entry_head nhgc_entries;
 
+/* RB 树比较函数：直接按组名 strcmp 排序。 */
 static inline int
 nexthop_group_cmd_compare(const struct nexthop_group_cmd *nhgc1,
 			  const struct nexthop_group_cmd *nhgc2)
@@ -61,6 +107,9 @@ nexthop_group_cmd_compare(const struct nexthop_group_cmd *nhgc1,
 	return strcmp(nhgc1->name, nhgc2->name);
 }
 
+/* 返回 nexthop_group 顶层链表的尾节点；空组返回 NULL。只走顶层 next 链，
+ * 不进入递归解析链。
+ */
 static struct nexthop *nexthop_group_tail(const struct nexthop_group *nhg)
 {
 	struct nexthop *nexthop = nhg->nexthop;
@@ -71,6 +120,7 @@ static struct nexthop *nexthop_group_tail(const struct nexthop_group *nhg)
 	return nexthop;
 }
 
+/* 统计组内 nexthop 总数（用 ALL_NEXTHOPS_PTR，含递归解析成员）。 */
 uint16_t nexthop_group_nexthop_num(const struct nexthop_group *nhg)
 {
 	struct nexthop *nhop;
@@ -82,6 +132,7 @@ uint16_t nexthop_group_nexthop_num(const struct nexthop_group *nhg)
 	return num;
 }
 
+/* 只统计顶层 nexthop 数量，不含递归解析成员。 */
 uint16_t nexthop_group_nexthop_num_no_recurse(const struct nexthop_group *nhg)
 {
 	struct nexthop *nhop;
@@ -93,6 +144,7 @@ uint16_t nexthop_group_nexthop_num_no_recurse(const struct nexthop_group *nhg)
 	return num;
 }
 
+/* 统计组内 ACTIVE 状态的 nexthop 数量（含递归解析成员）。 */
 uint16_t nexthop_group_active_nexthop_num(const struct nexthop_group *nhg)
 {
 	struct nexthop *nhop;
@@ -106,6 +158,7 @@ uint16_t nexthop_group_active_nexthop_num(const struct nexthop_group *nhg)
 	return num;
 }
 
+/* 统计组内已置 FIB 标志的 nexthop 数量（含递归解析成员）。 */
 uint16_t nexthop_group_fib_nexthop_num(const struct nexthop_group *nhg)
 {
 	struct nexthop *nhop;
@@ -119,6 +172,7 @@ uint16_t nexthop_group_fib_nexthop_num(const struct nexthop_group *nhg)
 	return num;
 }
 
+/* 组内是否有任一成员带标签栈（nh_label 非空）。找到即返回 true。 */
 bool nexthop_group_has_label(const struct nexthop_group *nhg)
 {
 	struct nexthop *nhop;
@@ -131,6 +185,9 @@ bool nexthop_group_has_label(const struct nexthop_group *nhg)
 	return false;
 }
 
+/* 在 nhg 顶层链表中查找与 nh“完整相等”（nexthop_same）的成员，返回其指针；
+ * 找不到返回 NULL。只查顶层链，不查递归解析链。
+ */
 struct nexthop *nexthop_exists(const struct nexthop_group *nhg,
 			       const struct nexthop *nh)
 {
@@ -144,6 +201,10 @@ struct nexthop *nexthop_exists(const struct nexthop_group *nhg,
 	return NULL;
 }
 
+/* 在 nhg 中按“配置语义”查找 nexthop：只比较 vrf、type、网关 / 接口 /
+ * 黑洞类型，忽略标签、权重、源地址等。这与 nexthop_same 的完整比较不同，
+ * 用于配置增删时定位成员。返回匹配成员，找不到返回 NULL。
+ */
 /*
  * Helper that locates a nexthop in an nhg config list. Note that
  * this uses a specific matching / equality rule that's different from
@@ -197,6 +258,10 @@ static struct nexthop *nhg_nh_find(const struct nexthop_group *nhg,
 	return NULL;
 }
 
+/* 两组相等判定的公共前置检查：NULL 规则（一方为空不相等、同一指针相等）、
+ * 成员个数是否相同（用传入的计数函数决定是否含递归）。返回 true 表示“有
+ * 可能相等，需继续逐成员比较”。注意：只做前置判断，不做逐成员比较。
+ */
 static bool nexthop_group_equal_common(
 	const struct nexthop_group *nhg1, const struct nexthop_group *nhg2,
 	uint16_t (*nexthop_group_nexthop_num_func)(const struct nexthop_group *nhg))
@@ -217,6 +282,9 @@ static bool nexthop_group_equal_common(
 	return true;
 }
 
+/* 比较两组是否相等（忽略递归解析链）：先做公共前置检查，再按顶层 next 链
+ * 逐成员 nexthop_same。前提：两组均已按规范顺序排列。
+ */
 /* This assumes ordered */
 bool nexthop_group_equal_no_recurse(const struct nexthop_group *nhg1,
 				    const struct nexthop_group *nhg2)
@@ -241,6 +309,9 @@ bool nexthop_group_equal_no_recurse(const struct nexthop_group *nhg1,
 	return true;
 }
 
+/* 比较两组是否相等（含递归解析链）：公共前置检查后，用 nexthop_next 遍历
+ * （会下钻解析链）逐成员 nexthop_same。前提：两组均已按规范顺序排列。
+ */
 /* This assumes ordered */
 bool nexthop_group_equal(const struct nexthop_group *nhg1,
 			 const struct nexthop_group *nhg2)
@@ -263,11 +334,16 @@ bool nexthop_group_equal(const struct nexthop_group *nhg1,
 
 	return true;
 }
+/* 分配并零初始化一个空 nexthop_group（XCALLOC，失败即终止）。 */
 struct nexthop_group *nexthop_group_new(void)
 {
 	return XCALLOC(MTYPE_NEXTHOP_GROUP, sizeof(struct nexthop_group));
 }
 
+/* 深拷贝 from 到已存在的 to：拷贝 resilience 参数，并用 copy_nexthops 复制
+ * 整条成员链（含递归信息，rparent 以 NULL 起）。to 原有成员会被覆盖，调用
+ * 者应先确保 to 为空或已释放。
+ */
 void nexthop_group_copy(struct nexthop_group *to,
 			const struct nexthop_group *from)
 {
@@ -276,6 +352,9 @@ void nexthop_group_copy(struct nexthop_group *to,
 	copy_nexthops(&to->nexthop, from->nexthop, NULL);
 }
 
+/* 删除整组：释放成员与结构体，并把 *nhg 置 NULL。对 *nhg 为 NULL 安全
+ * （直接返回），因此可用于“可能为空”的场景。
+ */
 void nexthop_group_delete(struct nexthop_group **nhg)
 {
 	/* OK to call with NULL group */
@@ -288,6 +367,9 @@ void nexthop_group_delete(struct nexthop_group **nhg)
 	XFREE(MTYPE_NEXTHOP_GROUP, *nhg);
 }
 
+/* 把 nexthop 追加到链表 *target 的末尾（遍历到最后一个节点再挂）。*target
+ * 为空时把它作为新头。注意：它不维护 prev 指针，也不保序。
+ */
 /* Add nexthop to the end of a nexthop list.  */
 void _nexthop_add(struct nexthop **target, struct nexthop *nexthop)
 {
@@ -302,6 +384,9 @@ void _nexthop_add(struct nexthop **target, struct nexthop *nexthop)
 	nexthop->prev = last;
 }
 
+/* 把 nexthop 按 nexthop_cmp 升序插入到已排序链表 *head 的正确位置，并维护
+ * prev / next 双向指针。要求 nexthop->next 为空（assert 校验）。
+ */
 /* Add nexthop to sorted list of nexthops */
 static void _nexthop_add_sorted(struct nexthop **head,
 				struct nexthop *nexthop)
@@ -333,6 +418,10 @@ static void _nexthop_add_sorted(struct nexthop **head,
 		*head = nexthop;
 }
 
+/* 按规范顺序把 nexthop 加入 nhg。优化：先与尾节点比较，若比尾大则直接追加
+ * （假定链表已排序），否则退回 _nexthop_add_sorted 逐位插入。要求 nexthop
+ * 的 next 为空。
+ */
 void nexthop_group_add_sorted(struct nexthop_group *nhg,
 			      struct nexthop *nexthop)
 {
@@ -355,6 +444,9 @@ void nexthop_group_add_sorted(struct nexthop_group *nhg,
 	_nexthop_add_sorted(&nhg->nexthop, nexthop);
 }
 
+/* 从 nhg 顶层链表中删除与 nh 相同的成员（按 nexthop_same 查找），并从链表
+ * 摘除、把 nh 的 prev / next 置空。要求能找到该成员（assert），否则崩溃。
+ */
 /* Delete nexthop from a nexthop list.  */
 void _nexthop_del(struct nexthop_group *nhg, struct nexthop *nh)
 {
@@ -379,6 +471,10 @@ void _nexthop_del(struct nexthop_group *nhg, struct nexthop *nh)
 	nh->next = NULL;
 }
 
+/* 无条件地把 nexthop 从其所在链表摘除（不做查找 / 相等判断）：修正前后节点
+ * 的指针，若它是头节点则更新 nhg->nexthop（用 assert 校验一致性），最后把
+ * 它的 prev / next 置空。
+ */
 /* Unlink a nexthop from the list it's on, unconditionally */
 static void nexthop_unlink(struct nexthop_group *nhg, struct nexthop *nexthop)
 {
@@ -398,6 +494,9 @@ static void nexthop_unlink(struct nexthop_group *nhg, struct nexthop *nexthop)
 	nexthop->next = NULL;
 }
 
+/* 把链表 nh 中的每个 nexthop 复制（nexthop_dup）并保序插入 nhg。优化：若
+ * 源链表本身有序，与尾比较后直接追加即可，避免逐位比较。
+ */
 /*
  * Copy a list of nexthops in 'nh' to an nhg, enforcing canonical sort order
  */
@@ -431,6 +530,9 @@ void nexthop_group_copy_nh_sorted(struct nexthop_group *nhg,
 	}
 }
 
+/* 复制链表 nh 并按原顺序追加到 *tnh（_nexthop_add），不做排序。rparent 作为
+ * 复制出的每个 nexthop 的递归父指针。
+ */
 /* Copy a list of nexthops, no effort made to sort or order them. */
 void copy_nexthops(struct nexthop **tnh, const struct nexthop *nh,
 		   struct nexthop *rparent)
@@ -444,6 +546,9 @@ void copy_nexthops(struct nexthop **tnh, const struct nexthop *nh,
 	}
 }
 
+/* 对整组求哈希，但只遍历顶层 next 链（不含递归解析成员）。逐个成员用
+ * nexthop_hash 后以 jhash_1word 累积。结果依赖成员顺序。
+ */
 uint32_t nexthop_group_hash_no_recurse(const struct nexthop_group *nhg)
 {
 	struct nexthop *nh;
@@ -459,6 +564,9 @@ uint32_t nexthop_group_hash_no_recurse(const struct nexthop_group *nhg)
 	return key;
 }
 
+/* 对整组求哈希（用 ALL_NEXTHOPS_PTR，含递归解析成员）。逐个成员用
+ * nexthop_hash 后以 jhash_1word 累积。结果依赖成员顺序。
+ */
 uint32_t nexthop_group_hash(const struct nexthop_group *nhg)
 {
 	struct nexthop *nh;
@@ -470,6 +578,10 @@ uint32_t nexthop_group_hash(const struct nexthop_group *nhg)
 	return key;
 }
 
+/* 遍历组内每个 nexthop（含递归成员），若与“它之前的某个成员”nexthop_same
+ * 相等，则给它打上 NEXTHOP_FLAG_DUPLICATE。进入时先清除本节点旧标志再判断，
+ * 因此可反复调用而结果稳定。副作用：修改成员 flags。
+ */
 void nexthop_group_mark_duplicates(struct nexthop_group *nhg)
 {
 	struct nexthop *nexthop, *prev;
@@ -488,6 +600,10 @@ void nexthop_group_mark_duplicates(struct nexthop_group *nhg)
 	}
 }
 
+/* 删除命名组 nhgc 中的全部 nexthop（含递归成员）：逐个从链表摘除、调用
+ * del_nexthop 回调（若注册）、再释放。用 nexthop_next 保存下一个节点，避免
+ * 释放后解引用。
+ */
 static void nhgc_delete_nexthops(struct nexthop_group_cmd *nhgc)
 {
 	struct nexthop *nexthop;
@@ -506,6 +622,9 @@ static void nhgc_delete_nexthops(struct nexthop_group_cmd *nhgc)
 	}
 }
 
+/* 按名字在 RB 树中查找命名组，返回其 nexthop_group_cmd；找不到返回 NULL。
+ * 内部构造一个临时 key 做 RB_FIND，名字会按 NHGC_NAME_SIZE 截断。
+ */
 struct nexthop_group_cmd *nhgc_find(const char *name)
 {
 	struct nexthop_group_cmd find;
@@ -515,6 +634,9 @@ struct nexthop_group_cmd *nhgc_find(const char *name)
 	return RB_FIND(nhgc_entry_head, &nhgc_entries, &find);
 }
 
+/* 字符串比较助手：先处理 NULL（双 NULL 相等、单 NULL 有固定大小关系），
+ * 再 strcmp。用于对可空字符串字段排序。
+ */
 static int nhgc_cmp_helper(const char *a, const char *b)
 {
 	if (!a && !b)
@@ -529,6 +651,9 @@ static int nhgc_cmp_helper(const char *a, const char *b)
 	return strcmp(a, b);
 }
 
+/* sockunion 地址比较助手：NULL 处理同 nhgc_cmp_helper，之后用 sockunion_cmp
+ * 比较实际地址。
+ */
 static int nhgc_addr_cmp_helper(const union sockunion *a, const union sockunion *b)
 {
 	if (!a && !b)
@@ -543,6 +668,9 @@ static int nhgc_addr_cmp_helper(const union sockunion *a, const union sockunion 
 	return sockunion_cmp(a, b);
 }
 
+/* 两个 nexthop_hold（配置项）的排序比较：依次比较地址 → 接口 → VRF →
+ * onlink（注意 onlink 是降序：nh2 - nh1）→ 标签串。用于 nhg_list 的排序 / 去重。
+ */
 static int nhgl_cmp(struct nexthop_hold *nh1, struct nexthop_hold *nh2)
 {
 	int ret;
@@ -566,6 +694,9 @@ static int nhgl_cmp(struct nexthop_hold *nh1, struct nexthop_hold *nh2)
 	return nhgc_cmp_helper(nh1->labels, nh2->labels);
 }
 
+/* 释放一个 nexthop_hold 配置项：释放 intf / nhvrf_name / addr / labels 及
+ * 结构体本身。作为 nhg_list 的 del 回调使用。
+ */
 static void nhgl_delete(struct nexthop_hold *nh)
 {
 	XFREE(MTYPE_TMP, nh->intf);
@@ -580,6 +711,10 @@ static void nhgl_delete(struct nexthop_hold *nh)
 	XFREE(MTYPE_TMP, nh);
 }
 
+/* 按名字获取命名组，不存在则新建：分配 nexthop_group_cmd、登记 QOBJ、插入
+ * RB 树、初始化内部的 nhg_list（带 nhgl_cmp / nhgl_delete 回调），并在新建
+ * 时触发 nhg_hooks.new。返回该命名组。
+ */
 static struct nexthop_group_cmd *nhgc_get(const char *name)
 {
 	struct nexthop_group_cmd *nhgc;
@@ -603,6 +738,9 @@ static struct nexthop_group_cmd *nhgc_get(const char *name)
 	return nhgc;
 }
 
+/* 删除命名组：先删除其全部 nexthop，触发 nhg_hooks.delete，再从 RB 树移除、
+ * 删除 nhg_list、注销 QOBJ，最后释放结构体。
+ */
 static void nhgc_delete(struct nexthop_group_cmd *nhgc)
 {
 	nhgc_delete_nexthops(nhgc);
@@ -618,8 +756,13 @@ static void nhgc_delete(struct nexthop_group_cmd *nhgc)
 	XFREE(MTYPE_TMP, nhgc);
 }
 
+/* 为 nexthop_group_cmd 生成 QOBJ 类型登记（供内省 / 引用计数框架使用）。 */
 DEFINE_QOBJ_TYPE(nexthop_group_cmd);
 
+/* 命令 “nexthop-group NAME”：创建（或获取）命名组并进入其子模式。
+ * 注意本文件仅提供独立命令实现，实际命令注册在 nexthop_group_init 中完成，
+ * 故用 DEFUN_NOSH。副作用：可能新建命名组并触发 new 回调。
+ */
 DEFUN_NOSH(nexthop_group, nexthop_group_cmd, "nexthop-group NHGNAME",
 	   "Enter into the nexthop-group submode\n"
 	   "Specify the NAME of the nexthop-group\n")
@@ -633,6 +776,7 @@ DEFUN_NOSH(nexthop_group, nexthop_group_cmd, "nexthop-group NHGNAME",
 	return CMD_SUCCESS;
 }
 
+/* 命令 “no nexthop-group NAME”：按名查找并删除命名组；不存在则静默成功。 */
 DEFUN_NOSH(no_nexthop_group, no_nexthop_group_cmd, "no nexthop-group NHGNAME",
 	   NO_STR
 	   "Delete the nexthop-group\n"
@@ -648,6 +792,7 @@ DEFUN_NOSH(no_nexthop_group, no_nexthop_group_cmd, "no nexthop-group NHGNAME",
 	return CMD_SUCCESS;
 }
 
+/* 命令 “backup-group NAME”：把当前命名组的备份组名设为 name。 */
 DEFPY(nexthop_group_backup, nexthop_group_backup_cmd,
       "backup-group WORD$name",
       "Specify a group name containing backup nexthops\n"
@@ -660,6 +805,7 @@ DEFPY(nexthop_group_backup, nexthop_group_backup_cmd,
 	return CMD_SUCCESS;
 }
 
+/* 命令 “no backup-group [NAME]”：清空当前命名组的备份组名。 */
 DEFPY(no_nexthop_group_backup, no_nexthop_group_backup_cmd,
       "no backup-group [WORD$name]",
       NO_STR
@@ -673,6 +819,9 @@ DEFPY(no_nexthop_group_backup, no_nexthop_group_backup_cmd,
 	return CMD_SUCCESS;
 }
 
+/* 命令 “resilient buckets ... idle-timer ... unbalanced-timer ...”：设置当前
+ * 命名组的韧性参数（桶数、空闲与失衡定时器），并触发 modify 回调。
+ */
 DEFPY(nexthop_group_resilience,
       nexthop_group_resilience_cmd,
       "resilient buckets (1-256) idle-timer (1-4294967295) unbalanced-timer (1-4294967295)",
@@ -696,6 +845,7 @@ DEFPY(nexthop_group_resilience,
 	return CMD_SUCCESS;
 }
 
+/* 命令 “no resilient ...”：把当前命名组的韧性参数全部清零。 */
 DEFPY(no_nexthop_group_resilience,
       no_nexthop_group_resilience_cmd,
       "no resilient [buckets (1-256) idle-timer (1-4294967295) unbalanced-timer (1-4294967295)]",
@@ -717,6 +867,10 @@ DEFPY(no_nexthop_group_resilience,
 	return CMD_SUCCESS;
 }
 
+/* 保存一条 nexthop 的“配置信息”：分配 nexthop_hold，按需深拷贝各字符串 /
+ * 地址，填入 onlink / weight / backup_str，再按序插入 nhgc->nhg_list。
+ * 保存的是原始配置（可能尚未生效），与已解析的 struct nexthop 并行存在。
+ */
 static void nexthop_group_save_nhop(struct nexthop_group_cmd *nhgc,
 				    const char *nhvrf_name,
 				    const union sockunion *addr,
@@ -747,6 +901,9 @@ static void nexthop_group_save_nhop(struct nexthop_group_cmd *nhgc,
 	listnode_add_sort(nhgc->nhg_list, nh);
 }
 
+/* 从 nhgc->nhg_list 中按 vrf + 地址 + 接口（仅此三项）找到并删除对应的
+ * nexthop_hold 配置项。找不到则静默返回。它只改配置列表，不动实际 nexthop。
+ */
 /*
  * Remove config info about a nexthop from group 'nhgc'. Note that we
  * use only a subset of the available attributes here to determine
@@ -779,6 +936,12 @@ static void nexthop_group_unsave_nhop(struct nexthop_group_cmd *nhgc,
 	nhgl_delete(nh);
 }
 
+/* 由配置串构造一个 nexthop：解析 vrf 名（缺省用默认 VRF）、接口名（未就绪
+ * 会失败）、onlink、地址（IPv4 / IPv6，决定 type）、标签串（mpls_str2label，
+ * 结果经 lbl_ret 回传）、VNI（EVPN 场景）、weight、备份索引串。
+ * 返回 true 表示合法；false 可能是暂时性失败（如接口未就绪）或致命错误
+ * （标签解析失败，此时 *lbl_ret < 0）。
+ */
 /*
  * Parse the config strings we support for a single nexthop. This gets used
  * in a couple of different ways, and we distinguish between transient
@@ -872,6 +1035,9 @@ static bool nexthop_group_parse_nexthop(struct nexthop *nhop,
 	return true;
 }
 
+/* 便捷封装：把一个 nexthop_hold 的各字段喂给 nexthop_group_parse_nexthop
+ * 构造出 nexthop（lbl_ret 传 NULL，即不关心标签解析细节）。返回是否合法。
+ */
 /*
  * Wrapper to parse the strings in a 'nexthop_hold'
  */
@@ -883,6 +1049,13 @@ static bool nexthop_group_parse_nhh(struct nexthop *nhop,
 		nhh->labels, nhh->vni, NULL, nhh->weight, nhh->backup_str));
 }
 
+/* 核心命令 “[no] nexthop <ADDR|INTERFACE> [onlink] [nexthop-vrf ...|label ...|
+ * vni ...|weight ...|backup-idx ...]”：向当前命名组增删一条 nexthop。
+ * 流程：先校验备份串，再解析出 nhop（可能因接口未就绪而“暂时非法”）；
+ * 拒绝无接口的 v6 链路本地地址；对标签解析错误给出具体提示；随后总是移除
+ * 旧配置信息与旧 nexthop，若是新增则把合法的 nhop 挂入组并保存配置，最后
+ * 触发相应回调。返回 CMD_SUCCESS 或 CMD_WARNING_CONFIG_FAILED。
+ */
 DEFPY(ecmp_nexthops, ecmp_nexthops_cmd,
       "[no] nexthop\
         <\
@@ -1006,6 +1179,9 @@ DEFPY(ecmp_nexthops, ecmp_nexthops_cmd,
 	return CMD_SUCCESS;
 }
 
+/* cmd_node：定义 nexthop-group 子模式（NH_GROUP_NODE），其配置回显由
+ * nexthop_group_write 完成（此处先声明）。
+ */
 static int nexthop_group_write(struct vty *vty);
 static struct cmd_node nexthop_group_node = {
 	.name = "nexthop-group",
@@ -1015,6 +1191,10 @@ static struct cmd_node nexthop_group_node = {
 	.config_write = nexthop_group_write,
 };
 
+/* 以简化格式输出单条 nexthop 的“nexthop ...”部分（不含 vrf / label / weight
+ * 等后缀）：按类型打印接口名或地址 + 接口名，黑洞打印 drop。altifname 非空
+ * 时用作接口名（常用于重命名场景）。
+ */
 void nexthop_group_write_nexthop_simple(struct vty *vty,
 					const struct nexthop *nh,
 					char *altifname)
@@ -1050,6 +1230,9 @@ void nexthop_group_write_nexthop_simple(struct vty *vty,
 	}
 }
 
+/* 以完整配置格式输出单条 nexthop：先调 _simple 打印主体，再补 nexthop-vrf /
+ * label / weight / backup-idx 等后缀，最后换行。
+ */
 void nexthop_group_write_nexthop(struct vty *vty, const struct nexthop *nh)
 {
 	struct vrf *vrf;
@@ -1083,6 +1266,10 @@ void nexthop_group_write_nexthop(struct vty *vty, const struct nexthop *nh)
 	vty_out(vty, "\n");
 }
 
+/* 把单条 nexthop 以 JSON 形式追加到对象 j：按类型输出 nexthop 地址 / 接口，
+ * 非默认 VRF 时输出 targetVrf，另有 label、weight、backupIdx（仅 HAS_BACKUP
+ * 时）。无返回值。
+ */
 void nexthop_group_json_nexthop(json_object *j, const struct nexthop *nh)
 {
 	struct vrf *vrf;
@@ -1142,6 +1329,10 @@ void nexthop_group_json_nexthop(json_object *j, const struct nexthop *nh)
 	}
 }
 
+/* 把一条 nexthop_hold 的“配置原文”回显为一行 “nexthop ...”，字段顺序为
+ * addr / intf / onlink / nexthop-vrf / label / vni / weight / backup-idx。
+ * 输出的是配置列表里的原始信息，而非解析后的 nexthop。
+ */
 static void nexthop_group_write_nexthop_internal(struct vty *vty,
 						 const struct nexthop_hold *nh)
 {
@@ -1174,6 +1365,10 @@ static void nexthop_group_write_nexthop_internal(struct vty *vty,
 	vty_out(vty, "\n");
 }
 
+/* 当前运行配置中所有命名组的回显（cmd_node 的 config_write 回调）：遍历 RB
+ * 树，逐组输出 “nexthop-group NAME”、resilient 行、backup-group 行与各条
+ * nexthop 配置，最后 “exit” 与分隔符。始终返回 1。
+ */
 static int nexthop_group_write(struct vty *vty)
 {
 	struct nexthop_group_cmd *nhgc;
@@ -1207,6 +1402,10 @@ static int nexthop_group_write(struct vty *vty)
 	return 1;
 }
 
+/* VRF 创建 / 就绪时调用：遍历所有命名组，对属于该 VRF 且此前因 VRF 缺失而
+ * 未生效的配置项，构造 nexthop 并补挂进组（若尚不存在），触发 add_nexthop
+ * 回调。用于“配置先于 VRF 存在”的补挂场景。
+ */
 void nexthop_group_enable_vrf(struct vrf *vrf)
 {
 	struct nexthop_group_cmd *nhgc;
@@ -1241,6 +1440,9 @@ void nexthop_group_enable_vrf(struct vrf *vrf)
 	}
 }
 
+/* VRF 删除时调用：遍历所有命名组，把属于该 VRF 的已生效 nexthop 从组中摘除、
+ * 触发 del_nexthop 回调并释放。与 enable_vrf 互为逆操作。
+ */
 void nexthop_group_disable_vrf(struct vrf *vrf)
 {
 	struct nexthop_group_cmd *nhgc;
@@ -1274,6 +1476,11 @@ void nexthop_group_disable_vrf(struct vrf *vrf)
 	}
 }
 
+/* 接口状态变化（up/down 或 ifindex 变更）时调用：遍历所有命名组，
+ *   接口 up：把引用该接口、此前未生效的配置项补挂进组；
+ *   接口 down：把引用该接口（按 oldifindex 匹配）的 nexthop 摘除并释放。
+ * 会触发 add_nexthop / del_nexthop 回调。
+ */
 void nexthop_group_interface_state_change(struct interface *ifp,
 					  ifindex_t oldifindex)
 {
@@ -1347,6 +1554,9 @@ void nexthop_group_interface_state_change(struct interface *ifp,
 	}
 }
 
+/* 命令补全回调：遍历 RB 树，把所有命名组的名字加入候选集 comps，供
+ * “nexthop-group <TAB>” 之类的补全使用。
+ */
 static void nhg_name_autocomplete(vector comps, struct cmd_token *token)
 {
 	struct nexthop_group_cmd *nhgc;
@@ -1356,10 +1566,17 @@ static void nhg_name_autocomplete(vector comps, struct cmd_token *token)
 	}
 }
 
+/* 命令变量处理器表：把 token 名 NHGNAME 绑定到 nhg_name_autocomplete，
+ * 末尾用 NULL 终止（CLI 框架约定）。
+ */
 static const struct cmd_variable_handler nhg_name_handlers[] = {
 	{.tokenname = "NHGNAME", .completions = nhg_name_autocomplete},
 	{.completions = NULL}};
 
+/* 初始化命名 nexthop group 子系统：初始化 RB 树、注册补全处理器、安装
+ * nexthop-group 子模式相关的所有 cli 命令，并保存上层传入的事件回调（未传
+ * 的回调保持为空，即不通知）。此函数应在启动时调用一次。
+ */
 void nexthop_group_init(void (*new)(const char *name),
 			void (*modify)(const struct nexthop_group_cmd *nhgc),
 			void (*add_nexthop)(const struct nexthop_group_cmd *nhg,

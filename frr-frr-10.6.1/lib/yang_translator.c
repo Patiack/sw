@@ -4,6 +4,19 @@
  *                     Renato Westphal
  */
 
+/*
+ * 文件导读：YANG 模型翻译层实现（yang_translator.c）
+ *
+ * 本文件实现 yang_translator.h 声明的模型翻译功能：把一个“外部模型家族”的
+ * JSON 描述文件解析成翻译器，加载其中的模块，建立“外部路径 与 原生路径”的
+ * 双向映射，再据此在配置进入或离开时转换 xpath 与数据节点。
+ *
+ * 与相邻层的关系：翻译器拥有自己独立的 libyang 上下文，与 yang.c 中的
+ * ly_native_ctx 相互分离；转换过程通过 yang.c 提供的 schema 与数据节点工具操作。
+ *
+ * 关键数据结构：yang_mapping_node 是映射表元素；翻译器的 mappings 数组按下标
+ * （TO_NATIVE 或 FROM_NATIVE）存放两张哈希表。
+ */
 #include <zebra.h>
 
 #include "log.h"
@@ -13,33 +26,61 @@
 #include "yang_translator.h"
 #include "frrstr.h"
 
+/*
+ * DEFINE_MTYPE_STATIC - 声明本文件私有的内存类型标签，便于内存统计与排错。
+ */
 DEFINE_MTYPE_STATIC(LIB, YANG_TRANSLATOR, "YANG Translator");
 DEFINE_MTYPE_STATIC(LIB, YANG_TRANSLATOR_MODULE, "YANG Translator Module");
 DEFINE_MTYPE_STATIC(LIB, YANG_TRANSLATOR_MAPPING, "YANG Translator Mapping");
 
 /* Generate the yang_translators tree. */
+/*
+ * yang_translator_compare - 翻译器红黑树的比较函数，按 family 家族名字符串比较。
+ */
 static inline int yang_translator_compare(const struct yang_translator *a,
 					  const struct yang_translator *b)
 {
 	return strcmp(a->family, b->family);
 }
+/*
+ * RB_GENERATE - 为 yang_translators 生成红黑树的一整套操作函数。
+ */
 RB_GENERATE(yang_translators, yang_translator, entry, yang_translator_compare)
 
+/*
+ * yang_translators - 全局翻译器红黑树。
+ */
 struct yang_translators yang_translators = RB_INITIALIZER(&yang_translators);
 
+/*
+ * ly_translator_ctx - 翻译器专用（与原生上下文分离）的 libyang 上下文，
+ * 用于解析翻译器描述 JSON 文件本身。
+ */
 /* Separate libyang context for the translator module. */
 static struct ly_ctx *ly_translator_ctx;
 
+/*
+ * 两个前置声明：yang_translator_validate 负责校验映射完整性，
+ * yang_module_nodes_count 统计模块节点数以计算覆盖率。实现见文件后部。
+ */
 static unsigned int
 yang_translator_validate(struct yang_translator *translator);
 static unsigned int yang_module_nodes_count(const struct lys_module *module);
 
+/*
+ * yang_mapping_node - 一条路径映射。
+ * xpath_from_canonical 是哈希表键（来源侧的规范路径，含实际 key 值）；
+ * xpath_from_fmt 与 xpath_to_fmt 是带占位符的格式串，用于把实际 key 代入生成目标路径。
+ */
 struct yang_mapping_node {
 	char xpath_from_canonical[XPATH_MAXLEN];
 	char xpath_from_fmt[XPATH_MAXLEN];
 	char xpath_to_fmt[XPATH_MAXLEN];
 };
 
+/*
+ * yang_mapping_hash_cmp - 哈希表的相等判断，比较来源侧规范路径是否相同。
+ */
 static bool yang_mapping_hash_cmp(const void *value1, const void *value2)
 {
 	const struct yang_mapping_node *c1 = value1;
@@ -48,11 +89,17 @@ static bool yang_mapping_hash_cmp(const void *value1, const void *value2)
 	return strmatch(c1->xpath_from_canonical, c2->xpath_from_canonical);
 }
 
+/*
+ * yang_mapping_hash_key - 哈希函数，对传入字符串计算哈希值。
+ */
 static unsigned int yang_mapping_hash_key(const void *value)
 {
 	return string_hash_make(value);
 }
 
+/*
+ * yang_mapping_hash_alloc - 哈希表插入新键时的分配回调，复制键的规范路径。
+ */
 static void *yang_mapping_hash_alloc(void *p)
 {
 	struct yang_mapping_node *new, *key = p;
@@ -64,11 +111,18 @@ static void *yang_mapping_hash_alloc(void *p)
 	return new;
 }
 
+/*
+ * yang_mapping_hash_free - 哈希表元素的释放回调。
+ */
 static void yang_mapping_hash_free(void *arg)
 {
 	XFREE(MTYPE_YANG_TRANSLATOR_MAPPING, arg);
 }
 
+/*
+ * yang_mapping_lookup - 按方向与 xpath 在映射表中查找映射项。
+ * @dir：翻译方向。返回映射项或 NULL。
+ */
 static struct yang_mapping_node *
 yang_mapping_lookup(const struct yang_translator *translator, int dir,
 		    const char *xpath)
@@ -79,6 +133,13 @@ yang_mapping_lookup(const struct yang_translator *translator, int dir,
 	return hash_lookup(translator->mappings[dir], &s);
 }
 
+/*
+ * yang_mapping_add - 新增一条映射。
+ * @dir：方向；@snode：来源侧 schema 节点（据此取规范路径作为键）；
+ * @xpath_from_fmt 与 @xpath_to_fmt：来源与目标格式串。
+ * 副作用：把格式串中的 KEY1 到 KEY4 占位符替换掉：来源侧换成匹配非引号的通配，
+ *          目标侧换成 %s，从而把静态模板变成可用于 sscanf 与 snprintf 的格式。
+ */
 static void yang_mapping_add(struct yang_translator *translator, int dir,
 			     const struct lysc_node *snode,
 			     const char *xpath_from_fmt,
@@ -114,11 +175,23 @@ static void yang_mapping_add(struct yang_translator *translator, int dir,
 	}
 }
 
+/*
+ * yang_tmodule_delete - 释放一个 yang_tmodule。
+ */
 static void yang_tmodule_delete(struct yang_tmodule *tmodule)
 {
 	XFREE(MTYPE_YANG_TRANSLATOR_MODULE, tmodule);
 }
 
+/*
+ * yang_translator_load - 从 JSON 文件加载并构建一个模块翻译器。
+ * @path：翻译器描述文件的绝对路径
+ * 返回：新翻译器；失败返回 NULL。
+ * 流程：解析 JSON 并读 family；若已存在同名翻译器则报错返回；创建独立上下文并加载
+ *       各模块与偏差模块，统计覆盖率，再建立双向映射并校验。
+ * 坑：多处错误路径都要归还 dnode；error 标签里还会调用 yang_tmodule_delete，
+ *     需注意 tmodule 可能为 NULL。
+ */
 struct yang_translator *yang_translator_load(const char *path)
 {
 	struct yang_translator *translator;
@@ -279,6 +352,11 @@ error:
 	return NULL;
 }
 
+/*
+ * yang_translator_unload - 卸载翻译器并释放其全部资源。
+ * 依次清理两张映射哈希表、删除模块链表（设置 del 回调以释放各 tmodule）、
+ * 销毁翻译器上下文、从红黑树移除并释放句柄本身。
+ */
 void yang_translator_unload(struct yang_translator *translator)
 {
 	for (size_t i = 0; i < YANG_TRANSLATE_MAX; i++)
@@ -290,6 +368,9 @@ void yang_translator_unload(struct yang_translator *translator)
 	XFREE(MTYPE_YANG_TRANSLATOR, translator);
 }
 
+/*
+ * yang_translator_find - 按家族名在红黑树中查找翻译器，找不到返回 NULL。
+ */
 struct yang_translator *yang_translator_find(const char *family)
 {
 	struct yang_translator s;
@@ -298,6 +379,15 @@ struct yang_translator *yang_translator_find(const char *family)
 	return RB_FIND(yang_translators, &yang_translators, &s);
 }
 
+/*
+ * yang_translate_xpath - 翻译一个 xpath。
+ * @dir：方向，决定用哪个 libyang 上下文定位 schema 节点
+ * @xpath：就地输入输出，成功时被替换为目标路径
+ * 返回：SUCCESS / NOTFOUND（无映射）/ FAILURE（路径未知或转换出错）。
+ * 实现：先取来源侧 schema 节点的规范路径作为键查映射，再用 sscanf 依来源格式提取
+ *       各 key，用 snprintf 依目标格式拼出新路径。
+ * 坑：格式串来自配置，用 diagnostic 抑制 -Wformat-nonliteral 告警。
+ */
 enum yang_translate_result
 yang_translate_xpath(const struct yang_translator *translator, int dir,
 		     char *xpath, size_t xpath_len)
@@ -350,6 +440,15 @@ yang_translate_xpath(const struct yang_translator *translator, int dir,
 	return YANG_TRANSLATE_SUCCESS;
 }
 
+/*
+ * yang_translate_dnode - 翻译整棵数据树。
+ * @dir：方向，决定新树的目标上下文
+ * @dnode：输入输出指针，成功时指向新树，旧树被释放
+ * 返回：SUCCESS 或 FAILURE。
+ * 实现：新建空树，深度优先遍历原树，对每个节点翻译路径，命中则在目标树里按新路径
+ *       创建同值节点，未命中则跳过。
+ * 坑：节点值用 yang_dnode_get_string 取字符串，适用于叶子；非叶子会得到空值。
+ */
 int yang_translate_dnode(const struct yang_translator *translator, int dir,
 			 struct lyd_node **dnode)
 {
@@ -409,11 +508,20 @@ error:
 	return YANG_TRANSLATE_FAILURE;
 }
 
+/*
+ * translator_validate_args - 校验回调的上下文：待校验的翻译器与累计错误数。
+ */
 struct translator_validate_args {
 	struct yang_translator *translator;
 	unsigned int errors;
 };
 
+/*
+ * yang_translator_validate_cb - 校验单个 schema 节点的映射。
+ * 若该节点在 TO_NATIVE 方向缺少映射则记一个错误；否则检查对应的原生节点类型，
+ * 类型基类不一致时也记错误；找不到原生节点会 assert。
+ * 返回：始终 YANG_ITER_CONTINUE。
+ */
 static int yang_translator_validate_cb(const struct lysc_node *snode_custom,
 				       void *arg)
 {
@@ -460,6 +568,11 @@ static int yang_translator_validate_cb(const struct lysc_node *snode_custom,
  * Check if the modules from the translator have a mapping for all of their
  * schema nodes (after loading the deviations).
  */
+/*
+ * yang_translator_validate - 校验翻译器所有模块的 schema 节点是否都有映射。
+ * 返回：累计的错误数（0 表示全部通过）。
+ * 副作用：有错误时打印告警，列出家族名与错误数。
+ */
 static unsigned int yang_translator_validate(struct yang_translator *translator)
 {
 	struct yang_tmodule *tmodule;
@@ -487,6 +600,9 @@ static unsigned int yang_translator_validate(struct yang_translator *translator)
 	return args.errors;
 }
 
+/*
+ * yang_module_nodes_count_cb - 遍历回调，每访问一个节点就把计数加一。
+ */
 static int yang_module_nodes_count_cb(const struct lysc_node *snode, void *arg)
 {
 	unsigned int *total = arg;
@@ -497,6 +613,10 @@ static int yang_module_nodes_count_cb(const struct lysc_node *snode, void *arg)
 }
 
 /* Calculate the number of nodes for the given module. */
+/*
+ * yang_module_nodes_count - 统计一个模块的节点数量（用于覆盖率计算）。
+ * 过滤掉非 presence 容器、list key 与 rpc 的输入输出节点。
+ */
 static unsigned int yang_module_nodes_count(const struct lys_module *module)
 {
 	unsigned int total = 0;
@@ -510,6 +630,10 @@ static unsigned int yang_module_nodes_count(const struct lys_module *module)
 	return total;
 }
 
+/*
+ * yang_translator_init - 初始化翻译子系统。
+ * 创建独立的翻译器上下文并加载 frr-module-translator 模型；失败则 exit(1)。
+ */
 void yang_translator_init(void)
 {
 	ly_translator_ctx = yang_ctx_new_setup(true, false, false);
@@ -528,6 +652,9 @@ void yang_translator_init(void)
 	}
 }
 
+/*
+ * yang_translator_terminate - 优雅收尾，逐个卸载翻译器后销毁上下文。
+ */
 void yang_translator_terminate(void)
 {
 	while (!RB_EMPTY(yang_translators, &yang_translators)) {

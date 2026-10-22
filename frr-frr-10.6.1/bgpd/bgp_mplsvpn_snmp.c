@@ -2,6 +2,36 @@
 /* MPLS/BGP L3VPN MIB
  * Copyright (C) 2020 Volta Networks Inc
  */
+/* ============================================================================
+ * 【文件导读】bgp_mplsvpn_snmp.c —— MPLS / BGP L3VPN MIB（RFC4382）取值实现
+ * ============================================================================
+ * 【它解决什么问题】把 bgpd 里的 L3VPN（VRF）状态暴露给网管：配置了哪些 VRF、各自的
+ *   RD、RT、接口、路由计数、以及每条 VRF 路由的详情；并在 VRF 的 up / down 状态翻转时
+ *   发 trap。对应的 MIB 是 MPLSL3VPN-MIB（1.3.6.1.2.1.10.166.11）。
+ *
+ * 【Net-SNMP 集成骨架】与前两个 BGP MIB 文件同构：回调签名一致，先 smux_header_generic
+ *   （标量）或 smux_header_table（表）校验，再按 exact 定位实例，最后 switch(v->magic)
+ *   取数。变量表 mpls_l3vpn_variables[] 把各列映射到回调与 OID。
+ *
+ * 【表索引（关键）】本 MIB 的表大多以“VRF 名字符串”为索引，于是：
+ *   - 需要一个按字典序遍历 VRF 名的辅助（bgp_lookup_by_name_next）才能实现 get_next；
+ *   - bgpL3vpnVrfRt_lookup 用 <vrf 名> + <AFI(u32)> + <rt 类型(u8)> 作复合索引；
+ *   - bgpL3vpnRte_lookup 用 <vrf 名> + <前缀类型 + 前缀 + 前缀长度 + policy(u16) +
+ *     下一跳类型 + 下一跳> 作复合索引，并逐字节解析 / 回填 OID。
+ *
+ * 【头文件常量是 MIB 契约】MPLSL3VPNVRFRTECIDRTYPE*（条目来源类型）与
+ *   MPLSVPNVRFRTTYPE*（RT 方向 import / export / both）取值必须与 MIB 一致，
+ *   见 bgp_mplsvpn_snmp.h 的导读。
+ *
+ * 【本文件承担的 hook】见文件末尾 bgp_mpls_l3vpn_module_init：把本文件的函数挂到
+ *   bgp_vrf_status_changed（VRF 状态变化 → 可能发 up / down trap）、
+ *   bgp_snmp_init_stats（初始化路由计数块）、bgp_snmp_update_last_changed（更新时间戳）、
+ *   bgp_snmp_update_stats（路由增删计数）。
+ *
+ * 【推荐阅读顺序】各 *_TABLE 常量与变量表 → 三个标量回调 → *_lookup 辅助（索引解析）
+ *   → 各表回调 → 末尾 hook 注册。
+ * ============================================================================
+ */
 
 #include <zebra.h>
 
@@ -26,12 +56,16 @@
 #include "bgpd/bgp_mplsvpn.h"
 #include "bgpd/bgp_mplsvpn_snmp.h"
 
+/* 【常量】通知开关的 MIB 取值：1=enable(true)、2=disable(false)（沿用 SNMP TruthValue）。 */
 #define BGP_mplsvpn_notif_enable_true 1
 #define BGP_mplsvpn_notif_enable_false 2
 
+/* 【OID 前缀】MPLSL3VPN-MIB 子树：1.3.6.1.2.1.10.166.11（见 RFC4382）。 */
 /* MPLSL3VPN MIB described in RFC4382 */
 #define MPLSL3VPNMIB 1, 3, 6, 1, 2, 1, 10, 166, 11
 
+/* 【标量列】mplsL3Vpn 下的标量：已配置 VRF 数、活跃 VRF 数、连接接口数、通知开关(可写)、
+ * 最大可能路由数、路由阈值时间、非法标签接收阈值。 */
 /* MPLSL3VPN Scalars */
 #define MPLSL3VPNCONFIGUREDVRFS 1
 #define MPLSL3VPNACTIVEVRFS 2
@@ -41,11 +75,14 @@
 #define MPLSL3VPNVRFCONFRTEMXTHRSHTIME 6
 #define MPLSL3VPNILLLBLRCVTHRSH 7
 
+/* 【表】mplsL3VpnIfConfTable 各列：IF 与 VRF 的绑定类信息。 */
 /* MPLSL3VPN IFConf Table */
 #define MPLSL3VPNIFVPNCLASSIFICATION 1
 #define MPLSL3VPNIFCONFSTORAGETYPE 2
 #define MPLSL3VPNIFCONFROWSTATUS 3
 
+/* 【表】mplsL3VpnVrfTable 各列：VPN id、描述、RD、创建时间、操作状态、接口数、
+ * 各阈值、最大路由、最后变更时间、行状态 / 管理状态 / 存储类型。 */
 /* MPLSL3VPN VRF Table */
 #define MPLSL3VPNVRFVPNID 1
 #define MPLSL3VPNVRFDESC 2
@@ -62,17 +99,22 @@
 #define MPLSL3VPNVRFCONFADMINSTATUS 13
 #define MPLSL3VPNVRFCONFSTORAGETYPE 14
 
+/* 【表】mplsL3VpnVrfRtTable 各列：RT 值、RT 描述、行状态、存储类型。 */
 /* MPLSL3VPN RT Table */
 #define MPLSL3VPNVRFRT 1
 #define MPLSL3VPNVRFRTDESCR 2
 #define MPLSL3VPNVRFRTROWSTATUS 3
 #define MPLSL3VPNVRFRTSTORAGETYPE 4
 
+/* 【表】mplsL3VpnPerfTable 各列：新增路由数、删除路由数、当前路由数。 */
 /* MPLSL3VPN PERF Table */
 #define MPLSL3VPNVRFPERFROUTESADDED 1
 #define MPLSL3VPNVRFPERFROUTESDELETED 2
 #define MPLSL3VPNVRFPERFCURRNUMROUTES 3
 
+/* 【表】mplsL3VpnVrfRteTable 各列：目的类型、目的前缀、前缀长度、policy(OID)、
+ * 下一跳类型、下一跳、ifindex、路由类型、协议、age、下一跳 AS、metric1..5、
+ * 交叉指针、行状态。 */
 /* MPLSL3VPN RTE Table */
 #define MPLSL3VPNVRFRTEINETCIDRDESTTYPE 1
 #define MPLSL3VPNVRFRTEINETCIDRDEST 2
@@ -93,10 +135,13 @@
 #define MPLSL3VPNVRFRTEINETCIDRXCPOINTER 17
 #define MPLSL3VPNVRFRTEINETCIDRSTATUS 18
 
+/* 【trap】两个通知：VRF up=1、VRF down=2。 */
 /* BGP Trap */
 #define MPLSL3VPNVRFUP 1
 #define MPLSL3VPNDOWN 2
 
+/* 【宏】类型别名（与 bgp_snmp.h 同义，此处独立定义）：把 SNMP 库的 ASN_* 常量映射成
+ * MIB 惯用类型名。改这些映射等于改变对外暴露的 SNMP 类型，不要随手改。 */
 /* SNMP value hack. */
 #define INTEGER ASN_INTEGER
 #define INTEGER32 ASN_INTEGER
@@ -107,11 +152,16 @@
 #define TIMETICKS ASN_TIMETICKS
 #define OID ASN_OBJECT_ID
 
+/* 【宏】声明回调返回值用的 static 缓冲（见 lib/smux.h）；SNMP_INTEGER 等宏写这些缓冲。 */
 /* Declare static local variables for convenience. */
 SNMP_LOCAL_VARIABLES
 
+/* 【常量】生成 RT 描述文本时，前缀 “RT <类型> for VRF ” 的预留长度。 */
 #define RT_PREAMBLE_SIZE 20
 
+/* 【静态状态】mpls_l3vpn_oid（MIB 基 OID）、mpls_l3vpn_trap_oid、rd_buf（RD 文本缓冲）、
+ * bgp_mplsvpn_notif_enable（通知开关，默认开启）、mpls_l3vpn_policy_oid（路由 policy 的
+ * OID 数组）、empty_nhop（空下一跳哨兵）、rt_description（RT 描述缓冲）。 */
 /* BGP-MPLS-MIB instances */
 static oid mpls_l3vpn_oid[] = {MPLSL3VPNMIB};
 static oid mpls_l3vpn_trap_oid[] = {MPLSL3VPNMIB, 0};
@@ -122,6 +172,7 @@ static oid mpls_l3vpn_policy_oid[2] = {0, 0};
 static const char *empty_nhop = "";
 char rt_description[VRF_NAMSIZ + RT_PREAMBLE_SIZE];
 
+/* 【前向声明】本文件各表 / 标量的取值回调，供下面的变量表引用（定义在文件后半）。 */
 static uint8_t *mplsL3vpnConfiguredVrfs(struct variable *, oid[], size_t *, int,
 					size_t *, WriteMethod **);
 
@@ -160,6 +211,8 @@ static uint8_t *mplsL3vpnRteTable(struct variable *, oid[], size_t *, int,
 				  size_t *, WriteMethod **);
 
 
+/* 【变量表】MPLS L3VPN MIB 注册表：每行 {magic, 类型, 读写, 回调, OID 段数, {OID 段}}。
+ * OID 段 {1,1,x} 是标量，{1,2,...} 是各表（IfConf / Vrf / VrfRt / Perf / Rte）。 */
 static struct variable mpls_l3vpn_variables[] = {
 	/* BGP version. */
 	{MPLSL3VPNCONFIGUREDVRFS,
@@ -468,6 +521,7 @@ static struct variable mpls_l3vpn_variables[] = {
 	 {1, 4, 1, 1, 18} },
 };
 
+/* 【辅助】把当前单调时间转成 TimeTicks（百分之一秒），写入 *counter。 */
 /* timeticks are in hundredths of a second */
 static void bgp_mpls_l3vpn_update_timeticks(time_t *counter)
 {
@@ -477,6 +531,7 @@ static void bgp_mpls_l3vpn_update_timeticks(time_t *counter)
 	*counter = (tv.tv_sec * 100) + (tv.tv_usec / 10000);
 }
 
+/* 【辅助】更新 VRF 的“最后变更时间”（snmp_stats->modify_time），供 MIB 列返回。 */
 static int bgp_mpls_l3vpn_update_last_changed(struct bgp *bgp)
 {
 	if (bgp->snmp_stats)
@@ -485,6 +540,7 @@ static int bgp_mpls_l3vpn_update_last_changed(struct bgp *bgp)
 	return 0;
 }
 
+/* 【辅助】统计某 VRF 当前的路由数（遍历 IPv4 与 IPv6 单播表，累加每条 path）。 */
 static uint32_t bgp_mpls_l3vpn_current_routes(struct bgp *l3vpn_bgp)
 {
 	uint32_t count = 0;
@@ -507,6 +563,9 @@ static uint32_t bgp_mpls_l3vpn_current_routes(struct bgp *l3vpn_bgp)
 	return count;
 }
 
+/* 【hook 回调】bgp_snmp_init_stats：初始化 / 清理 VRF 的 SNMP 统计块。
+ * 若是 MPLS L3VPN VRF 且尚无统计块，则分配，并按当前路由数初始化 routes_added、
+ * 记录 creation_time；若不是 L3VPN VRF 则释放统计块。最后更新时间戳。 */
 static int bgp_init_snmp_stats(struct bgp *bgp)
 {
 	if (is_bgp_vrf_mplsvpn(bgp)) {
@@ -532,6 +591,7 @@ static int bgp_init_snmp_stats(struct bgp *bgp)
 	return 0;
 }
 
+/* 【hook 回调】bgp_snmp_update_stats：路由新增 / 删除时给对应 VRF 的统计块计数加减。 */
 static int bgp_snmp_update_route_stats(struct bgp_dest *dest,
 				       struct bgp_path_info *pi, bool added)
 {
@@ -550,6 +610,8 @@ static int bgp_snmp_update_route_stats(struct bgp_dest *dest,
 	return 0;
 }
 
+/* 【辅助】判断 VRF 是否“活跃”：该 VRF 下只要有一个接口 up 即视为活跃；
+ * 遍历时跳过 l3mdev（与 VRF 同名的那个设备）。 */
 static bool is_bgp_vrf_active(struct bgp *bgp)
 {
 	struct vrf *vrf;
@@ -572,10 +634,15 @@ static bool is_bgp_vrf_active(struct bgp *bgp)
 	return false;
 }
 
+/* 【trap 载荷】VRF up / down trap 携带的对象：{5,{1,2,1,1,5}} 与 {5,{1,2,2,1,6}}，
+ * 即绑定接口相关列与 VRF 操作状态列。 */
 /* BGP Traps. */
 static struct trap_object l3vpn_trap_list[] = {{5, {1, 2, 1, 1, 5} },
 					       {5, {1, 2, 2, 1, 6} } };
 
+/* 【hook 回调】bgp_vrf_status_changed：当某 VRF 的活跃状态发生变化时，若通知开启，
+ * 则按新状态发 VRF up / down trap。trap 用双索引：vrf_name + ifindex，以及 vrf_name。
+ * 若全局 rfc4382 trap 开关关闭，只更新时间戳不发 trap。 */
 static int bgp_vrf_check_update_active(struct bgp *bgp, struct interface *ifp)
 {
 	bool new_active = false;
@@ -626,6 +693,7 @@ static int bgp_vrf_check_update_active(struct bgp *bgp, struct interface *ifp)
 	return 0;
 }
 
+/* 【标量】mplsL3vpnConfiguredVrfs：统计所有 MPLS L3VPN VRF 的个数。 */
 static uint8_t *mplsL3vpnConfiguredVrfs(struct variable *v, oid name[],
 					size_t *length, int exact,
 					size_t *var_len,
@@ -646,6 +714,7 @@ static uint8_t *mplsL3vpnConfiguredVrfs(struct variable *v, oid name[],
 	return SNMP_INTEGER(count);
 }
 
+/* 【标量】mplsL3vpnActiveVrfs：统计所有“已配置且活跃”的 L3VPN VRF 个数。 */
 static uint8_t *mplsL3vpnActiveVrfs(struct variable *v, oid name[],
 				    size_t *length, int exact, size_t *var_len,
 				    WriteMethod **write_method)
@@ -665,6 +734,7 @@ static uint8_t *mplsL3vpnActiveVrfs(struct variable *v, oid name[],
 	return SNMP_INTEGER(count);
 }
 
+/* 【标量】mplsL3vpnConnectedInterfaces：累加各 L3VPN VRF 的接口数。 */
 static uint8_t *mplsL3vpnConnectedInterfaces(struct variable *v, oid name[],
 					     size_t *length, int exact,
 					     size_t *var_len,
@@ -692,6 +762,7 @@ static uint8_t *mplsL3vpnConnectedInterfaces(struct variable *v, oid name[],
 	return SNMP_INTEGER(count);
 }
 
+/* 【写回调】mplsL3vpnNotificationEnable 的 SET 处理：把写入值存进全局通知开关。 */
 static int write_mplsL3vpnNotificationEnable(int action, uint8_t *var_val,
 					     uint8_t var_val_type,
 					     size_t var_val_len, uint8_t *statP,
@@ -710,6 +781,7 @@ static int write_mplsL3vpnNotificationEnable(int action, uint8_t *var_val,
 	return SNMP_ERR_NOERROR;
 }
 
+/* 【标量】mplsL3vpnNotificationEnable：读 / 写通知总开关（可写，设置 write_method）。 */
 static uint8_t *mplsL3vpnNotificationEnable(struct variable *v, oid name[],
 					    size_t *length, int exact,
 					    size_t *var_len,
@@ -723,6 +795,7 @@ static uint8_t *mplsL3vpnNotificationEnable(struct variable *v, oid name[],
 	return SNMP_INTEGER(bgp_mplsvpn_notif_enable);
 }
 
+/* 【标量】mplsL3vpnVrfConfMaxPossRts：本实现固定返回 0（未实现具体上限）。 */
 static uint8_t *mplsL3vpnVrfConfMaxPossRts(struct variable *v, oid name[],
 					   size_t *length, int exact,
 					   size_t *var_len,
@@ -735,6 +808,7 @@ static uint8_t *mplsL3vpnVrfConfMaxPossRts(struct variable *v, oid name[],
 	return SNMP_INTEGER(0);
 }
 
+/* 【标量】mplsL3vpnVrfConfRteMxThrshTime：本实现固定返回 0。 */
 static uint8_t *mplsL3vpnVrfConfRteMxThrshTime(struct variable *v, oid name[],
 					       size_t *length, int exact,
 					       size_t *var_len,
@@ -747,6 +821,7 @@ static uint8_t *mplsL3vpnVrfConfRteMxThrshTime(struct variable *v, oid name[],
 	return SNMP_INTEGER(0);
 }
 
+/* 【标量】mplsL3vpnIllLblRcvThrsh：本实现固定返回 0。 */
 static uint8_t *mplsL3vpnIllLblRcvThrsh(struct variable *v, oid name[],
 					size_t *length, int exact,
 					size_t *var_len,
@@ -760,6 +835,8 @@ static uint8_t *mplsL3vpnIllLblRcvThrsh(struct variable *v, oid name[],
 }
 
 
+/* 【辅助】按 VRF 名做“字典序下一个”遍历：bm->bgp 列表不是按名字排序的，这里找严格大于
+ * vrf_name 的最小名字，以支持 get_next 的有序遍历。vrf_name 为空表示取第一个。 */
 static struct bgp *bgp_lookup_by_name_next(char *vrf_name)
 {
 	struct bgp *bgp, *bgp_next = NULL;
@@ -790,8 +867,12 @@ static struct bgp *bgp_lookup_by_name_next(char *vrf_name)
 	return bgp_next;
 }
 
+/* 【常量】mplsL3vpnIfConfTable 的 OID 前缀段数（到索引之前）= 14。 */
 /* 1.3.6.1.2.1.10.166.11.1.2.1.1.x = 14*/
 #define IFCONFTAB_NAMELEN 14
+/* 【辅助】mplsL3vpnIfConfTable 实例定位：索引 = <vrf 名> + <ifindex(u32)>。
+ * exact 时按名找 bgp 再按 ifindex 找接口；get_next 时先找下一个 VRF，再找其下一个接口，
+ * 并把 vrf 名与 ifindex 回填进 name[]。 */
 static struct bgp *bgpL3vpnIfConf_lookup(struct variable *v, oid name[],
 					 size_t *length, char *vrf_name,
 					 ifindex_t *ifindex, int exact)
@@ -852,6 +933,8 @@ static struct bgp *bgpL3vpnIfConf_lookup(struct variable *v, oid name[],
 	return bgp;
 }
 
+/* 【表】mplsL3vpnIfConfTable 读取回调：三列都返回固定值（2 / 2 / 1），因为本实现不从
+ * 接口取真实分类信息，仅提供 MIB 结构占位。 */
 static uint8_t *mplsL3vpnIfConfTable(struct variable *v, oid name[],
 				     size_t *length, int exact, size_t *var_len,
 				     WriteMethod **write_method)
@@ -881,9 +964,12 @@ static uint8_t *mplsL3vpnIfConfTable(struct variable *v, oid name[],
 	return NULL;
 }
 
+/* 【常量】mplsL3vpnVrfTable 的 OID 前缀段数 = 14。 */
 /* 1.3.6.1.2.1.10.166.11.1.2.2.1.x = 14*/
 #define VRFTAB_NAMELEN 14
 
+/* 【辅助】mplsL3vpnVrfTable 实例定位：索引就是 VRF 名字符串。exact 按名精确查，
+ * get_next 取字典序下一个，并把名字回填进 name[]、更新 *length。 */
 static struct bgp *bgpL3vpnVrf_lookup(struct variable *v, oid name[],
 				      size_t *length, char *vrf_name, int exact)
 {
@@ -912,6 +998,9 @@ static struct bgp *bgpL3vpnVrf_lookup(struct variable *v, oid name[],
 	return bgp;
 }
 
+/* 【表】mplsL3vpnVrfTable 读取回调：逐列返回 VRF 信息。VPN id 返回空；RD 列因为 MIB
+ * 要求“一个 VRF 一个 RD”而 FRR 是“每 AFI 一个 RD”，所以优先返回 AFI_IP 的 RD，否则
+ * AFI_IP6 的（见函数内注释）。其余多为统计 / 状态列，部分阈值为固定 0 / 1。 */
 static uint8_t *mplsL3vpnVrfTable(struct variable *v, oid name[],
 				  size_t *length, int exact, size_t *var_len,
 				  WriteMethod **write_method)
@@ -988,8 +1077,13 @@ static uint8_t *mplsL3vpnVrfTable(struct variable *v, oid name[],
 	return NULL;
 }
 
+/* 【常量】mplsL3vpnVrfRtTable 的 OID 前缀段数 = 14。 */
 /* 1.3.6.1.2.1.10.166.11.1.2.3.1.x = 14*/
 #define VRFRTTAB_NAMELEN 14
+/* 【辅助】mplsL3vpnVrfRtTable 实例定位：索引 = <vrf 名> + <AFI(u32)> + <rt 类型(u8)>。
+ * get_next 时在 (AFI, rt 类型) 上做进位枚举：AFI 0→IP→IP6→结束，类型 0→import→export→
+ * 再回 0；且只在对应方向确实配置了 rtlist 时才返回。若 import 与 export 的 rtlist 完全
+ * 相同，则类型判定为 both。 */
 static struct bgp *bgpL3vpnVrfRt_lookup(struct variable *v, oid name[],
 					size_t *length, char *vrf_name,
 					uint32_t *rt_index, uint8_t *rt_type,
@@ -1108,6 +1202,7 @@ static struct bgp *bgpL3vpnVrfRt_lookup(struct variable *v, oid name[],
 	return NULL;
 }
 
+/* 【辅助】把 RT 类型枚举转成文本（import / export / both / unknown），用于生成描述。 */
 static const char *rt_type2str(uint8_t rt_type)
 {
 	switch (rt_type) {
@@ -1121,6 +1216,9 @@ static const char *rt_type2str(uint8_t rt_type)
 		return "unknown";
 	}
 }
+/* 【表】mplsL3vpnVrfRtTable 读取回调：RT 列按方向取对应 rtlist 并格式化成字符串（import
+ * 取 FROMVPN，export / both 取 TOVPN）；描述列用 rt_type2str 现场拼 “RT <type> for VRF
+ * <name>”；行状态 / 存储类型返回固定值。 */
 static uint8_t *mplsL3vpnVrfRtTable(struct variable *v, oid name[],
 				    size_t *length, int exact, size_t *var_len,
 				    WriteMethod **write_method)
@@ -1189,9 +1287,12 @@ static uint8_t *mplsL3vpnVrfRtTable(struct variable *v, oid name[],
 	return NULL;
 }
 
+/* 【常量】mplsL3vpnPerfTable 的 OID 前缀段数 = 14。 */
 /* 1.3.6.1.2.1.10.166.11.1.3.1.1.x = 14*/
 #define PERFTAB_NAMELEN 14
 
+/* 【表】mplsL3vpnPerfTable 读取回调：从 VRF 的 snmp_stats 取新增 / 删除路由计数；当前
+ * 路由数现算（bgp_mpls_l3vpn_current_routes）。 */
 static uint8_t *mplsL3vpnPerfTable(struct variable *v, oid name[],
 				   size_t *length, int exact, size_t *var_len,
 				   WriteMethod **write_method)
@@ -1220,6 +1321,8 @@ static uint8_t *mplsL3vpnPerfTable(struct variable *v, oid name[],
 	return NULL;
 }
 
+/* 【辅助】在指定 VRF 的 IPv4 / IPv6 单播表里，按前缀与下一跳精确找一条 path；
+ * policy 参数本函数未使用（保留以对齐调用约定）。 */
 static struct bgp_path_info *
 bgp_lookup_route(struct bgp *l3vpn_bgp, struct bgp_dest **dest,
 		 struct prefix *prefix, uint16_t policy, struct ipaddr *nexthop)
@@ -1266,6 +1369,9 @@ bgp_lookup_route(struct bgp *l3vpn_bgp, struct bgp_dest **dest,
 	return NULL;
 }
 
+/* 【辅助】路由表的 get_next：从 (前缀, policy, 下一跳) 出发找下一条 path。
+ * prefixlen==0 表示“从头开始”；同一前缀内用 policy 递增区分多路径，否则跨前缀、跨 VRF、
+ * 跨 AFI 依次推进。 */
 static struct bgp_path_info *bgp_lookup_route_next(struct bgp **l3vpn_bgp,
 						   struct bgp_dest **dest,
 						   struct prefix *prefix,
@@ -1350,6 +1456,7 @@ static struct bgp_path_info *bgp_lookup_route_next(struct bgp **l3vpn_bgp,
 	return NULL;
 }
 
+/* 【辅助】判断 OID 段是否为本 MIB 定义的地址类型取值（UNKNOWN / IPv4 / IPv6）。 */
 static bool is_addr_type(oid id)
 {
 	switch (id) {
@@ -1361,9 +1468,13 @@ static bool is_addr_type(oid id)
 	return false;
 }
 
+/* 【常量】mplsL3vpnVrfRteTable 的 OID 前缀段数（沿用 PERFTAB_NAMELEN 名字，值同 14）。 */
 /* 1.3.6.1.2.1.10.166.11.1.4.1.1.x = 14*/
 #define PERFTAB_NAMELEN 14
 
+/* 【辅助】mplsL3vpnVrfRteTable 实例定位：逐字节解析 OID 里的
+ * <vrf 名（直到遇到地址类型字节）><前缀类型><前缀><前缀长度><policy(u16)>
+ * <下一跳类型><下一跳>，据此查路由；get_next 时把找到路由的索引回填进 name[]。 */
 static struct bgp_path_info *bgpL3vpnRte_lookup(struct variable *v, oid name[],
 						size_t *length, char *vrf_name,
 						struct bgp **l3vpn_bgp,
@@ -1517,6 +1628,12 @@ static struct bgp_path_info *bgpL3vpnRte_lookup(struct variable *v, oid name[],
 	return pi;
 }
 
+/* 【表】mplsL3vpnVrfRteTable 读取回调：逐列返回某 VRF 路由的详情。关键映射：
+ * DESTTYPE / DEST / PFXLEN←前缀; POLICY←policy 的 OID 形式; NHOPTYPE / NEXTHOP←下一跳;
+ * IFINDEX←pi->nexthop->ifindex; TYPE←由 nexthop->type / bh_type 映射到
+ * LOCAL / REMOTE / REJECT / BLACKHOLE / OTHER（见头文件常量）;
+ * PROTO←pi->type 映射到 IANA 路由协议号（connect→local, static→netmgmt, bgp→bgp ...）;
+ * AGE←pi->uptime; NEXTHOPAS←peer->as; METRIC1←imported bpi 的 igpmetric，其余 metric 固定 -1。 */
 static uint8_t *mplsL3vpnRteTable(struct variable *v, oid name[],
 				  size_t *length, int exact, size_t *var_len,
 				  WriteMethod **write_method)
@@ -1679,6 +1796,8 @@ static uint8_t *mplsL3vpnRteTable(struct variable *v, oid name[],
 	return NULL;
 }
 
+/* 【初始化】注册本文件的 hook（VRF 状态变化、统计块初始化 / 更新时间戳 / 更新计数），
+ * 并把 mpls_l3vpn_variables[] 注册为 MIB "mplsL3VpnMIB"。由 bgp_snmp_init 调用。 */
 void bgp_mpls_l3vpn_module_init(void)
 {
 	hook_register(bgp_vrf_status_changed, bgp_vrf_check_update_active);

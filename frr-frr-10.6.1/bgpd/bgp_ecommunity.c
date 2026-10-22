@@ -3,6 +3,42 @@
  * Copyright (C) 2000 Kunihiro Ishiguro <kunihiro@zebra.org>
  */
 
+/* 【文件导读】 bgp_ecommunity.c —— Extended Community 属性的实现
+ *
+ * 一、本文件做什么
+ *    实现 bgp_ecommunity.h 声明的操作：分配 / 释放、解析（线格式与字符串）、
+ *    打印（三种格式）、驻留与引用计数、集合运算、各 subtype 的语义处理，以及
+ *    link-bandwidth 与聚合器相关函数。扩展社区是 RT / SoO / 带宽 / Router MAC /
+ *    流量动作等的统一载体，语义分支很多。阅读主线：先看 type（高序字节）决定
+ *    大类，再看 subtype（低序字节）决定细节。
+ *
+ * 二、单元与内存布局
+ *    普通扩展社区单元 8 字节，IPv6 扩展社区单元 20 字节；结构里用 unit_size
+ *    区分，size 是单元个数，val 是连续单元数组。所有以 _internal 结尾的函数
+ *    用参数带入 unit_size，被普通版本（8 字节）与 IPv6 版本（20 字节）复用。
+ *
+ * 三、驻留与引用计数
+ *    ecomhash 是全局哈希表。ecommunity_intern / ecommunity_unintern 与 community
+ *    系列同构：内容相同的集合进程内只存一份，用 refcnt 共享。
+ *
+ * 四、字符串互转
+ *    ecommunity_gettoken 负责词法解析（rt / soo / nt / color 关键字，以及
+ *    A.B.C.D:MN、EF:OPQR、GHJK:MN 等数字形式）；ecommunity_str2com 组装集合
+ *    （返回未驻留对象）；_ecommunity_ecom2str 负责反向打印，按 subtype 分支。
+ *
+ * 五、返回约定（重点）
+ *    - ecommunity_str 返回对象内部缓存，勿 free；
+ *    - ecommunity_ecom2str / _ecommunity_ecom2str 返回新分配字符串，需用
+ *      ecommunity_strfree 释放；
+ *    - ecommunity_str2com / ecommunity_parse 返回未驻留对象（refcnt 为 0）。
+ *
+ * 六、推荐阅读顺序
+ *    ecommunity_new / free -> ecommunity_add_val_internal -> uniq_sort_internal
+ *    -> ecommunity_parse / dup -> intern / unintern -> ecommunity_gettoken /
+ *    str2com -> _ecommunity_ecom2str（打印总入口，各 subtype 分支）-> 末尾的
+ *    linkbw 与 aggregate 系列。
+ */
+
 #include <zebra.h>
 
 #include "hash.h"
@@ -25,15 +61,22 @@
 #include "bgpd/bgp_pbr.h"
 
 /* struct used to dump the rate contained in FS set traffic-rate EC */
+/* 【结构】traffic_rate：把 4 字节按 float 与字节数组两种视角访问，
+ * 用于 FlowSpec traffic-rate 扩展社区中带宽的打印。
+ */
 union traffic_rate {
 	float rate_float;
 	uint8_t rate_byte[4];
 };
 
 /* Hash of community attribute. */
+/* 【全局变量】ecomhash：所有已驻留扩展社区集合的全局哈希表；
+ * 键用 ecommunity_hash_make、比较用 ecommunity_cmp。
+ */
 static struct hash *ecomhash;
 
 /* Allocate a new ecommunities.  */
+/* 【函数】ecommunity_new：分配空扩展社区，unit_size 默认 8 字节。 */
 struct ecommunity *ecommunity_new(void)
 {
 	struct ecommunity *ecom;
@@ -44,12 +87,14 @@ struct ecommunity *ecommunity_new(void)
 	return ecom;
 }
 
+/* 【函数】ecommunity_strfree：释放由 ecommunity_ecom2str 系列分配的字符串。 */
 void ecommunity_strfree(char **s)
 {
 	XFREE(MTYPE_ECOMMUNITY_STR, *s);
 }
 
 /* Free ecommunities.  */
+/* 【函数】ecommunity_free：释放扩展社区及其内部 val / str，并置空指针。 */
 void ecommunity_free(struct ecommunity **ecom)
 {
 	if (!(*ecom))
@@ -60,6 +105,7 @@ void ecommunity_free(struct ecommunity **ecom)
 	XFREE(MTYPE_ECOMMUNITY, *ecom);
 }
 
+/* 【函数】ecommunity_hash_free：哈希销毁回调，释放每个集合。 */
 static void ecommunity_hash_free(struct ecommunity *ecom)
 {
 	ecommunity_free(&ecom);
@@ -76,6 +122,13 @@ static void ecommunity_hash_free(struct ecommunity *ecom)
    once and whether the new value should replace what is existing or
    not.
 */
+/* 【函数】ecommunity_add_val_internal：通用插入，参数 ecom_size 决定单元长度
+ * （8 或 20 字节），故同时服务普通与 IPv6 两种扩展社区。
+ *   unique 为真时按 type 与 subtype 判重：同 type / subtype 已存在则不再插入，
+ *     overwrite 为真时用新值覆盖旧值；
+ *   unique 为假时按整单元字节判重并保持升序插入。
+ * 插入位置由 ins_idx 计算，再用 memmove 腾挪。
+ */
 static bool ecommunity_add_val_internal(struct ecommunity *ecom,
 					const void *eval,
 					bool unique, bool overwrite,
@@ -159,6 +212,7 @@ static bool ecommunity_add_val_internal(struct ecommunity *ecom,
  * numerical order.  When the value is added to the structure return 1
  * else return 0.
  */
+/* 【函数】ecommunity_add_val：8 字节单元的插入封装。 */
 bool ecommunity_add_val(struct ecommunity *ecom, struct ecommunity_val *eval,
 		       bool unique, bool overwrite)
 {
@@ -166,6 +220,7 @@ bool ecommunity_add_val(struct ecommunity *ecom, struct ecommunity_val *eval,
 					   overwrite, ECOMMUNITY_SIZE);
 }
 
+/* 【函数】ecommunity_add_val_ipv6：20 字节单元的插入封装。 */
 bool ecommunity_add_val_ipv6(struct ecommunity *ecom,
 			     struct ecommunity_val_ipv6 *eval,
 			     bool unique, bool overwrite)
@@ -175,6 +230,9 @@ bool ecommunity_add_val_ipv6(struct ecommunity *ecom,
 }
 
 static struct ecommunity *
+/* 【函数】ecommunity_uniq_sort_internal：按 ecom_size 去重排序，返回新集合
+ * （沿用 disable_ieee_floating）。
+ */
 ecommunity_uniq_sort_internal(struct ecommunity *ecom,
 			      unsigned short ecom_size)
 {
@@ -200,12 +258,16 @@ ecommunity_uniq_sort_internal(struct ecommunity *ecom,
  * create a new Extended Communities structure by uniq and sort each
  * Extended Communities value.
  */
+/* 【函数】ecommunity_uniq_sort：8 字节版本的去重排序入口。 */
 struct ecommunity *ecommunity_uniq_sort(struct ecommunity *ecom)
 {
 	return ecommunity_uniq_sort_internal(ecom, ECOMMUNITY_SIZE);
 }
 
 /* Parse Extended Communities Attribute in BGP packet.  */
+/* 【函数】ecommunity_parse_internal：从报文解析。length 必须能被 size_ecom
+ * 整除，否则返回 NULL；去重排序后 intern 返回。
+ */
 static struct ecommunity *ecommunity_parse_internal(uint8_t *pnt,
 						    unsigned short length,
 						    unsigned short size_ecom,
@@ -231,6 +293,7 @@ static struct ecommunity *ecommunity_parse_internal(uint8_t *pnt,
 	return ecommunity_intern(new);
 }
 
+/* 【函数】ecommunity_parse：8 字节版本解析入口。 */
 struct ecommunity *ecommunity_parse(uint8_t *pnt, unsigned short length,
 				    bool disable_ieee_floating)
 {
@@ -238,6 +301,7 @@ struct ecommunity *ecommunity_parse(uint8_t *pnt, unsigned short length,
 					 disable_ieee_floating);
 }
 
+/* 【函数】ecommunity_parse_ipv6：20 字节版本解析入口。 */
 struct ecommunity *ecommunity_parse_ipv6(uint8_t *pnt, unsigned short length)
 {
 	return ecommunity_parse_internal(pnt, length, IPV6_ECOMMUNITY_SIZE,
@@ -245,6 +309,7 @@ struct ecommunity *ecommunity_parse_ipv6(uint8_t *pnt, unsigned short length)
 }
 
 /* Duplicate the Extended Communities Attribute structure.  */
+/* 【函数】ecommunity_dup：深拷贝（含 unit_size），refcnt 归零，不驻留。 */
 struct ecommunity *ecommunity_dup(struct ecommunity *ecom)
 {
 	struct ecommunity *new;
@@ -263,6 +328,9 @@ struct ecommunity *ecommunity_dup(struct ecommunity *ecom)
 }
 
 /* Return string representation of ecommunities attribute. */
+/* 【函数】ecommunity_str：返回 ecom->str（内部缓存），必要时用 DISPLAY 格式
+ * 惰性生成；调用者不得 free。空指针返回字面量 "(null)"。
+ */
 const char *ecommunity_str(struct ecommunity *ecom)
 {
 	if (!ecom)
@@ -275,6 +343,9 @@ const char *ecommunity_str(struct ecommunity *ecom)
 }
 
 /* Merge two Extended Communities Attribute structure.  */
+/* 【函数】ecommunity_merge：把 ecom2 追加到 ecom1 末尾（原地，按 ecom1 的
+ * unit_size 复制）。要求两者 unit_size 一致。
+ */
 struct ecommunity *ecommunity_merge(struct ecommunity *ecom1,
 				    struct ecommunity *ecom2)
 {
@@ -290,6 +361,9 @@ struct ecommunity *ecommunity_merge(struct ecommunity *ecom1,
 }
 
 /* Intern Extended Communities Attribute.  */
+/* 【函数】ecommunity_intern：驻留。命中已存者则释放传入对象、返回已有者并
+ * refcnt 加一；首个快照会生成 DISPLAY 字符串。
+ */
 struct ecommunity *ecommunity_intern(struct ecommunity *ecom)
 {
 	struct ecommunity *find;
@@ -309,6 +383,7 @@ struct ecommunity *ecommunity_intern(struct ecommunity *ecom)
 }
 
 /* Unintern Extended Communities Attribute.  */
+/* 【函数】ecommunity_unintern：refcnt 减一，减到 0 从哈希摘除并释放，指针置 NULL。 */
 void ecommunity_unintern(struct ecommunity **ecom)
 {
 	struct ecommunity *ret;
@@ -330,6 +405,7 @@ void ecommunity_unintern(struct ecommunity **ecom)
 }
 
 /* Utinity function to make hash key.  */
+/* 【函数】ecommunity_hash_make：对 val 的全部字节做 jhash 得到哈希键。 */
 unsigned int ecommunity_hash_make(const void *arg)
 {
 	const struct ecommunity *ecom = arg;
@@ -339,6 +415,7 @@ unsigned int ecommunity_hash_make(const void *arg)
 }
 
 /* Compare two Extended Communities Attribute structure.  */
+/* 【函数】ecommunity_cmp：全等比较，先比 unit_size 再比 size 与字节。哈希 key 回调。 */
 bool ecommunity_cmp(const void *arg1, const void *arg2)
 {
 	const struct ecommunity *ecom1 = arg1;
@@ -358,6 +435,9 @@ bool ecommunity_cmp(const void *arg1, const void *arg2)
 			  ecom1->unit_size) == 0);
 }
 
+/* 【函数】ecommunity_color_str：把 color 扩展社区打印为 "Color:CX:值"，
+ * CX 由 CO 位决定。
+ */
 static void ecommunity_color_str(char *buf, size_t bufsz, uint8_t *ptr)
 {
 	/*
@@ -381,18 +461,23 @@ static void ecommunity_color_str(char *buf, size_t bufsz, uint8_t *ptr)
 }
 
 /* Initialize Extended Comminities related hash. */
+/* 【函数】ecommunity_init：创建全局哈希表 ecomhash。 */
 void ecommunity_init(void)
 {
 	ecomhash = hash_create(ecommunity_hash_make, ecommunity_cmp,
 			       "BGP ecommunity hash");
 }
 
+/* 【函数】ecommunity_finish：清空并销毁全局哈希表。 */
 void ecommunity_finish(void)
 {
 	hash_clean_and_free(&ecomhash, (void (*)(void *))ecommunity_hash_free);
 }
 
 /* Extended Communities token enum. */
+/* 【枚举】ecommunity_token：字符串解析的词法类型（rt / nt / soo / color /
+ * 数字值 / IPv6 rt6 / IPv6 值 val6 / unknown）。
+ */
 enum ecommunity_token {
 	ecommunity_token_unknown = 0,
 	ecommunity_token_rt,
@@ -404,6 +489,7 @@ enum ecommunity_token {
 	ecommunity_token_val6,
 };
 
+/* 【函数】ecommunity_origin_validation_state2str：校验状态枚举转显示字符串。 */
 static const char *ecommunity_origin_validation_state2str(
 	enum ecommunity_origin_validation_states state)
 {
@@ -421,6 +507,9 @@ static const char *ecommunity_origin_validation_state2str(
 	return "ERROR";
 }
 
+/* 【函数】ecommunity_origin_validation_state_str：打印为 "OVS:valid" 等。
+ * 上面英文注释给出了该扩展社区的位布局。
+ */
 static void ecommunity_origin_validation_state_str(char *buf, size_t bufsz,
 						   uint8_t *ptr)
 {
@@ -442,6 +531,9 @@ static void ecommunity_origin_validation_state_str(char *buf, size_t bufsz,
 	(void)ptr; /* consume value */
 }
 
+/* 【函数】ecommunity_node_target_match：判断集合中是否存在 IP 编码的 node target
+ * 且其目标 ID 等于 local_id。
+ */
 bool ecommunity_node_target_match(struct ecommunity *ecom,
 				  struct in_addr *local_id)
 {
@@ -471,6 +563,9 @@ bool ecommunity_node_target_match(struct ecommunity *ecom,
 	return match;
 }
 
+/* 【函数】ecommunity_node_target_str：打印 node target；DISPLAY 格式为
+ * "NT:x.x.x.x"，community-list 格式为 "nt x.x.x.x:0"。
+ */
 static void ecommunity_node_target_str(char *buf, size_t bufsz, uint8_t *ptr,
 				       int format)
 {
@@ -494,6 +589,10 @@ static void ecommunity_node_target_str(char *buf, size_t bufsz, uint8_t *ptr,
 	(void)ptr; /* consume value */
 }
 
+/* 【函数】ecommunity_encode_internal：按 type 与 sub_type 把参数编码为扩展社区，
+ * 是各类 encode_* 的分发器。先做取值范围校验（AS 不能超过 BGP_AS_MAX、值不能
+ * 超过 UINT16_MAX 等），再根据 type 调用对应编码器。
+ */
 static int ecommunity_encode_internal(uint8_t type, uint8_t sub_type,
 				      int trans, as_t as,
 				      struct in_addr *ip,
@@ -550,6 +649,7 @@ static int ecommunity_encode_internal(uint8_t type, uint8_t sub_type,
  * Encode BGP extended community from passed values. Supports types
  * defined in RFC 4360 and well-known sub-types.
  */
+/* 【函数】ecommunity_encode：IPv4 场景的编码封装（8 字节单元）。 */
 static int ecommunity_encode(uint8_t type, uint8_t sub_type, int trans, as_t as,
 			     struct in_addr ip, uint32_t val,
 			     struct ecommunity_val *eval)
@@ -559,6 +659,13 @@ static int ecommunity_encode(uint8_t type, uint8_t sub_type, int trans, as_t as,
 }
 
 /* Get next Extended Communities token from the string. */
+/* 【函数】ecommunity_gettoken：扩展社区字符串词法解析，本文件最复杂的一个函数。
+ * 先识别关键字节 rt / rt6 / nt / soo / color；否则按数字形式解析，支持：
+ *   A.B.C.D:MN（IPv4）、EF:OPQR（2 字节 AS 与 4 字节值）、
+ *   GHJK:MN（4 字节 AS 与 2 字节值）、IPv6:MN（仅 rt6）。
+ * 通过 dot / separator 计数区分 IP 与 AS，据此选择编码类型；color 还额外解析
+ * CO 位。出错则把 token 置为 unknown。
+ */
 static const char *ecommunity_gettoken(const char *str, void *eval_ptr,
 				       enum ecommunity_token *token, int type)
 {
@@ -827,6 +934,10 @@ error:
 	return p;
 }
 
+/* 【函数】ecommunity_str2com_internal：循环 gettoken 组装集合。
+ * keyword_included 表示字符串自带 "rt" / "soo" 等关键字（extcommunity-list 场景），
+ * 否则需由参数 type 指定语义（route-map 场景）。返回未驻留对象。
+ */
 static struct ecommunity *ecommunity_str2com_internal(const char *str, int type,
 						      int keyword_included,
 						      bool is_ipv6_extcomm)
@@ -927,6 +1038,9 @@ static struct ecommunity *ecommunity_str2com_internal(const char *str, int type,
  *				    type = 0
  *				    keyword_include = 1
  */
+/* 【函数】ecommunity_str2com：普通（8 字节）字符串转集合入口。上面的英文注释
+ * 给出了 route-map 与 extcommunity-list 两类调用示例。
+ */
 struct ecommunity *ecommunity_str2com(const char *str, int type,
 				      int keyword_included)
 {
@@ -934,6 +1048,7 @@ struct ecommunity *ecommunity_str2com(const char *str, int type,
 					   keyword_included, false);
 }
 
+/* 【函数】ecommunity_str2com_ipv6：IPv6（20 字节）字符串转集合入口。 */
 struct ecommunity *ecommunity_str2com_ipv6(const char *str, int type,
 					   int keyword_included)
 {
@@ -941,6 +1056,10 @@ struct ecommunity *ecommunity_str2com_ipv6(const char *str, int type,
 					   keyword_included, true);
 }
 
+/* 【函数】ecommunity_rt_soo_str_internal：把 RT / SoO 打印成字符串。按 format
+ * 决定前缀（"rt " / "soo "、"RT:" / "SoO:" 或空）；按 type 决定取 AS 还是 IP；
+ * 当 ecom_size 为 20 时按 IPv6 地址取值。
+ */
 static int ecommunity_rt_soo_str_internal(char *buf, size_t bufsz,
 					  const uint8_t *pnt, int type,
 					  int sub_type, int format,
@@ -1016,6 +1135,7 @@ static int ecommunity_rt_soo_str_internal(char *buf, size_t bufsz,
 	return len;
 }
 
+/* 【函数】ecommunity_rt_soo_str：8 字节版本的 RT / SoO 打印封装。 */
 static int ecommunity_rt_soo_str(char *buf, size_t bufsz, const uint8_t *pnt,
 				 int type, int sub_type, int format)
 {
@@ -1025,6 +1145,9 @@ static int ecommunity_rt_soo_str(char *buf, size_t bufsz, const uint8_t *pnt,
 }
 
 /* Helper function to convert IEEE-754 Floating Point to uint32 */
+/* 【函数】ieee_float_uint32_to_uint32：把 IEEE-754 单精度浮点的位模式还原为整数
+ * （与 bgp_ecommunity.h 中的 uint32_to_ieee_float_uint32 相反）。
+ */
 static uint32_t ieee_float_uint32_to_uint32(uint32_t u)
 {
 	union {
@@ -1035,6 +1158,10 @@ static uint32_t ieee_float_uint32_to_uint32(uint32_t u)
 	return (uint32_t)f.r;
 }
 
+/* 【函数】ecommunity_lb_str：打印 link-bandwidth（subtype 0x04），
+ * 形如 "LB:AS:字节数 (N.NNN Gbps)"；disable_ieee_floating 决定带宽按整数还是
+ * 浮点解释，并按量级选择 Gbps / Mbps / Kbps / bps 单位。
+ */
 static int ecommunity_lb_str(char *buf, size_t bufsz, const uint8_t *pnt,
 			     bool disable_ieee_floating)
 {
@@ -1066,6 +1193,9 @@ static int ecommunity_lb_str(char *buf, size_t bufsz, const uint8_t *pnt,
 	return len;
 }
 
+/* 【函数】ipv6_ecommunity_lb_str：打印 extended-link-bandwidth（20 字节，
+ * 8 字节带宽与 4 字节 AS）。
+ */
 static int ipv6_ecommunity_lb_str(char *buf, size_t bufsz, const uint8_t *pnt,
 				  size_t length)
 {
@@ -1098,6 +1228,9 @@ done:
 	return len;
 }
 
+/* 【函数】ecommunity_has_route_target：判断集合中是否含 RT（在 AS / IP / AS4
+ * 三种编码空间里找 subtype 为 ECOMMUNITY_ROUTE_TARGET 的单元）。
+ */
 bool ecommunity_has_route_target(struct ecommunity *ecom)
 {
 	uint32_t i;
@@ -1148,6 +1281,15 @@ bool ecommunity_has_route_target(struct ecommunity *ecom)
  * 0 value displays all.
  * Index is a unsigned integer value, and stands for the extended community list entry
  * to display when value is not -1.
+ */
+/* 【函数】_ecommunity_ecom2str：打印扩展社区集合的总入口，也是本文件最长、
+ * 分支最多的函数。逐单元处理：type 决定大类，subtype 决定细节，拼成可读文本。
+ *   filter 为 ECOMMUNITY_ROUTE_TARGET 时跳过 opaque 与 EVPN；
+ *   index 不为 -1 时只打印第 index 个单元。
+ * 返回新分配字符串（需用 ecommunity_strfree 释放）。
+ * 主要 subtype 分支：RT / SoO、link-bandwidth、node target、color、EVPN 的
+ * Router MAC / MAC mobility / ND / ES-Import RT / ESI label / DF / L2 attr、
+ * FlowSpec 的 redirect / action / rate / marking，以及 OVS 等。
  */
 static char *_ecommunity_ecom2str(struct ecommunity *ecom, int format, int filter, int index)
 {
@@ -1499,16 +1641,19 @@ unknown:
 	return str_buf;
 }
 
+/* 【函数】ecommunity_ecom2str：打印全部单元。返回新分配字符串。 */
 char *ecommunity_ecom2str(struct ecommunity *ecom, int format, int filter)
 {
 	return _ecommunity_ecom2str(ecom, format, filter, -1);
 }
 
+/* 【函数】ecommunity_ecom2str_one：只打印第 number 个单元。返回新分配字符串。 */
 char *ecommunity_ecom2str_one(struct ecommunity *ecom, int format, int number)
 {
 	return _ecommunity_ecom2str(ecom, format, 0, number);
 }
 
+/* 【函数】ecommunity_include_one：判断某单个单元 ptr 是否在集合中。 */
 bool ecommunity_include_one(struct ecommunity *ecom, uint8_t *ptr)
 {
 	uint32_t i;
@@ -1522,6 +1667,7 @@ bool ecommunity_include_one(struct ecommunity *ecom, uint8_t *ptr)
 	return false;
 }
 
+/* 【函数】ecommunity_include：判断 e1 与 e2 是否有任意一个单元相同（交集非空）。 */
 bool ecommunity_include(struct ecommunity *e1, struct ecommunity *e2)
 {
 	uint32_t i, j;
@@ -1539,6 +1685,7 @@ bool ecommunity_include(struct ecommunity *e1, struct ecommunity *e2)
 	return false;
 }
 
+/* 【函数】ecommunity_match：判断 ecom2 是否为 ecom1 的子集。归并式遍历实现。 */
 bool ecommunity_match(const struct ecommunity *ecom1,
 		      const struct ecommunity *ecom2)
 {
@@ -1572,6 +1719,9 @@ bool ecommunity_match(const struct ecommunity *ecom1,
 
 /* return last occurrence of color */
 /* it will be the greatest color value */
+/* 【函数】ecommunity_select_color：返回集合中最后一个 color 的值（英文注释说即
+ * 最大 color 值）。
+ */
 extern uint32_t ecommunity_select_color(const struct ecommunity *ecom)
 {
 
@@ -1594,6 +1744,9 @@ extern uint32_t ecommunity_select_color(const struct ecommunity *ecom)
 
 
 /* return first occurrence of type */
+/* 【函数】ecommunity_lookup：返回第一个 type 与 subtype 匹配的单元指针，
+ * 找不到返回 NULL。
+ */
 extern struct ecommunity_val *ecommunity_lookup(const struct ecommunity *ecom,
 						uint8_t type, uint8_t subtype)
 {
@@ -1614,6 +1767,9 @@ extern struct ecommunity_val *ecommunity_lookup(const struct ecommunity *ecom,
 
 /* remove ext. community matching type and subtype
  * return 1 on success ( removed ), 0 otherwise (not present)
+ */
+/* 【函数】ecommunity_strip：删除所有匹配 type 与 subtype 的单元。
+ * 保留其余单元原顺序并重建 val 数组；全部匹配时直接清空。返回是否有删除。
  */
 bool ecommunity_strip(struct ecommunity *ecom, uint8_t type,
 		      uint8_t subtype)
@@ -1660,6 +1816,7 @@ bool ecommunity_strip(struct ecommunity *ecom, uint8_t type,
 	return true;
 }
 
+/* 【函数】ecommunity_non_transitive：判断某 type 字节是否表示非传递社区。 */
 static bool ecommunity_non_transitive(uint8_t type)
 {
 	return (CHECK_FLAG(type, ECOMMUNITY_FLAG_NON_TRANSITIVE) ||
@@ -1668,6 +1825,7 @@ static bool ecommunity_non_transitive(uint8_t type)
 }
 
 /* Delete all non-transitive extended communities */
+/* 【函数】ecommunity_strip_non_transitive：删除所有非传递扩展社区。 */
 bool ecommunity_strip_non_transitive(struct ecommunity *ecom)
 {
 	uint8_t *p, *q, *new;
@@ -1715,6 +1873,9 @@ bool ecommunity_strip_non_transitive(struct ecommunity *ecom)
  * Filter source Extended Communities Attribute. May return NULL if the result
  * is empty, or the source ecommunity, if not modified.
  */
+/* 【函数】ecommunity_filter：用回调 filter 过滤单元，保留回调为真者。
+ * 结果为空返回 NULL；未发生改动（全部保留）时返回原对象 ecom；否则返回新对象。
+ */
 struct ecommunity *ecommunity_filter(struct ecommunity *ecom,
 				     bool (*filter)(uint8_t *, uint8_t, void *), void *arg)
 {
@@ -1755,6 +1916,7 @@ struct ecommunity *ecommunity_filter(struct ecommunity *ecom,
  * Remove specified extended community value from extended community.
  * Returns 1 if value was present (and hence, removed), 0 otherwise.
  */
+/* 【函数】ecommunity_del_val：删除与 eval 相同的一个单元。返回是否删除。 */
 bool ecommunity_del_val(struct ecommunity *ecom, struct ecommunity_val *eval)
 {
 	uint8_t *p;
@@ -1791,6 +1953,10 @@ bool ecommunity_del_val(struct ecommunity *ecom, struct ecommunity_val *eval)
 	return true;
 }
 
+/* 【函数】ecommunity_fill_pbr_action：把 FlowSpec 扩展社区翻译为 PBR 动作
+ * （traffic-rate / action / marking / redirect VRF 或 IP）。redirect VRF 需外部
+ * 函数处理，这里返回 0 表示“交由上层”；无法识别返回 -1。
+ */
 int ecommunity_fill_pbr_action(struct ecommunity_val *ecom_eval,
 			       struct bgp_pbr_entry_action *api,
 			       afi_t afi)
@@ -1843,6 +2009,7 @@ int ecommunity_fill_pbr_action(struct ecommunity_val *ecom_eval,
 	return 0;
 }
 
+/* 【函数】bgp_aggr_ecommunity_lookup：在聚合器的 ecommunity 哈希中查找。 */
 static struct ecommunity *bgp_aggr_ecommunity_lookup(
 						struct bgp_aggregate *aggregate,
 						struct ecommunity *ecommunity)
@@ -1850,6 +2017,9 @@ static struct ecommunity *bgp_aggr_ecommunity_lookup(
 	return hash_lookup(aggregate->ecommunity_hash, ecommunity);
 }
 
+/* 【函数】bgp_aggr_ecommunty_hash_alloc：哈希插入分配回调，返回深拷贝。
+ * 注：函数名 ecommunty 少一个 i，属原始拼写笔误，未改动。
+ */
 static void *bgp_aggr_ecommunty_hash_alloc(void *p)
 {
 	struct ecommunity *ref = (struct ecommunity *)p;
@@ -1859,6 +2029,7 @@ static void *bgp_aggr_ecommunty_hash_alloc(void *p)
 	return ecommunity;
 }
 
+/* 【函数】bgp_aggr_ecommunity_prepare：哈希遍历回调，合并进聚合器。 */
 static void bgp_aggr_ecommunity_prepare(struct hash_bucket *hb, void *arg)
 {
 	struct ecommunity *hb_ecommunity = hb->data;
@@ -1871,6 +2042,7 @@ static void bgp_aggr_ecommunity_prepare(struct hash_bucket *hb, void *arg)
 		*aggr_ecommunity = ecommunity_dup(hb_ecommunity);
 }
 
+/* 【函数】bgp_aggr_ecommunity_remove：释放聚合器持有的 ecommunity。 */
 void bgp_aggr_ecommunity_remove(void *arg)
 {
 	struct ecommunity *ecommunity = arg;
@@ -1878,6 +2050,7 @@ void bgp_aggr_ecommunity_remove(void *arg)
 	ecommunity_free(&ecommunity);
 }
 
+/* 【函数】bgp_compute_aggregate_ecommunity：计入聚合器并重算汇总。 */
 void bgp_compute_aggregate_ecommunity(struct bgp_aggregate *aggregate,
 				      struct ecommunity *ecommunity)
 {
@@ -1886,6 +2059,9 @@ void bgp_compute_aggregate_ecommunity(struct bgp_aggregate *aggregate,
 }
 
 
+/* 【函数】bgp_compute_aggregate_ecommunity_hash：按需建哈希；已在则 refcnt 加一，
+ * 否则插入深拷贝并加一。
+ */
 void bgp_compute_aggregate_ecommunity_hash(struct bgp_aggregate *aggregate,
 					   struct ecommunity *ecommunity)
 {
@@ -1915,6 +2091,9 @@ void bgp_compute_aggregate_ecommunity_hash(struct bgp_aggregate *aggregate,
 	aggr_ecommunity->refcnt++;
 }
 
+/* 【函数】bgp_compute_aggregate_ecommunity_val：合并哈希中全部集合，去重排序后
+ * 存入 aggregate->ecommunity。
+ */
 void bgp_compute_aggregate_ecommunity_val(struct bgp_aggregate *aggregate)
 {
 	struct ecommunity *ecommerge = NULL;
@@ -1938,6 +2117,7 @@ void bgp_compute_aggregate_ecommunity_val(struct bgp_aggregate *aggregate)
 	}
 }
 
+/* 【函数】bgp_remove_ecommunity_from_aggregate：减记引用；归零则摘除释放并重算汇总。 */
 void bgp_remove_ecommunity_from_aggregate(struct bgp_aggregate *aggregate,
 					  struct ecommunity *ecommunity)
 {
@@ -1964,6 +2144,7 @@ void bgp_remove_ecommunity_from_aggregate(struct bgp_aggregate *aggregate,
 	}
 }
 
+/* 【函数】bgp_remove_ecomm_from_aggregate_hash：仅减记引用（归零则释放），不重算汇总。 */
 void bgp_remove_ecomm_from_aggregate_hash(struct bgp_aggregate *aggregate,
 					  struct ecommunity *ecommunity)
 {
@@ -1990,6 +2171,10 @@ void bgp_remove_ecomm_from_aggregate_hash(struct bgp_aggregate *aggregate,
 	}
 }
 
+/* 【函数】ecommunity_add_origin_validation_state：为集合设置或更新 OVS 扩展社区。
+ * 有旧集合时复制后覆盖（unique 与 overwrite 均为真）；无旧集合时以单个 OVS
+ * 单元构造新集合。
+ */
 struct ecommunity *
 ecommunity_add_origin_validation_state(enum rpki_states rpki_state,
 				       struct ecommunity *old)
@@ -2018,6 +2203,9 @@ ecommunity_add_origin_validation_state(enum rpki_states rpki_state,
 /*
  * return the BGP link bandwidth extended community, if present;
  * the actual bandwidth is returned via param
+ */
+/* 【函数】ecommunity_linkbw_present：查找集合中的 link-bandwidth 单元，把带宽写入
+ * bw 并返回该单元的指针（找不到返回 NULL）。支持 8 字节与 20 字节两种编码。
  */
 const uint8_t *ecommunity_linkbw_present(struct ecommunity *ecom, uint64_t *bw)
 {
@@ -2083,6 +2271,10 @@ const uint8_t *ecommunity_linkbw_present(struct ecommunity *ecom, uint64_t *bw)
 }
 
 
+/* 【函数】ecommunity_replace_linkbw：把集合中传递性的 link-bandwidth 替换为新的
+ * 累计带宽 cum_bw（非传递的、或本来没有 link-bandwidth 的保持不变）。
+ * extended 为真时用 20 字节编码；AS 超过 2 字节时用 BGP_AS_TRANS 占位。
+ */
 struct ecommunity *ecommunity_replace_linkbw(as_t as, struct ecommunity *ecom,
 					     uint64_t cum_bw,
 					     bool disable_ieee_floating,
@@ -2134,6 +2326,9 @@ struct ecommunity *ecommunity_replace_linkbw(as_t as, struct ecommunity *ecom,
 	return new;
 }
 
+/* 【函数】soo_in_ecom：判断 ecom 是否含 SoO 且与 soo 匹配（要求存在 SoO，
+ * 且 ecom 包含 soo 的单元）。
+ */
 bool soo_in_ecom(struct ecommunity *ecom, struct ecommunity *soo)
 {
 	if (ecom && soo) {

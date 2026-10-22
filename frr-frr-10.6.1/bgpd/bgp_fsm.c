@@ -3,6 +3,39 @@
  * From RFC1771 [A Border Gateway Protocol 4 (BGP-4)]
  * Copyright (C) 1996, 97, 98 Kunihiro Ishiguro
  */
+/* ============================================================================
+ * 【文件导读】bgp_fsm.c —— BGP 邻居状态机（FSM）与连接/定时器/GR 的核心实现
+ * ============================================================================
+ * 本文件实现 RFC4271 §8 定义的 BGP-4 有限状态机，是 bgpd 中“邻居线”的控制中枢：
+ * 它把 TCP 连接事件、定时器超时、收到的报文事件统一成 FSM 事件，按“状态 × 事件”
+ * 迁移表决定“执行什么动作”并推进到下一个状态。
+ *
+ * 在 bgpd 中的位置（谁调用它 / 它调用谁）：
+ *   - 上游（驱动它）：bgp_packet.c 解析出 OPEN/KEEPALIVE/UPDATE/NOTIFICATION 后
+ *     调用 bgp_event()/BGP_EVENT_ADD() 注入事件；bgp_network.c 在 TCP 就绪/失败时
+ *     注入 TCP_connection_* 事件；本文件各定时器回调到期后也注入事件。
+ *   - 下游（它调用谁）：bgp_packet.c（收发报文）、bgp_network.c（建连/取本地地址）、
+ *     bgp_route.c（清/宣告路由）、bgp_updgrp.c（update-group 调整）、bgp_nht.c（NHT）、
+ *     bgp_keepalives.c（保活发送）、bgp_zebra.c（GR 通知 zebra）等。
+ *   - 数据结构：struct peer（配置 + 长期状态）、struct peer_connection（单次 TCP 连接，
+ *     持有 fd、ibuf/obuf、以及各类 event 定时器句柄）。关键点：一个 peer 建连早期可能
+ *     同时存在“入向/出向”两条连接（连接碰撞 / doppelganger），见 peer_xfer_conn()。
+ *
+ * 关键函数清单（建议阅读顺序）：
+ *   1) bgp_event() / bgp_event_update()      —— 事件注入与“状态×事件”查表驱动（总入口）
+ *   2) FSM[BGP_STATUS_MAX-1][BGP_EVENTS_MAX-1] —— 迁移表：每格 = {动作函数, 新状态}
+ *   3) bgp_timer_set()                       —— 按当前状态统一启停所有定时器（副作用集中处）
+ *   4) bgp_*_timer() 定时器回调              —— 到期后注入对应事件
+ *   5) 动作函数 bgp_start/bgp_stop/bgp_establish/bgp_fsm_open/... —— 迁移时执行
+ *   6) bgp_fsm_change_status()               —— 状态真正落库、统计、清路由、触发 hook
+ *   7) peer_xfer_conn()/peer_xfer_stats()    —— 双连接碰撞时的“换心”逻辑
+ *   8) GR/update-delay/maxmed 相关（后半部分）—— 优雅重启、更新延迟、启动期 MED 增强
+ *   9) 结尾的 bgp_*_gr_*()                    —— 全局/邻居级 GR 配置模式切换状态机
+ *
+ * 提示：表里没出现的函数多为辅助函数或定时器/回调。状态枚举里 Clearing、Deleted 是
+ * 非 RFC 状态（见 bgpd.h 中 enum bgp_fsm_status 的注释）。
+ * ============================================================================
+ */
 
 #include <zebra.h>
 
@@ -48,6 +81,11 @@ DEFINE_HOOK(peer_backward_transition, (struct peer * peer), (peer));
 DEFINE_HOOK(peer_status_changed, (struct peer * peer), (peer));
 DEFINE_HOOK(bgp_rpki_connection_status, (const char *vrf_name), (vrf_name));
 
+/* bgp_rpki_cache_connected：查询本实例所在 VRF 的 RPKI 缓存是否已连接。
+ * 参数 bgp：目标实例。返回 true 表示 RPKI 可用。
+ * 设计要点：bgpd 不直接链接 rpki 库，而是通过 hook（bgp_rpki_connection_status）
+ * 回调到 RPKI 模块；若查不到 vrf 则退化为默认 VRF 名。
+ * 调用时机：bgp_start() 中当邻居配了 RPKI strict 模式时作为前置校验。 */
 bool bgp_rpki_cache_connected(struct bgp *bgp)
 {
 	struct vrf *vrf = vrf_lookup_by_id(bgp->vrf_id);
@@ -55,9 +93,14 @@ bool bgp_rpki_cache_connected(struct bgp *bgp)
 	return hook_call(bgp_rpki_connection_status, vrf ? vrf->name : VRF_DEFAULT_NAME);
 }
 
+/* ========== 0. 事件名表与前置声明 ========== */
+
 /* Definition of display strings corresponding to FSM events. This should be
  * kept consistent with the events defined in bgpd.h
  */
+/* 事件名表：下标即 enum bgp_fsm_events 的取值，用于日志/调试打印。
+ * 第 0 项占位为 NULL，因为事件枚举从 1（BGP_Start）开始。务必与 bgpd.h 中
+ * enum bgp_fsm_events 的成员顺序保持一致，否则日志打印的事件名会错位。 */
 static const char *const bgp_event_str[] = {
 	NULL,
 	"BGP_Start",
@@ -82,6 +125,12 @@ static const char *const bgp_event_str[] = {
    one is thread functions.  Type two is event functions.  Type three
    is FSM functions.  Timer functions are set by bgp_timer_set
    function. */
+/* 上面这段英文注释点明了本文件的三类函数，是理解全文件的钥匙：
+ *   类型一 “thread/event 回调函数”：定时器到期或 fd 可读/可写时被调用（bgp_*_timer 等）。
+ *   类型二 “event 函数”：注入并执行 FSM 事件（bgp_event / bgp_event_update）。
+ *   类型三 “FSM 动作函数”：状态迁移时真正做事（bgp_start / bgp_stop / bgp_establish ...）。
+ * 三类的关系：回调/收包路径 → 产生事件 → 查表得到 FSM 动作函数 → 动作函数改状态。
+ */
 
 /* BGP event function. */
 void bgp_event(struct event *event);
@@ -100,6 +149,12 @@ static bool bgp_gr_check_all_eors(struct bgp *bgp, afi_t afi, safi_t safi,
 				  bool *multihop_eors_pending);
 
 /* Register peer with NHT */
+/* bgp_peer_connection_reg_with_nht：把一个连接注册到 Nexthop Tracking（NHT）。
+ * 参数 connection：提供对端地址 su 及其所属 peer。
+ * 返回值：bgp_find_or_add_nexthop() 的结果，非 0 表示下一跳已解析、可以建连。
+ * 语义要点：当对端是 eBGP、TTL 为默认值（即直连、且未关闭 connected-check）时，
+ * connected=1，要求 NHT 判定“直连可达”而非任意 IGP 可达——这是 BGP 依据 IGP
+ * 可达性决定是否发起会话的关键。 */
 int bgp_peer_connection_reg_with_nht(struct peer_connection *connection)
 {
 	int connected = 0;
@@ -115,6 +170,13 @@ int bgp_peer_connection_reg_with_nht(struct peer_connection *connection)
 				       SAFI_UNICAST, NULL, peer, connected, NULL, NULL);
 }
 
+/* ========== 1. 连接碰撞处理（peer_xfer_*） ========== */
+
+/* peer_xfer_stats：连接碰撞“换连接”时，把即将被丢弃连接的“建连前统计”累加到
+ * 保留下来的 peer 上，避免换连接导致统计清零。
+ * 参数：peer_dst=被保留并成为会话主连接的一方；peer_src=即将被释放的一方。
+ * 注意：只搬运建连前统计（open/keepalive/notify/dynamic 收发计数），已 Established
+ * 之后的会话统计不属于这里。调用前提：I/O 必须已关闭（见 peer_xfer_conn 内注释）。 */
 static void peer_xfer_stats(struct peer *peer_dst, struct peer *peer_src)
 {
 	/* Copy stats over. These are only the pre-established state stats */
@@ -131,6 +193,15 @@ static void peer_xfer_stats(struct peer *peer_dst, struct peer *peer_src)
 static void bgp_graceful_stale_timer_expire(struct event *event);
 static void bgp_graceful_restart_timer_expire(struct event *event);
 
+/* peer_xfer_conn：连接碰撞（doppelganger）仲裁的核心——“换心”。
+ * 场景：同一对端可能同时存在两条 TCP 连接（一条对端主动=非配置节点 from_peer，
+ * 一条我方配置节点 peer）。本函数把要保留的连接 keeper 从 from_peer 迁移到配置
+ * 节点 peer 上，让 going_away 拿走那条将被释放的连接。
+ * 参数 from_peer：非配置节点（动态/对端发起的连接）。
+ * 返回值：成功返回配置节点 peer；失败返回 NULL（表示已注入 BGP_Stop、连接将被关闭）。
+ * 关键副作用：交换 fd 与 peer 指针、迁移 GR 定时器（stale/restart）、拷贝协商状态
+ * （as/holdtime/cap/各 AF 能力）、切换 keepalive 哈希、重挂连接 FIFO、注册 NHT。
+ * 调用时机：bgp_establish() 迁移到 Established 时。 */
 static struct peer *peer_xfer_conn(struct peer *from_peer)
 {
 	struct peer *peer;
@@ -146,6 +217,7 @@ static struct peer *peer_xfer_conn(struct peer *from_peer)
 	/*
 	 * Keeper is the connection that is staying around
 	 */
+	/* keeper：将被保留并“换”到配置节点上的那条连接；peer 指向配置节点（doppelganger） */
 	keeper = from_peer->connection;
 	peer = from_peer->doppelganger;
 
@@ -165,6 +237,8 @@ static struct peer *peer_xfer_conn(struct peer *from_peer)
 	 * Let's check that we are not going to loose known configuration
 	 * state based upon doppelganger rules.
 	 */
+	/* 安全护栏：非配置节点的 AF 激活位必须与配置节点一致，否则说明“换心”会丢失
+	 * 配置语义，直接放弃本次转移（返回 NULL，交由上层发 BGP_Stop）。 */
 	FOREACH_AFI_SAFI (afi, safi) {
 		if (from_peer->afc[afi][safi] != peer->afc[afi][safi]) {
 			flog_err(
@@ -213,6 +287,8 @@ static struct peer *peer_xfer_conn(struct peer *from_peer)
 	 * on various buffers. Those need to be transferred or dropped,
 	 * otherwise we'll get spurious failures during session establishment.
 	 */
+	/* 关键一步：交换“谁持有哪条连接”。配置节点 peer 拿到 keeper（保留下来的连接），
+	 * 非配置节点 from_peer 拿到 going_away（即将被释放的连接）。 */
 	peer->connection = keeper;
 	keeper->peer = peer;
 	from_peer->connection = going_away;
@@ -355,12 +431,22 @@ static struct peer *peer_xfer_conn(struct peer *from_peer)
 	}
 	event_add_event(bm->master, bgp_process_packet, NULL, 0, &bm->e_process_packet);
 
+	/* 迁移成功，返回配置节点 peer（将来成为会话主连接） */
 	return (peer);
 }
+
+/* ========== 2. 定时器统一设置：bgp_timer_set ========== */
 
 /* Hook function called after bgp event is occered.  And vty's
    neighbor command invoke this function after making neighbor
    structure. */
+/* bgp_timer_set：按连接“当前状态”统一启停本状态应当生效的定时器。
+ * 参数 connection：被处理的连接（碰撞期间可能不是 peer->connection 的那条）。
+ * 为什么集中在此：定时器与状态强耦合，分散设置极易漏置/残留，因此每次状态迁移后由
+ * bgp_event_update() 统一调用一次。本函数只“开关定时器”，不做状态跃迁。
+ * 共性规律（RFC4271 §8）：Idle 起 StartTimer；Connect/Active 起 ConnectRetry；
+ * OpenSent 起 HoldTimer；OpenConfirm/Established 起 HoldTimer + KeepAlive；
+ * 进入 Clearing/Deleted 停掉一切。 */
 void bgp_timer_set(struct peer_connection *connection)
 {
 	afi_t afi;
@@ -369,6 +455,8 @@ void bgp_timer_set(struct peer_connection *connection)
 
 	switch (connection->status) {
 	case Idle:
+		/* Idle：仅保留 StartTimer，其余全部关闭。若 peer 被 shutdown/
+		 * suppressed、或 VRF 尚未就绪，则连 StartTimer 也不起，等待外部事件唤醒。 */
 		/* First entry point of peer's finite state machine.  In Idle
 		   status start timer is on unless peer is shutdown or peer is
 		   inactive.  All other timer must be turned off */
@@ -387,6 +475,8 @@ void bgp_timer_set(struct peer_connection *connection)
 		break;
 
 	case Connect:
+		/* Connect：只保留 ConnectRetryTimer（若配了 DelayOpen，则把
+		 * DelayOpenTime 叠加到 Connect 重试时间上）。 */
 		/* After start timer is expired, the peer moves to Connect
 		   status.  Make sure start timer is off and connect timer is
 		   on. */
@@ -404,6 +494,7 @@ void bgp_timer_set(struct peer_connection *connection)
 		break;
 
 	case Active:
+		/* Active：等待对端发起连接。passive 或 NSF_WAIT 时不设 ConnectRetry。 */
 		/* Active is waiting connection from remote peer.  And if
 		   connect timer is expired, change status to Connect. */
 		event_cancel(&connection->t_start);
@@ -427,6 +518,8 @@ void bgp_timer_set(struct peer_connection *connection)
 		break;
 
 	case OpenSent:
+		/* OpenSent：已发出 OPEN，等待对端 OPEN。起 HoldTimer（holdtime 非 0 时），
+		 * 停 Start/Connect；此时尚未协商，不发 keepalive。 */
 		/* OpenSent status. */
 		event_cancel(&connection->t_start);
 		event_cancel(&connection->t_connect);
@@ -442,6 +535,9 @@ void bgp_timer_set(struct peer_connection *connection)
 		break;
 
 	case OpenConfirm:
+		/* OpenConfirm：已互换 OPEN，等待 KEEPALIVE。协商 HoldTime=0 表示不使用
+		 * 保活机制（HoldTimer 与 KeepAlive 都不启用）；否则先停再起 HoldTimer
+		 * （因为协商后的 holdtime 可能与我们初始值不同）并开启 keepalive。 */
 		/* OpenConfirm status. */
 		event_cancel(&connection->t_start);
 		event_cancel(&connection->t_connect);
@@ -465,6 +561,8 @@ void bgp_timer_set(struct peer_connection *connection)
 		break;
 
 	case Established:
+		/* Established：会话已建立，停 Start/Connect/DelayOpen；按协商 holdtime
+		 * 决定是否启用 HoldTimer + KeepAlive（与 OpenConfirm 同理）。 */
 		/* In Established status start and connect timer is turned
 		   off. */
 		event_cancel(&connection->t_start);
@@ -487,6 +585,9 @@ void bgp_timer_set(struct peer_connection *connection)
 		}
 		break;
 	case Deleted:
+		/* Deleted：终态。先额外取消所有 GR 相关定时器（restart/stale/各 AF 的
+		 * LLGR stale、Pmax restart、refresh-stale），再 fallthrough 到 Clearing
+		 * 复用“停一切”的逻辑。注意这里用 peer->connection（配置节点连接）。 */
 		event_cancel(&peer->connection->t_gr_restart);
 		event_cancel(&peer->connection->t_gr_stale);
 
@@ -497,6 +598,7 @@ void bgp_timer_set(struct peer_connection *connection)
 		event_cancel(&peer->t_refresh_stalepath);
 		fallthrough;
 	case Clearing:
+		/* Clearing：正在清路由。停掉所有与建连/保活相关的定时器。 */
 		event_cancel(&connection->t_start);
 		event_cancel(&connection->t_connect);
 		event_cancel(&connection->t_holdtime);
@@ -505,12 +607,19 @@ void bgp_timer_set(struct peer_connection *connection)
 		event_cancel(&connection->t_delayopen);
 		break;
 	case BGP_STATUS_MAX:
+		/* 防御性分支：BGP_STATUS_MAX 只是枚举哨兵，不是合法状态，走到这里说明有 bug。 */
 		flog_err(EC_LIB_DEVELOPMENT,
 			 "BGP_STATUS_MAX while a legal state is not valid state for the FSM");
 		break;
 	}
 }
 
+/* ========== 3. 定时器回调（到期 → 注入事件） ========== */
+
+/* bgp_start_timer：StartTimer 到期回调（Idle 态）。
+ * 到期后把事件值改写为 BGP_Start 并立即执行 bgp_event()，由 FSM 决定是否发起连接。
+ * 对应 RFC4271 §8.2.2 的 Idle→Connect 触发。注释 “bgp_event unlocks peer” 指
+ * bgp_event() 内部会对自己加/解锁（见 bgp_event 注释）。 */
 /* BGP start timer.  This function set BGP_Start event to thread value
    and process event. */
 static void bgp_start_timer(struct event *event)
@@ -527,6 +636,11 @@ static void bgp_start_timer(struct event *event)
 	bgp_event(event); /* bgp_event unlocks peer */
 }
 
+/* bgp_connect_timer：ConnectRetryTimer 到期回调（Connect/Active 态）。
+ * 入向连接直接 bgp_stop；出向连接注入 ConnectRetry_timer_expired，由 FSM 走
+ * bgp_reconnect 重连。此处做指数退避：每次重试把 v_connect 翻倍（上限
+ * BGP_MAX_CONNECT_RETRY），避免对端不可达时把网络打爆；成功建立后会被
+ * bgp_fsm_change_status() 复位。 */
 /* BGP connect retry timer. */
 static void bgp_connect_timer(struct event *event)
 {
@@ -554,6 +668,11 @@ static void bgp_connect_timer(struct event *event)
 	}
 }
 
+/* bgp_holdtime_timer：HoldTimer 到期回调（RFC4271 §8.2.2，协商 HoldTime 内未收到
+ * 任何报文即超时）。
+ * 设计要点：任意报文都会重置 HoldTimer，但“收包处理”与“HoldTimer 到期”是同一
+ * peer 上互不保证顺序的两个事件。因此在真正判定超时前，先检查入向缓冲 ibuf 内是否
+ * 还有未处理数据；若有则重新计时，把处理机会让给收包路径——避免系统重负载误判断连。 */
 /* BGP holdtime timer. */
 static void bgp_holdtime_timer(struct event *event)
 {
@@ -589,6 +708,10 @@ static void bgp_holdtime_timer(struct event *event)
 	bgp_event(event); /* bgp_event unlocks peer */
 }
 
+/* bgp_routeadv_timer：MRAI（MinRouteAdvertisementInterval）路由宣告定时器回调。
+ * 作用：抑制同一前缀向同一对端的宣告频率。到期后不直接发包，而是把
+ * bgp_generate_updgrp_packets 以 0ms 排入事件循环，真正刷新由 update-group 完成；
+ * MRAI 会在 update-group FIFO 构建时按需重启（故此处不再重启）。 */
 void bgp_routeadv_timer(struct event *event)
 {
 	struct peer_connection *connection = EVENT_ARG(event);
@@ -609,6 +732,8 @@ void bgp_routeadv_timer(struct event *event)
 	 */
 }
 
+/* bgp_delayopen_timer：DelayOpenTimer 到期回调（RFC4271 §8）。
+ * 到期注入 DelayOpen_timer_expired，由 bgp_fsm_delayopen_timer_expire 真正发出 OPEN。 */
 /* RFC 4271 DelayOpenTimer */
 void bgp_delayopen_timer(struct event *event)
 {
@@ -624,6 +749,11 @@ void bgp_delayopen_timer(struct event *event)
 	bgp_event(event); /* bgp_event unlocks peer */
 }
 
+/* ========== 4. peer_down_str 表 ========== */
+/* peer_down_str[]：与 bgpd.h 中 enum peer_down 一一对应的可读原因串，下标即
+ * peer->last_reset，用于日志/display。末尾多条是 BGP Notification CEASE 子码
+ * （RFC4486/8203 等）的文案。
+ * 注意：数组顺序必须与 enum peer_down 严格一致，否则打印原因会“张冠李戴”。 */
 /* BGP Peer Down Cause */
 const char *const peer_down_str[] = {
 	"never",
@@ -675,6 +805,11 @@ const char *const peer_down_str[] = {
 	"Cease: subcode unknown",
 };
 
+/* ========== 5. 优雅重启（GR / LLGR）辅助逻辑 ========== */
+
+/* bgp_graceful_restart_timer_off：GR 收尾。当所有 AFI/SAFI 都退出 LLGR_WAIT 后，
+ * 清除 NSF_WAIT 标志、停 stale 定时器；若该 peer 是动态邻居则删除；最后重设定时器。
+ * 只要还有任一 (afi,safi) 处于 LLGR_WAIT（长保活等待），就直接返回，保证路由继续保留。 */
 static void bgp_graceful_restart_timer_off(struct peer_connection *connection,
 					   struct peer *peer)
 {
@@ -701,6 +836,9 @@ static void bgp_graceful_restart_timer_off(struct peer_connection *connection,
 	bgp_timer_set(connection);
 }
 
+/* bgp_llgr_stale_timer_expire：LLGR（Long-Lived Graceful Restart）stale 定时器到期。
+ * 依据 RFC9494：若在 Long-lived Stale Time 内会话仍未重建，Helper 必须删除此前为
+ * 该邻居保留的过期路由。此处清 LLGR_WAIT 标志、清 stale 路由，再做 GR 收尾。 */
 static void bgp_llgr_stale_timer_expire(struct event *event)
 {
 	struct peer_af *paf;
@@ -730,6 +868,11 @@ static void bgp_llgr_stale_timer_expire(struct event *event)
 	bgp_graceful_restart_timer_off(peer->connection, peer);
 }
 
+/* bgp_set_llgr_stale：给该 peer 产生的路由打上 LLGR_STALE 社区，表示这些是进入
+ * LLGR 保留期的路由（需向外重宣告，使下游知晓）。
+ * 参数 peer：来源邻居；afi/safi：目标地址族。
+ * 对 VPN/ENCAP/EVPN 等，需先下钻到内层表（dest 上的 bgp_table）。跳过已带 NO_LLGR
+ * 或已带 LLGR_STALE 的路由；改完社区要重新 intern 并 bgp_process 使变更生效/重宣告。 */
 static void bgp_set_llgr_stale(struct peer *peer, afi_t afi, safi_t safi)
 {
 	struct bgp *bgp = peer->bgp;
@@ -807,6 +950,10 @@ static void bgp_set_llgr_stale(struct peer *peer, afi_t afi, safi_t safi)
 	}
 }
 
+/* bgp_graceful_restart_timer_expire：GR “Restart Time” 到期。
+ * 对每个仍标记 nsf 的 (afi,safi)：若配了 LLGR stale_time，则进入 LLGR 阶段（打
+ * LLGR_STALE 社区、清 stale 路由、启动 LLGR 定时器、向全实例重新宣告）；否则直接
+ * 清 stale 路由。最后做 GR 收尾。 */
 static void bgp_graceful_restart_timer_expire(struct event *event)
 {
 	struct peer_connection *connection = EVENT_ARG(event);
@@ -869,6 +1016,8 @@ static void bgp_graceful_restart_timer_expire(struct event *event)
 	bgp_graceful_restart_timer_off(connection, peer);
 }
 
+/* bgp_graceful_stale_timer_expire：GR stalepath 定时器（bgp->stalepath_time）到期。
+ * 对仍标记 nsf 的 (afi,safi) 清除其 stale 路由——这是 Helper 侧保留旧路由的最后期限。 */
 static void bgp_graceful_stale_timer_expire(struct event *event)
 {
 	struct peer_connection *connection = EVENT_ARG(event);
@@ -890,6 +1039,11 @@ static void bgp_graceful_stale_timer_expire(struct event *event)
  * Start the tier-2 selection deferral timer thread for the specified AFI, SAFI,
  * mark peers from whom we need an EOR
  */
+/* bgp_start_tier2_deferral_timer：启动“二级路径选择延迟”定时器。
+ * 背景：当实例内同时存在直连对端与多跳（通常 eBGP multihop）对端时，多跳会话的建立
+ * 可能依赖从直连对端学到的前缀。因此分两级延迟 bestpath：tier1 等所有直连对端发来
+ * EOR，tier2 再等所有多跳对端 EOR。已运行则直接返回（幂等）。
+ * 副作用：分配 afi_safi_info 作为事件参数（回调中释放），置 select_defer_tier2_required。 */
 void bgp_start_tier2_deferral_timer(struct bgp *bgp, afi_t afi, safi_t safi)
 {
 	struct afi_safi_info *thread_info;
@@ -930,6 +1084,9 @@ void bgp_start_tier2_deferral_timer(struct bgp *bgp, afi_t afi, safi_t safi)
 }
 
 /* Selection deferral timer processing function */
+/* bgp_graceful_deferral_timer_expire：延迟选路定时器（tier1/tier2 共用）到期回调。
+ * info->tier2_gr 区分是哪一级：分别置 select_defer_over(_tier2) 表示可放行。若满足
+ * 完成条件则触发 GR deferral 完成并返回；否则执行被延迟的 bestpath 选择。 */
 static void bgp_graceful_deferral_timer_expire(struct event *event)
 {
 	struct afi_safi_info *info;
@@ -979,6 +1136,11 @@ static void bgp_graceful_deferral_timer_expire(struct event *event)
 	bgp_do_deferred_path_selection(bgp, afi, safi);
 }
 
+/* ========== 6. update-delay（更新延迟/只读模式） ========== */
+
+/* bgp_update_delay_applicable：本次启动 update-delay 是否适用。
+ * 仅当上次 update-delay 已结束（update_delay_over 为真）才适用，从而保证每个进程
+ * 生命周期内该特性只生效一次。 */
 static bool bgp_update_delay_applicable(struct bgp *bgp)
 {
 	/* update_delay_over flag should be reset (set to 0) for any new
@@ -990,6 +1152,7 @@ static bool bgp_update_delay_applicable(struct bgp *bgp)
 	return false;
 }
 
+/* bgp_update_delay_active：update-delay 是否正在生效（定时器在跑）。 */
 bool bgp_update_delay_active(struct bgp *bgp)
 {
 	if (bgp->t_update_delay)
@@ -997,6 +1160,7 @@ bool bgp_update_delay_active(struct bgp *bgp)
 	return false;
 }
 
+/* bgp_update_delay_configured：update-delay 是否已配置（v_update_delay 非 0）。 */
 bool bgp_update_delay_configured(struct bgp *bgp)
 {
 	if (bgp->v_update_delay)
@@ -1006,6 +1170,10 @@ bool bgp_update_delay_configured(struct bgp *bgp)
 
 /* Do the post-processing needed when bgp comes out of the read-only mode
    on ending the update delay. */
+/* bgp_update_delay_end：结束 update-delay（退出只读模式）。
+ * 职位：复位相关计数、打时间戳、向主队列插入 EOI UPDATE 标记，并设置 zebra/peer
+ * 两级 update_hold，分三阶段放开：① 完成 bestpath；② 把路由推给 zebra；③ 放行向
+ * 对端写 UPDATE。同时解除 process_queue 阻塞，并重宣告路由（如 default-originate）。 */
 void bgp_update_delay_end(struct bgp *bgp)
 {
 	event_cancel(&bgp->t_update_delay);
@@ -1060,6 +1228,9 @@ void bgp_update_delay_end(struct bgp *bgp)
 /**
  * see bgp_fsm.h
  */
+/* bgp_start_routeadv：对所有已建立会话重启 routeadv（MRAI）定时器。通常在初始收敛
+ * 结束/退出只读模式后调用，让更新尽快发出。main_peers_update_hold 为真表示仍在 hold，
+ * 直接返回由后续流程再触发。 */
 void bgp_start_routeadv(struct bgp *bgp)
 {
 	struct listnode *node, *nnode;
@@ -1088,6 +1259,10 @@ void bgp_start_routeadv(struct bgp *bgp)
 /**
  * see bgp_fsm.h
  */
+/* bgp_adjust_routeadv：按“距上次实际写出更新的时间差”智能调整某对端的 MRAI 定时器，
+ * 使本应等待的更新尽早发出。函数内 CASE I/II 的 ASCII 图描述两种情形：已超过 MRAI
+ * 则立即触发；否则把剩余等待时间重排为更贴合的时长。v_routeadv==0（关闭 MRAI）时
+ * 直接排一个 generate_updgrp_packets 立即刷写。 */
 void bgp_adjust_routeadv(struct peer *peer)
 {
 	time_t nowtime = monotime(NULL);
@@ -1165,6 +1340,9 @@ void bgp_adjust_routeadv(struct peer *peer)
 	}
 }
 
+/* ========== 7. maxmed-onstartup（启动期抬高 MED 引导入站流量） ========== */
+
+/* bgp_maxmed_onstartup_applicable：maxmed-onstartup 是否仍适用（尚未 over）。 */
 static bool bgp_maxmed_onstartup_applicable(struct bgp *bgp)
 {
 	if (!bgp->maxmed_onstartup_over)
@@ -1172,6 +1350,7 @@ static bool bgp_maxmed_onstartup_applicable(struct bgp *bgp)
 	return false;
 }
 
+/* bgp_maxmed_onstartup_configured：maxmed-onstartup 是否已配置。 */
 bool bgp_maxmed_onstartup_configured(struct bgp *bgp)
 {
 	if (bgp->v_maxmed_onstartup != BGP_MAXMED_ONSTARTUP_UNCONFIGURED)
@@ -1179,6 +1358,7 @@ bool bgp_maxmed_onstartup_configured(struct bgp *bgp)
 	return false;
 }
 
+/* bgp_maxmed_onstartup_active：maxmed-onstartup 是否正在生效（定时器在跑）。 */
 bool bgp_maxmed_onstartup_active(struct bgp *bgp)
 {
 	if (bgp->t_maxmed_onstartup)
@@ -1186,6 +1366,8 @@ bool bgp_maxmed_onstartup_active(struct bgp *bgp)
 	return false;
 }
 
+/* bgp_maxmed_update：计算当前应使用的 MED：优先级 admin 配置 > onstartup > 默认。
+ * 只有当激活态或值发生变化时才触发 update_group_announce 重宣告，避免无谓开销。 */
 void bgp_maxmed_update(struct bgp *bgp)
 {
 	uint8_t maxmed_active;
@@ -1211,6 +1393,9 @@ void bgp_maxmed_update(struct bgp *bgp)
 	}
 }
 
+/* bgp_fsm_error_subcode：把当前 FSM 状态映射为 BGP NOTIFICATION 中 FSM Error 的子码
+ * （RFC4271 §6.5/§8）。只有 OpenSent/OpenConfirm/Established 有专用子码，其余用
+ * UNSPECIFIC。用于 bgp_stop_with_notify(..., BGP_NOTIFY_FSM_ERR, ...)。 */
 int bgp_fsm_error_subcode(int status)
 {
 	int fsm_err_subcode = BGP_NOTIFY_FSM_ERR_SUBCODE_UNSPECIFIC;
@@ -1233,6 +1418,7 @@ int bgp_fsm_error_subcode(int status)
 }
 
 /* The maxmed onstartup timer expiry callback. */
+/* bgp_maxmed_onstartup_timer：maxmed-onstartup 定时器到期 → 置 over，重算 MED。 */
 static void bgp_maxmed_onstartup_timer(struct event *event)
 {
 	struct bgp *bgp;
@@ -1246,6 +1432,9 @@ static void bgp_maxmed_onstartup_timer(struct event *event)
 	bgp_maxmed_update(bgp);
 }
 
+/* bgp_maxmed_onstartup_begin：启动 maxmed-onstartup（仅进程生命周期一次）。
+ * 启动定时器；若未配置 admin maxmed，则暂把所有路由 MED 抬为 onstartup 值，待对端
+ * 收敛后再回落，以此引导入站流量。路由宣告在随后的 bgp_establish() 中触发。 */
 static void bgp_maxmed_onstartup_begin(struct bgp *bgp)
 {
 	/* Applicable only once in the process lifetime on the startup */
@@ -1267,6 +1456,8 @@ static void bgp_maxmed_onstartup_begin(struct bgp *bgp)
 	 * bgp_establish() */
 }
 
+/* bgp_maxmed_onstartup_process_status_change：对端建立且本实例尚未 established 时，
+ * 进入 maxmed-onstartup 模式。 */
 static void bgp_maxmed_onstartup_process_status_change(struct peer *peer)
 {
 	if (peer_established(peer->connection) && !peer->bgp->established) {
@@ -1275,6 +1466,7 @@ static void bgp_maxmed_onstartup_process_status_change(struct peer *peer)
 }
 
 /* The update delay timer expiry callback. */
+/* bgp_update_delay_timer：update-delay 定时器到期 → 调 bgp_update_delay_end 退出只读模式。 */
 static void bgp_update_delay_timer(struct event *event)
 {
 	struct bgp *bgp;
@@ -1287,6 +1479,7 @@ static void bgp_update_delay_timer(struct event *event)
 }
 
 /* The establish wait timer expiry callback. */
+/* bgp_establish_wait_timer：establish-wait 定时器到期 → 重新评估 update-delay 是否可结束。 */
 static void bgp_establish_wait_timer(struct event *event)
 {
 	struct bgp *bgp;
@@ -1302,6 +1495,9 @@ static void bgp_establish_wait_timer(struct event *event)
      - initialize queues if needed
      - stop the queue processing
      - start the timer */
+/* bgp_update_delay_begin：进入 update-delay（只读模式）。
+ * 阻塞 process_queue（只入队不处理），清各 peer 的 update_delay_over，启动
+ * update-delay 定时器与（可选）establish-wait 定时器，记录开始时间。 */
 static void bgp_update_delay_begin(struct bgp *bgp)
 {
 	struct listnode *node, *nnode;
@@ -1325,6 +1521,9 @@ static void bgp_update_delay_begin(struct bgp *bgp)
 		      sizeof(bgp->update_delay_begin_time));
 }
 
+/* bgp_update_delay_process_status_change：会话状态变化时维护 update-delay 计数。
+ * 首个 established 时启动 update-delay；若该对端此前已建立又 flap，则回退 established
+ * 计数（注意刻意不动 EOR 计数，靠 bgp_check_update_delay 的额外校验兜底）。 */
 static void bgp_update_delay_process_status_change(struct peer *peer)
 {
 	struct bgp *bgp = peer->bgp;
@@ -1351,6 +1550,10 @@ static void bgp_update_delay_process_status_change(struct peer *peer)
 	}
 }
 
+/* bgp_gr_check_all_eors：检查某 (afi,safi) 是否已从所有相关对端收到 EOR（End-of-RIB）。
+ * 返回值：true=直连对端全部收到（或无需等待）；false=仍有直连对端 EOR 未到。
+ * 出参 multihop_eors_pending：是否仍缺多跳对端的 EOR（供调用者决定是否启动 tier2）。
+ * 这是“两级延迟选路”判断的核心：先满足直连，再处理多跳。 */
 static bool bgp_gr_check_all_eors(struct bgp *bgp, afi_t afi, safi_t safi,
 				  bool *multihop_eors_pending)
 {
@@ -1531,6 +1734,9 @@ static bool bgp_gr_check_all_eors(struct bgp *bgp, afi_t afi, safi_t safi,
 	return true;
 }
 
+/* bgp_gr_check_path_select：在收到 EOR / 对端起落等时机，判断该 (afi,safi) 是否可
+ * 进行 bestpath。若所有直连对端 EOR 到齐：取消 tier1 定时器；若无多跳待等则取消
+ * tier2 并立即选路；否则按 AFI 特性（如 EVPN）更新标志。 */
 void bgp_gr_check_path_select(struct bgp *bgp, afi_t afi, safi_t safi)
 {
 	struct graceful_restart_info *gr_info;
@@ -1620,6 +1826,8 @@ void bgp_gr_check_path_select(struct bgp *bgp, afi_t afi, safi_t safi)
 	}
 }
 
+/* bgp_gr_mark_for_deferred_selection：为本实例所有对端、所有 GR 支持的 (afi,safi)
+ * 置 GR_WAIT_EOR（不支持的清除），重置延迟选路的前置标记。 */
 static void bgp_gr_mark_for_deferred_selection(struct bgp *bgp)
 {
 	struct listnode *node, *nnode;
@@ -1645,6 +1853,8 @@ static void bgp_gr_mark_for_deferred_selection(struct bgp *bgp)
  * Evaluate if GR is enabled for a mix of directly-connected and
  * multihop peers in ipv4-unicast and ipv6-unicast AFI-SAFI.
  */
+/* bgp_gr_evaluate_mix_peer_type：评估本实例是否存在“直连 + 多跳”混合对端（GR 支持、
+ * 已配该 AF、非 shutdown）。存在则置 gr_multihop_peer_exists，表示需要两级延迟选路。 */
 static void bgp_gr_evaluate_mix_peer_type(struct bgp *bgp)
 {
 	struct listnode *node, *nnode;
@@ -1690,6 +1900,8 @@ static void bgp_gr_evaluate_mix_peer_type(struct bgp *bgp)
  * Start the selection deferral timer thread for the specified AFI, SAFI,
  * mark peers from whom we need an EOR and inform zebra
  */
+/* bgp_start_deferral_timer：启动 tier1 选择延迟定时器；置 af_enabled、
+ * gr_route_sync_pending，并通知 zebra 有 pending 的路由更新。 */
 static void bgp_start_deferral_timer(struct bgp *bgp, afi_t afi, safi_t safi,
 				     struct graceful_restart_info *gr_info)
 {
@@ -1724,6 +1936,7 @@ static void bgp_start_deferral_timer(struct bgp *bgp, afi_t afi, safi_t safi,
 /*
  * start the GR deferral timer for all GR supported afi-safis
  */
+/* bgp_gr_start_all_deferral_timers：对所有 GR 支持的 (afi,safi) 启动 tier1 延迟定时器。 */
 void bgp_gr_start_all_deferral_timers(struct bgp *bgp)
 {
 	struct graceful_restart_info *gr_info;
@@ -1740,6 +1953,8 @@ void bgp_gr_start_all_deferral_timers(struct bgp *bgp)
 	}
 }
 
+/* bgp_gr_process_peer_up_ignore：对端 up 但无需等其 EOR（对端已重启 / GR 未协商 /
+ * 未启用 GR）：清 WAIT_EOR 并尝试推进选路。 */
 static void bgp_gr_process_peer_up_ignore(struct bgp *bgp, struct peer *peer)
 {
 	afi_t afi;
@@ -1758,6 +1973,9 @@ static void bgp_gr_process_peer_up_ignore(struct bgp *bgp, struct peer *peer)
 	}
 }
 
+/* bgp_gr_process_peer_up_include：对端 up 且是需要等 EOR 的 Helper（对端未重启、GR 已协商）：
+ * 对已协商且支持 GR 的 AF 置 WAIT_EOR 并在需要时启动 tier1 定时器；其余 AF 清标志
+ * 并尝试推进选路。 */
 static void bgp_gr_process_peer_up_include(struct bgp *bgp, struct peer *peer)
 {
 	afi_t afi;
@@ -1787,6 +2005,9 @@ static void bgp_gr_process_peer_up_include(struct bgp *bgp, struct peer *peer)
 	}
 }
 
+/* bgp_gr_process_peer_status_change：对端状态变化时的 GR 处理。
+ * 首次触发时先做标记与混合类型评估；对端 up 时按是否已重启 / GR 是否协商分流到
+ * include / ignore；对端 down（且此前曾在 Established）时不再等待其 EOR。 */
 static void bgp_gr_process_peer_status_change(struct peer *peer)
 {
 	struct bgp *bgp;
@@ -1842,6 +2063,9 @@ static void bgp_gr_process_peer_status_change(struct peer *peer)
 	}
 }
 
+/* gr_path_select_deferral_applicable：是否需要对某实例做 GR 延迟选路。
+ * 条件：BGP 正在优雅重启（t_startup 在跑或处于 GR 中）且存在尚未完成延迟选路的
+ * GR 支持 AF。 */
 static bool gr_path_select_deferral_applicable(struct bgp *bgp)
 {
 	afi_t afi;
@@ -1867,6 +2091,19 @@ static bool gr_path_select_deferral_applicable(struct bgp *bgp)
 
 /* Called after event occurred, this function change status and reset
    read/write and timer thread. */
+/* ========== 8. 状态变更落库与停机/清理 ========== */
+
+/* bgp_fsm_change_status：真正切换连接状态并执行副作用——状态迁移的唯一落点。
+ * 参数 connection：被迁移的连接；status：目标状态。
+ * 职责（按顺序）：
+ *   1) 维护 bgp->established_peers 计数，并在进入 Established 时复位 connect 退避；
+ *   2) 全实例最后一个 Established 消失时调整 Router-ID（bgp_router_id_zebra_bump）；
+ *   3) 进入 Clearing/Deleted 时清全部路由（须在真正改状态前完成），并在必要时补发
+ *      Clearing_Completed 事件，防止 peer 卡在 Clearing；
+ *   4) 保存 ostatus、写入 status，重置 keepalive 计数；
+ *   5) 触发 peer_backward_transition / peer_status_changed hook（供模块挂钩）；
+ *   6) 与 maxmed-onstartup / update-delay / GR 三套增强逻辑联动。
+ * 返回值：无。被 bgp_event_update() 及 bgp_stop / bgp_stop_with_notify 等调用。 */
 void bgp_fsm_change_status(struct peer_connection *connection,
 			   enum bgp_fsm_status status)
 {
@@ -1876,6 +2113,9 @@ void bgp_fsm_change_status(struct peer_connection *connection,
 
 	peer_count = bgp->established_peers;
 
+	/* 维护“已建立邻居数”：进入 Established +1，离开 Established -1（下方 else if）。
+	 * 进入 Established 时同时把 ConnectRetry 退避值复位为配置值（新建会话不应
+	 * 继承上一轮的指数退避）。 */
 	if (status == Established) {
 		bgp->established_peers++;
 		/* Reset the retry timer if we already established */
@@ -1935,6 +2175,8 @@ void bgp_fsm_change_status(struct peer_connection *connection,
 	}
 
 	/* Preserve old status and change into new status. */
+	/* 关键：先保存旧状态到 ostatus（供比较/回退/统计），再写入新状态。
+	 * 注意上面清路由的判断必须先于此处——它依赖“尚未改变”的旧状态语义。 */
 	connection->ostatus = connection->status;
 	connection->status = status;
 
@@ -1977,6 +2219,8 @@ void bgp_fsm_change_status(struct peer_connection *connection,
 }
 
 /* Flush the event queue and ensure the peer is shut down */
+/* bgp_clearing_completed：Clearing 完成处理。调用 bgp_stop 收尾；成功则清空该连接上
+ * 已就绪的事件，使 peer 结束 Clearing 进入 Idle。 */
 static enum bgp_fsm_state_progress
 bgp_clearing_completed(struct peer_connection *connection)
 {
@@ -1990,6 +2234,16 @@ bgp_clearing_completed(struct peer_connection *connection)
 
 /* Administrative BGP peer stop event. */
 /* May be called multiple times for the same peer */
+/* bgp_stop：行政性/异常性停止会话的通用收尾（可被多次调用，也用于非 Established 态）。
+ * 参数 connection：要停止的连接。返回值：告知调用者是否已删除 peer
+ * （BGP_FSM_FAILURE_AND_DELETE / BGP_FSM_SUCCESS）。
+ * 主要动作：
+ *   - 动态邻居直接删除；取消该连接所有已就绪事件（Clearing 态除外，因事件即状态迁移手段）；
+ *   - 若原本 Established：累加 dropped、处理 BFD、打印 ADJCHANGE Down、启停 GR 定时器、
+ *     停 route-refresh 定时器、更新时间戳、移出 update-group；
+ *   - 停 keepalive/读写/所有状态定时器；清空收发缓冲、关闭 fd、复位 dir；
+ *   - 复位协商能力与各 AF 标志（特别保留 GR_WAIT_EOR）、keepalive/holdtime/delayopen
+ *     回到配置默认值；非配置节点则删除 peer。 */
 enum bgp_fsm_state_progress bgp_stop(struct peer_connection *connection)
 {
 	afi_t afi;
@@ -2012,6 +2266,8 @@ enum bgp_fsm_state_progress bgp_stop(struct peer_connection *connection)
 	}
 
 	/* Can't do this in Clearing; events are used for state transitions */
+	/* Clearing 态不能清事件：Clearing→Idle 的迁移本身就是靠事件完成的，清掉会把
+	 * 状态机憋死。其它状态下则把该连接上已排队的就绪事件全部撤销。 */
 	if (connection->status != Clearing) {
 		/* Delete all existing events of the peer */
 		event_cancel_event_ready(bm->master, connection);
@@ -2053,6 +2309,8 @@ enum bgp_fsm_state_progress bgp_stop(struct peer_connection *connection)
 					   peer,
 					   bgp_peer_get_connection_direction_string(connection));
 		}
+		/* GR：会话 down 时，若此前处于 NSF_WAIT（对端曾宣告支持 GR），启动
+		 * GR restart 与 stalepath 两个定时器以暂时保留其路由；否则清除 nsf 状态。 */
 		if (CHECK_FLAG(peer->sflags, PEER_STATUS_NSF_WAIT)) {
 			if (bgp_debug_neighbor_events(peer)) {
 				zlog_debug("%pBP graceful restart timer started for %d sec for %s",
@@ -2139,6 +2397,7 @@ enum bgp_fsm_state_progress bgp_stop(struct peer_connection *connection)
 	}
 
 	/* Reset capabilities. */
+	/* 能力协商结果、remote_role 已随会话结束失效，清零以备下一轮重新协商。 */
 	peer->cap = 0;
 
 	/* Resetting neighbor role to the default value */
@@ -2200,6 +2459,8 @@ enum bgp_fsm_state_progress bgp_stop(struct peer_connection *connection)
 }
 
 /* BGP peer is stopped by the error. */
+/* bgp_stop_with_error：带错误的停止。先把 StartTimer 翻倍实现退避（上限 120s），
+ * 动态邻居直接删除，否则走 bgp_stop。 */
 static enum bgp_fsm_state_progress
 bgp_stop_with_error(struct peer_connection *connection)
 {
@@ -2226,6 +2487,9 @@ bgp_stop_with_error(struct peer_connection *connection)
 
 
 /* something went wrong, send notify and tear down */
+/* bgp_stop_with_notify：发送 NOTIFICATION 后停止会话（需把出错原因告知对端时使用）。
+ * 参数 code/sub_code：NOTIFICATION 的错误码与子码。先 bgp_notify_send 发出通知；
+ * 动态邻居直接删除；把 v_start 复位为默认值；最后调用 bgp_stop。 */
 enum bgp_fsm_state_progress
 bgp_stop_with_notify(struct peer_connection *connection, uint8_t code,
 		     uint8_t sub_code)
@@ -2250,6 +2514,7 @@ bgp_stop_with_notify(struct peer_connection *connection, uint8_t code,
 	return bgp_stop(connection);
 }
 
+/* ========== 9. TCP 连接建立与 OPEN 交互 ========== */
 /**
  * Determines whether a TCP session has successfully established for a peer and
  * events as appropriate.
@@ -2265,6 +2530,11 @@ bgp_stop_with_notify(struct peer_connection *connection, uint8_t code,
  * when the connection is established. A read event is triggered when the
  * connection is closed. Thus we need to cancel whichever one did not occur.
  */
+/* bgp_connect_check：非阻塞 connect 的结果判定（poll 就绪后回调）。
+ * 背景（见上方文档注释）：Linux/BSD 对“连接被关闭”时 revents 的取值不同，故同时挂
+ * 读事件与写事件（都在本函数），实际触发后取消另一个。用 getsockopt(SO_ERROR) 读结果：
+ * 0 表示 TCP 已连通 → 注入 TCP_connection_open（若配了 DelayOpen 则 _w_delay）；
+ * 非 0 → 注入 TCP_connection_open_failed。 */
 static void bgp_connect_check(struct event *event)
 {
 	int status;
@@ -2314,6 +2584,9 @@ static void bgp_connect_check(struct event *event)
 
 /* TCP connection open.  Next we send open message to remote peer. And
    add read thread for reading open message. */
+/* bgp_connect_success：TCP 连通后的处理（普通模式）。
+ * 校验 fd；bgp_getsockname 取本地地址（失败则发 FSM Error NOTIFY 并置写就绪以便
+ * 把通知发出去）；触发 nht 事件；开启读线程；发送 OPEN。 */
 static enum bgp_fsm_state_progress
 bgp_connect_success(struct peer_connection *connection)
 {
@@ -2365,6 +2638,9 @@ bgp_connect_success(struct peer_connection *connection)
 /* TCP connection open with RFC 4271 optional session attribute DelayOpen flag
  * set.
  */
+/* bgp_connect_success_w_delayopen：DelayOpen 版本的 TCP 连通处理。
+ * 与 bgp_connect_success 几乎相同，区别在于：不立即发送 OPEN，而是启动 DelayOpenTimer，
+ * 等其到期（bgp_delayopen_timer → DelayOpen_timer_expired）后再发 OPEN。 */
 static enum bgp_fsm_state_progress
 bgp_connect_success_w_delayopen(struct peer_connection *connection)
 {
@@ -2425,6 +2701,8 @@ bgp_connect_success_w_delayopen(struct peer_connection *connection)
 }
 
 /* TCP connect fail */
+/* bgp_connect_fail：TCP 连接失败处理。动态邻居则删除；否则触发 nht 事件并 bgp_stop
+ * （停会话后 FSM 通常会回到 Active 等待重试）。 */
 static enum bgp_fsm_state_progress
 bgp_connect_fail(struct peer_connection *connection)
 {
@@ -2451,6 +2729,8 @@ bgp_connect_fail(struct peer_connection *connection)
 /* after connect is called(), getpeername is able to return
  * port and address on non established streams
  */
+/* bgp_connect_in_progress_update_connection：非阻塞 connect 进行中，用已知的对端端口
+ * 补全 su_remote（此阶段 getpeername 尚不可用）。 */
 static void bgp_connect_in_progress_update_connection(struct peer_connection *connection)
 {
 	struct peer *peer = connection->peer;
@@ -2468,6 +2748,12 @@ static void bgp_connect_in_progress_update_connection(struct peer_connection *co
 /* This function is the first starting point of all BGP connection. It
  * try to connect to remote peer with non-blocking IO.
  */
+/* bgp_start：所有 BGP 连接的起点（对应 RFC4271 §8.2.2 Connect 态动作）。
+ * 参数 connection：要发起连接的连接实体。返回值：BGP_FSM_SUCCESS / FAILURE。
+ * 流程：一系列前置校验（对端地址是否就绪、是否被 suppressed、RPKI strict 是否可用、
+ * VRF 是否就绪、NHT 是否可达）→ 调用 bgp_connect 发起非阻塞 connect → 依返回值
+ * 注入对应事件（立即可成功 / 失败 / 进行中则挂读+写 bgp_connect_check）。
+ * 注意：任一校验失败都会 peer_set_last_reset(对应原因) 并返回 FAILURE，由 FSM 收敛。 */
 static enum bgp_fsm_state_progress bgp_start(struct peer_connection *connection)
 {
 	struct peer *peer = connection->peer;
@@ -2530,6 +2816,8 @@ static enum bgp_fsm_state_progress bgp_start(struct peer_connection *connection)
 	/* Register peer for NHT. If next hop is already resolved, proceed
 	 * with connection setup, else wait.
 	 */
+	/* NHT 注册：未解析出下一跳且 zebra 已有连接数时，说明“暂无到达邻居的路径”，
+	 * 记原因、注入 TCP_connection_open_failed 并成功返回（等待下一跳变化后再触发）。 */
 	if (!bgp_peer_connection_reg_with_nht(connection)) {
 		if (bgp_zebra_num_connects()) {
 			frrtrace(2, frr_bgp, session_state_change, peer, 8);
@@ -2550,6 +2838,8 @@ static enum bgp_fsm_state_progress bgp_start(struct peer_connection *connection)
 	status = bgp_connect(connection);
 
 	frrtrace(2, frr_bgp, connection_attempt, peer, status);
+	/* 三种 connect 结果分别注入不同事件：失败→open_failed；立即成功→connection_open；
+	 * 进行中→挂读+写 bgp_connect_check 等待 poll 就绪（取消未触发的那个）。 */
 	switch (status) {
 	case connect_error:
 		if (bgp_debug_neighbor_events(peer))
@@ -2598,6 +2888,8 @@ static enum bgp_fsm_state_progress bgp_start(struct peer_connection *connection)
 }
 
 /* Connect retry timer is expired when the peer status is Connect. */
+/* bgp_reconnect：ConnectRetry 到期后在 Connect 态重连。先 bgp_stop 复位，再通知 zebra
+ * 发送 GR capability，最后 bgp_start 发起新连接。 */
 static enum bgp_fsm_state_progress
 bgp_reconnect(struct peer_connection *connection)
 {
@@ -2615,6 +2907,9 @@ bgp_reconnect(struct peer_connection *connection)
 	return bgp_start(connection);
 }
 
+/* bgp_fsm_open：收到对端 OPEN 后的动作。若此时处于 Connect/Active（DelayOpen 场景，
+ * 我方尚未发 OPEN）则补发我方 OPEN；随后发送 KEEPALIVE 并启动 keepalive 定时器。
+ * 迁移目标为 OpenConfirm。 */
 static enum bgp_fsm_state_progress
 bgp_fsm_open(struct peer_connection *connection)
 {
@@ -2630,6 +2925,8 @@ bgp_fsm_open(struct peer_connection *connection)
 
 /* FSM error, unexpected event.  This is error of BGP connection. So cut the
    peer and change to Idle status. */
+/* bgp_fsm_event_error：在不应收到某报文的态收到了该报文（FSM 错误）：记日志并发
+ * FSM Error NOTIFY 停会话。 */
 static enum bgp_fsm_state_progress
 bgp_fsm_event_error(struct peer_connection *connection)
 {
@@ -2645,6 +2942,9 @@ bgp_fsm_event_error(struct peer_connection *connection)
 
 /* Hold timer expire.  This is error of BGP connection. So cut the
    peer and change to Idle status. */
+/* bgp_fsm_holdtime_expire：HoldTimer 到期。若处于 Established 且协商了 GR
+ * Notification（RFC8538），则置 NSF_WAIT 尝试走优雅重启保留路由；随后发 Hold Timer
+ * Expired NOTIFY 停会话。 */
 static enum bgp_fsm_state_progress
 bgp_fsm_holdtime_expire(struct peer_connection *connection)
 {
@@ -2668,6 +2968,9 @@ bgp_fsm_holdtime_expire(struct peer_connection *connection)
 }
 
 /* RFC 4271 DelayOpenTimer_Expires event */
+/* bgp_fsm_delayopen_timer_expire：DelayOpenTimer 到期（RFC4271 §8）。停定时器、发出
+ * OPEN、并把 holdtime 临时设为 245（4 分钟）——延长的 HoldTime 让对端有足够时间完成
+ * OPEN 协商，随后由协商结果覆盖。 */
 static enum bgp_fsm_state_progress
 bgp_fsm_delayopen_timer_expire(struct peer_connection *connection)
 {
@@ -2689,6 +2992,11 @@ bgp_fsm_delayopen_timer_expire(struct peer_connection *connection)
  * previously announced (afi,safi) or doesn't preserve forwarding for them.
  * The clearing of stale routes applies only to a Helper router.
  */
+/* bgp_peer_process_gr_cap_clear_stale：会话建立时处理对端宣告的 GR 能力，并在对端
+ * 未宣告某 (afi,safi)、或未声明保留转发（F-bit）时清除此前保留的 stale 路由
+ * （仅 Helper 侧适用）。
+ * 逐 AF 统计 nsf_af_count，据此决定 peer 是否进入 NSF_MODE（能保留路由）；
+ * 不进入时停掉 GR stalepath 定时器。 */
 static void bgp_peer_process_gr_cap_clear_stale(struct peer *peer)
 {
 	afi_t afi;
@@ -2752,6 +3060,15 @@ static void bgp_peer_process_gr_cap_clear_stale(struct peer *peer)
  * Convert peer from stub to full fledged peer, set some timers, and generate
  * initial updates.
  */
+/* bgp_establish：迁移到 Established（会话正式建立）的核心动作。
+ * 步骤：① 先把本连接与 doppelganger 连接移出 connectionhash；② peer_xfer_conn 完成
+ * 连接碰撞的“换心”（other==peer 表示发生了连接转移，返回值设为
+ * BGP_FSM_SUCCESS_STATE_TRANSFER）；③ 处理能力标志、复位 v_start、递增 established、
+ * 调 bgp_fsm_change_status(Established)；④ ADJCHANGE Up 日志、分配 update-group/
+ * subgroup、停 BFD hold、处理 GR、开启 keepalive；⑤ 发 ORF route-refresh、按需延迟
+ * 首个更新、启动 routeadv；⑥ 拆除 doppelganger 的 stub 连接（向对端发 CEASE/碰撞子码）。
+ * 返回 BGP_FSM_SUCCESS_STATE_TRANSFER 时，bgp_event_update 会把结果标记为
+ * FSM_PEER_TRANSFERRED。 */
 static enum bgp_fsm_state_progress
 bgp_establish(struct peer_connection *connection)
 {
@@ -2763,11 +3080,14 @@ bgp_establish(struct peer_connection *connection)
 	struct bgp *bgp = peer->bgp;
 	struct vrf *vrf = NULL;
 
+	/* 连接碰撞处理前，先把本连接和 doppelganger 连接从 connectionhash 摘除；
+	 * 换心完成后需重新放回（见函数末尾的 hash_get）。 */
 	other = peer->doppelganger;
 	hash_release(bgp->connectionhash, connection);
 	if (other && other->connection)
 		hash_release(bgp->connectionhash, other->connection);
 
+	/* 连接碰撞“换心”：成功后 peer 指向配置节点，connection 可能已被交换 */
 	peer = peer_xfer_conn(peer);
 	if (!peer) {
 		flog_err(EC_BGP_CONNECT, "%%Neighbor failed in xfer_conn");
@@ -2790,6 +3110,8 @@ bgp_establish(struct peer_connection *connection)
 	 */
 	connection = peer->connection;
 
+	/* other==peer 说明本次发生了连接转移（doppelganger 即配置节点本身）：
+	 * 用 SUCCESS_STATE_TRANSFER 告知上层，最终结果记为 FSM_PEER_TRANSFERRED。 */
 	if (other == peer)
 		ret = BGP_FSM_SUCCESS_STATE_TRANSFER;
 
@@ -2801,6 +3123,7 @@ bgp_establish(struct peer_connection *connection)
 	peer->v_start = BGP_INIT_START_TIMER;
 
 	/* Increment established count. */
+	/* 真正把状态切到 Established：此处会触发清路由判断、hook、update-delay/GR 联动等 */
 	peer->established++;
 	bgp_fsm_change_status(connection, Established);
 
@@ -2885,6 +3208,8 @@ bgp_establish(struct peer_connection *connection)
 				   bgp_peer_get_connection_direction_string(
 					   peer->doppelganger->connection));
 
+		/* 连接碰撞的收尾：对端主动那条（>Active）发 CEASE/Collision Resolution
+		 * 通知后拆除；尚未进入会话阶段（<=Active）的直接删除。 */
 		if (peer->doppelganger->connection->status > Active)
 			bgp_notify_send(peer->doppelganger->connection,
 					BGP_NOTIFY_CEASE,
@@ -2909,6 +3234,7 @@ bgp_establish(struct peer_connection *connection)
 }
 
 /* Keepalive packet is received. */
+/* bgp_fsm_keepalive：收到 KEEPALIVE。重置 HoldTimer（收到任何报文都刷新保活）。 */
 static enum bgp_fsm_state_progress
 bgp_fsm_keepalive(struct peer_connection *connection)
 {
@@ -2917,6 +3243,7 @@ bgp_fsm_keepalive(struct peer_connection *connection)
 }
 
 /* Update packet is received. */
+/* bgp_fsm_update：收到 UPDATE。同样重置 HoldTimer（UPDATE 也是保活流量）。 */
 static enum bgp_fsm_state_progress
 bgp_fsm_update(struct peer_connection *connection)
 {
@@ -2925,6 +3252,7 @@ bgp_fsm_update(struct peer_connection *connection)
 }
 
 /* This is empty event. */
+/* bgp_ignore：迁移表中该“状态 × 事件”应被忽略——仅记日志，不做任何动作。 */
 static enum bgp_fsm_state_progress bgp_ignore(struct peer_connection *connection)
 {
 	struct peer *peer = connection->peer;
@@ -2940,6 +3268,7 @@ static enum bgp_fsm_state_progress bgp_ignore(struct peer_connection *connection
 }
 
 /* This is to handle unexpected events.. */
+/* bgp_fsm_exception：迁移表中该“状态 × 事件”属异常组合——记日志并 bgp_stop 掉会话。 */
 static enum bgp_fsm_state_progress
 bgp_fsm_exception(struct peer_connection *connection)
 {
@@ -2955,6 +3284,11 @@ bgp_fsm_exception(struct peer_connection *connection)
 	return bgp_stop(connection);
 }
 
+/* bgp_fsm_nht_update：NHT（下一跳跟踪）结果变化驱动的 FSM 调整。
+ * 参数 has_valid_nexthops：下一跳是否仍然可达。按当前状态决定注入何种事件，使连接
+ * 随下一跳可达性变化：Idle 变可达则 BGP_Start；Connect 变不可达则 TCP_fatal_error；
+ * Active 变可达则 ConnectRetry_timer_expired；会话态变不可达且要求直连/gtsm 时
+ * TCP_fatal_error。 */
 void bgp_fsm_nht_update(struct peer_connection *connection, struct peer *peer,
 			bool has_valid_nexthops)
 {
@@ -2994,6 +3328,17 @@ void bgp_fsm_nht_update(struct peer_connection *connection, struct peer *peer,
 	}
 }
 
+/* ========== 10. FSM 迁移表（核心） ========== */
+/* 迁移表 FSM[status-1][event-1]：每个格子 = { 动作函数, 目标状态 }。
+ *   行下标 = 当前状态 - 1（Idle..Deleted，共 BGP_STATUS_MAX-1 行）；
+ *   列下标 = 事件 - 1（BGP_Start..Clearing_Completed，共 BGP_EVENTS_MAX-1 列）。
+ * bgp_event_update() 查表后：先调用动作函数，再据其返回值与本格的 next_state 推进状态。
+ * 阅读提示：
+ *   - 同一动作函数（如 bgp_stop）出现在多格，但目标状态不同，语义随之不同；
+ *   - Established 行里 BGP_Stop 等事件的目标是 Clearing（非 RFC 状态，先清路由再收尾）；
+ *   - Clearing 行的 Clearing_Completed 指向 bgp_clearing_completed→Idle；
+ *   - Deleted 行全部 bgp_ignore，是“终态不再响应任何事件”。
+ * 表格式的注释（BGP_Start 等）标明了每列对应的事件名，务必按列对齐阅读。 */
 /* Finite State Machine structure */
 static const struct {
 	enum bgp_fsm_state_progress (*func)(struct peer_connection *);
@@ -3161,7 +3506,14 @@ static const struct {
 	},
 };
 
+/* ========== 11. 事件分发入口 ========== */
+
 /* Execute event process. */
+/* bgp_event：事件分发入口（event 回调形式）。先对 peer 加锁（peer_lock），执行
+ * bgp_event_update 完成迁移，再解锁（peer_unlock）。加锁很关键：本函数可能由定时器或
+ * 主循环触发，而期间 peer 可能被其它路径试图删除；持锁可保证处理期间 peer 不被释放。
+ * 参数 e：事件对象，其数据 (EVENT_VAL) 存放 enum bgp_fsm_events，其参数 (EVENT_ARG)
+ * 为 peer_connection。 */
 void bgp_event(struct event *e)
 {
 	struct peer_connection *connection = EVENT_ARG(e);
@@ -3170,11 +3522,20 @@ void bgp_event(struct event *e)
 
 	event = EVENT_VAL(e);
 
+	/* 加/解锁确保迁移期间 peer 不被释放（bgp_event_update 内可能触发 peer 删除） */
 	peer_lock(peer);
 	bgp_event_update(connection, event);
 	peer_unlock(peer);
 }
 
+/* bgp_event_update：状态机核心。按 (当前状态, 事件) 查 FSM 表取动作函数与目标状态，
+ * 记录 last_event/cur_event（供调试与诊断），调用动作函数；随后依据其返回值
+ * (BGP_FSM_SUCCESS/_STATE_TRANSFER/FAILURE/_AND_DELETE) 推进状态、调用 bgp_timer_set
+ * 重设定时器，并返回 FSM_PEER_* 结果给上层。
+ * 参数 connection/event：连接与事件。返回值：FSM_PEER_NOOP / STOPPED / TRANSFERRED /
+ * TRANSITIONED（见 bgp_fsm.h）。
+ * 说明：动作函数内部也可能改状态（如 bgp_fsm_change_status），此处再比较并推进，
+ * 保证最终状态与迁移表一致。 */
 int bgp_event_update(struct peer_connection *connection,
 		     enum bgp_fsm_events event)
 {
@@ -3213,6 +3574,8 @@ int bgp_event_update(struct peer_connection *connection,
 	switch (ret) {
 	case BGP_FSM_SUCCESS:
 	case BGP_FSM_SUCCESS_STATE_TRANSFER:
+		/* 成功：若目标状态与当前不同则落库（bgp_fsm_change_status），并把结果标记为
+		 * TRANSITIONED；若是连接转移进入 Established 则为 TRANSFERRED。最后重设定时器。 */
 		if (ret == BGP_FSM_SUCCESS_STATE_TRANSFER &&
 		    next == Established) {
 			/* The case when doppelganger swap accurred in
@@ -3240,6 +3603,8 @@ int bgp_event_update(struct peer_connection *connection,
 		bgp_timer_set(connection);
 		break;
 	case BGP_FSM_FAILURE:
+		/* 失败（-1）：说明动作函数已（或应当）错误停止会话。对“非动态、非被动、且
+		 * 未删除 peer”的情形补做 bgp_stop + 状态置 Idle + 重设定时器；结果记为 STOPPED。 */
 		/*
 		 * If we got a return value of -1, that means there was an
 		 * error, restart the FSM. Since bgp_stop() was called on the
@@ -3265,14 +3630,22 @@ int bgp_event_update(struct peer_connection *connection,
 		fsm_result = FSM_PEER_STOPPED;
 		break;
 	case BGP_FSM_FAILURE_AND_DELETE:
+		/* 动作函数已删除 peer（-2）：不能再触碰 peer，仅标记 STOPPED。 */
 		fsm_result = FSM_PEER_STOPPED;
 		break;
 	}
 
 	return fsm_result;
 }
+/* ========== 12. GR 配置模式机（全局 / 邻居级） ========== */
+/* 说明：本文件后半部分（bgp_*_gr_*）并非 RFC4271 的连接状态机，而是“GR 开关的配置
+ * 状态机”：全局 GR 模式（GLOBAL_GR/HELPER/DISABLE）与邻居级模式（PEER_GR/HELPER/
+ * DISABLE/GLOBAL_INHERIT）之间的迁移，以及迁移后是否必须重置会话。二者用表格
+ * （GLOBAL_GR_FSM / PEER_GR_FSM）驱动，风格与本文件前面的 FSM 表一致。 */
 /* BGP GR Code */
 
+/* bgp_peer_inherit_global_gr_mode：把全局 GR 模式映射为 peer 的 GR 标志位
+ * （设置 HELPER / RESTART / DISABLE 三种 new_status_flag 之一）。 */
 static inline void
 bgp_peer_inherit_global_gr_mode(struct peer *peer,
 				enum global_mode global_gr_mode)
@@ -3293,6 +3666,9 @@ bgp_peer_inherit_global_gr_mode(struct peer *peer,
 	}
 }
 
+/* bgp_gr_update_mode_of_all_peers：全局 GR 模式变化时，遍历所有“继承全局”的 peer
+ * （含 peer-group 成员），应用新模式并刷新标志；需要时重置会话。
+ * 只处理当前为 PEER_GLOBAL_INHERIT 的 peer——显式配置了模式的邻居不受全局变化影响。 */
 static void bgp_gr_update_mode_of_all_peers(struct bgp *bgp,
 					    enum global_mode global_new_state)
 {
@@ -3346,6 +3722,9 @@ static void bgp_gr_update_mode_of_all_peers(struct bgp *bgp,
 	}
 }
 
+/* bgp_gr_update_all：全局 GR 命令入口。用 GLOBAL_GR_FSM 表由 (旧状态, 命令) 算出新
+ * 状态；无效或未变化则返回 NO_OPERATION（“next 为 INVALID”视为忽略该命令）；否则更新
+ * 全局状态并处理所有继承 peer。 */
 int bgp_gr_update_all(struct bgp *bgp, enum global_gr_command global_gr_cmd)
 {
 	enum global_mode global_new_state = GLOBAL_INVALID;
@@ -3375,6 +3754,7 @@ int bgp_gr_update_all(struct bgp *bgp, enum global_gr_command global_gr_cmd)
 	return BGP_GR_SUCCESS;
 }
 
+/* print_peer_gr_mode：邻居 GR 模式枚举 → 字符串，供日志/debug。 */
 const char *print_peer_gr_mode(enum peer_mode pr_mode)
 {
 	switch (pr_mode) {
@@ -3393,6 +3773,7 @@ const char *print_peer_gr_mode(enum peer_mode pr_mode)
 	return NULL;
 }
 
+/* print_peer_gr_cmd：邻居 GR 命令枚举 → 字符串，供日志/debug。 */
 const char *print_peer_gr_cmd(enum peer_gr_command pr_gr_cmd)
 {
 	switch (pr_gr_cmd) {
@@ -3413,6 +3794,7 @@ const char *print_peer_gr_cmd(enum peer_gr_command pr_gr_cmd)
 	return NULL;
 }
 
+/* print_global_gr_mode：全局 GR 模式枚举 → 字符串，供日志/debug。 */
 const char *print_global_gr_mode(enum global_mode gl_mode)
 {
 	switch (gl_mode) {
@@ -3429,6 +3811,7 @@ const char *print_global_gr_mode(enum global_mode gl_mode)
 	return "???";
 }
 
+/* print_global_gr_cmd：全局 GR 命令枚举 → 字符串，供日志/debug。 */
 const char *print_global_gr_cmd(enum global_gr_command gl_gr_cmd)
 {
 	switch (gl_gr_cmd) {
@@ -3445,16 +3828,20 @@ const char *print_global_gr_cmd(enum global_gr_command gl_gr_cmd)
 	return NULL;
 }
 
+/* bgp_global_gr_mode_get：读取实例当前全局 GR 模式。 */
 enum global_mode bgp_global_gr_mode_get(struct bgp *bgp)
 {
 	return bgp->global_gr_present_state;
 }
 
+/* bgp_peer_gr_mode_get：读取邻居当前 GR 模式。 */
 enum peer_mode bgp_peer_gr_mode_get(struct peer *peer)
 {
 	return peer->peer_gr_present_state;
 }
 
+/* bgp_neighbor_graceful_restart：邻居级 GR 命令入口。用 peer->PEER_GR_FSM 表由
+ * (旧状态, 命令) 算出新状态并执行对应动作函数；无效/未变化则返回 NO_OPERATION。 */
 int bgp_neighbor_graceful_restart(struct peer *peer,
 				  enum peer_gr_command peer_gr_cmd)
 {
@@ -3488,6 +3875,8 @@ int bgp_neighbor_graceful_restart(struct peer *peer,
 	return result;
 }
 
+/* gr_mode_matches：判断邻居模式与全局模式语义是否一致(helper/GR/disable 三者对应)。
+ * 用于在“继承/取消继承全局”时判断是否真的改变了语义，从而决定是否需要重置会话。 */
 static inline bool gr_mode_matches(enum peer_mode peer_gr_mode,
 				   enum global_mode global_gr_mode)
 {
@@ -3498,6 +3887,9 @@ static inline bool gr_mode_matches(enum peer_mode peer_gr_mode,
 	return false;
 }
 
+/* bgp_peer_gr_action：执行邻居 GR 状态迁移的动作。处理全局继承标志位的进/出；若迁移
+ * 前后与全局语义相同则免去会话重置(session_reset=false)；移动 GR 模式；需要时重置
+ * 单个邻居或整个 peer-group 的会话。 */
 unsigned int bgp_peer_gr_action(struct peer *peer, enum peer_mode old_state,
 				enum peer_mode new_state)
 {
@@ -3571,6 +3963,8 @@ unsigned int bgp_peer_gr_action(struct peer *peer, enum peer_mode old_state,
 	return BGP_GR_SUCCESS;
 }
 
+/* bgp_peer_move_to_gr_mode：把 peer 移动到新 GR 模式：按模式设置对应标志位，
+ * 刷新 peer->flags，并记录 peer_gr_present_state。 */
 void bgp_peer_move_to_gr_mode(struct peer *peer, enum peer_mode new_state)
 
 {
@@ -3607,6 +4001,9 @@ void bgp_peer_move_to_gr_mode(struct peer *peer, enum peer_mode new_state)
 			   peer->peer_gr_new_status_flag, peer->flags);
 }
 
+/* bgp_peer_gr_flags_update：把 peer_gr_new_status_flag 同步到 peer->flags 的 GR 相关
+ * 标志；若 GR 被彻底关闭（既非 restart 也非 helper）且此前正作为 Helper，则停 NSF 并
+ * 清除 stale 路由。 */
 void bgp_peer_gr_flags_update(struct peer *peer)
 {
 	if (CHECK_FLAG(peer->peer_gr_new_status_flag,
@@ -3654,6 +4051,8 @@ void bgp_peer_gr_flags_update(struct peer *peer)
 	}
 }
 
+/* bgp_event_stop_with_notify：event 化包装——在事件回调里以
+ * BGP_NOTIFY_SEND_HOLD_ERR 调用 bgp_stop_with_notify，用于定时器触发的“带通知停机”。 */
 void bgp_event_stop_with_notify(struct event *event)
 {
 	struct peer_connection *connection = EVENT_ARG(event);

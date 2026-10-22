@@ -7,26 +7,88 @@
  * Donald Sharp, Quentin Young
  */
 
+/*
+ * ============================ 文件导读 ============================
+ * frrlua.c —— FRR 内嵌 Lua 引擎「C 端绑定」的实现
+ *
+ * 一、职责
+ *   实现 frrlua.h 里声明的所有 lua_pushX / lua_decodeX / lua_toX 函数，
+ *   在 C 数据结构与 Lua 栈之间做双向转换，并提供日志导出与栈调试工具。
+ *
+ * 二、核心机制
+ *   Lua 与 C 通过一个虚拟栈交互。本文件里反复出现的套路是：
+ *     lua_newtable(L)            在栈顶新建一张表
+ *     lua_pushXxx / lua_setfield 往表里塞字段
+ *   解码时则：
+ *     lua_getfield(L, idx, k)    把字段值取到栈顶
+ *     lua_toXxx / lua_pop(L, 1)  读值后弹栈
+ *   最后 lua_decode_xxx 末尾会再 lua_pop 一次，弹出那张表本身。
+ *
+ * 三、核心数据结构
+ *   - lua_State         Lua 解释器状态（虚拟栈），贯穿全文。
+ *   - struct prefix     FRR 前缀，编码为含 network / length / family 的表。
+ *   - struct interface  接口，编码为含 name / ifindex / mtu 等的表。
+ *   - struct in_addr / in6_addr / ipaddr / ethaddr / sockunion 地址类。
+ *   - struct nexthop / nexthop_group  下一跳与下一跳组。
+ *   - MTYPE_SCRIPT_RES 本文件新分配对象的统一内存类型。
+ *
+ * 四、与其他模块的关系
+ *   - 上游：frrscript.c 与开启了 Lua 钩子的守护进程调用这里的函数。
+ *   - 依赖 lib/prefix.h、if.h、nexthop.h、nexthop_group.h、log.h 等，
+ *     把 FRR 的数据结构翻译成 Lua。
+ *   - frrlua_export_logging 把 lib/log.h 的 zlog 接口暴露给 Lua。
+ *
+ * 五、阅读顺序
+ *   先看 frrlua_table_get_integer（最简单）-> 再看 prefix 三件套 ->
+ *   interface -> 各类地址 -> nexthop -> integer / longlong / string ->
+ *   logging 导出 -> 末尾的 lua_table_dump / frrlua_stackdump 调试工具。
+ *
+ * 六、易踩的坑
+ *   1. lua_toXxx 用 XCALLOC(MTYPE_SCRIPT_RES, ..) 分配，必须由调用者
+ *      用 XFREE(MTYPE_SCRIPT_RES, ..) 释放，切勿与 MTYPE_TMP 混用。
+ *   2. lua_decode_xxx 假定栈上 idx 处就是对应的 table，且会弹出该表；
+ *      调用前不要多压东西。
+ *   3. 解码全靠字段名（字符串）匹配，字段名拼错不会报错，只会读到 0。
+ *   4. 整个文件被 HAVE_SCRIPTING 笼罩，未启用脚本时是空编译单元。
+ * ================================================================
+ */
+/* FRR 统一的超级头，集中引入大量系统头与平台兼容定义，必须最先包含。 */
 #include <zebra.h>
 
+/* 仅在编译时启用脚本支持时才编译本文件的实现。 */
 #ifdef HAVE_SCRIPTING
 
+/* Lua 辅助库（table / string 等标准操作的 C 接口）。 */
 #include <lauxlib.h>
+/* Lua 核心头，lua_State 与栈操作 API。 */
 #include <lua.h>
+/* Lua 标准库注册入口（luaL_openlibs 用）。 */
 #include <lualib.h>
 
+/* 前缀类型 struct prefix 及其字符串化 prefix2str / str2prefix。 */
 #include "lib/prefix.h"
+/* 动态缓冲区 struct buffer，lua_table_dump 用。 */
 #include "lib/buffer.h"
+/* 本文件要实现的接口声明。 */
 #include "lib/frrlua.h"
+/* 接口结构体 struct interface。 */
 #include "lib/if.h"
+/* zlog 日志接口，frrlua_export_logging 用。 */
 #include "lib/log.h"
+/* 下一跳 struct nexthop。 */
 #include "lib/nexthop.h"
+/* 下一跳组 struct nexthop_group。 */
 #include "lib/nexthop_group.h"
 
+/* 定义 MTYPE_SCRIPT_RES：本文件用 lua_toXxx 新分配对象时统一走这个内存
+ * 类型，便于内存统计与泄漏排查。头文件里是 DECLARE，这里是 DEFINE。 */
 DEFINE_MTYPE(LIB, SCRIPT_RES, "Scripting results");
 
+/* 本文件按「分组」组织：先通用便利函数，再各类型编解码，最后是日志导出
+ * 与调试工具；每组前都有一段英文小标题注释。 */
 /* Lua stuff */
 
+/* 便捷函数区：让 C 与 Lua 栈之间的数据搬运更省事，先看这里最直观。 */
 /*
  * FRR convenience functions.
  *
@@ -34,6 +96,9 @@ DEFINE_MTYPE(LIB, SCRIPT_RES, "Scripting results");
  * stack easier.
  */
 
+/* 从栈顶那张 table 中按 key 取整数。做法是：把 key 压栈，用 lua_gettable
+ * 以「栈中 -2 的表 + 栈顶的 key」做索引，取到的值就到栈顶，转成 int 后
+ * 弹掉。注意调用前栈顶必须是被查询的 table。 */
 int frrlua_table_get_integer(lua_State *L, const char *key)
 {
 	int result;
@@ -47,12 +112,19 @@ int frrlua_table_get_integer(lua_State *L, const char *key)
 	return result;
 }
 
+/* 编解码函数区：每种 FRR 类型都提供 1 个编码（lua_pushX）+ 2 个解码
+ * （lua_decodeX 写入已有对象 / lua_toX 新分配对象）函数。 */
 /*
  * This section has functions that convert internal FRR datatypes into Lua
  * datatypes: one encoder function and two decoder functions for each type.
  *
  */
 
+/* 把 struct prefix 编码成一张 Lua 表压栈，字段有：
+ *   network  形如 "10.0.0.0/8" 的字符串（prefix2str 生成）
+ *   length   前缀长度 prefixlen
+ *   family   地址族（AF_INET / AF_INET6）
+ * 注意表本身留在栈顶，由调用者决定何时弹出。 */
 void lua_pushprefix(lua_State *L, const struct prefix *prefix)
 {
 	char buffer[PREFIX_STRLEN];
@@ -66,6 +138,9 @@ void lua_pushprefix(lua_State *L, const struct prefix *prefix)
 	lua_setfield(L, -2, "family");
 }
 
+/* 反向：从栈上 idx 处的表解出 prefix，填充到 *prefix。只读 network 字段
+ * 并用 str2prefix 解析（length / family 由它自行推出）。取字段后弹掉字段
+ * 值，最后再弹掉整张表（见末尾 lua_pop）。 */
 void lua_decode_prefix(lua_State *L, int idx, struct prefix *prefix)
 {
 	lua_getfield(L, idx, "network");
@@ -75,6 +150,8 @@ void lua_decode_prefix(lua_State *L, int idx, struct prefix *prefix)
 	lua_pop(L, 1);
 }
 
+/* 便捷封装：新分配一个 prefix（MTYPE_SCRIPT_RES）后交给 lua_decode_prefix
+ * 填充并返回。调用者用完必须 XFREE(MTYPE_SCRIPT_RES, ..)。 */
 void *lua_toprefix(lua_State *L, int idx)
 {
 	struct prefix *p = XCALLOC(MTYPE_SCRIPT_RES, sizeof(struct prefix));
@@ -82,6 +159,9 @@ void *lua_toprefix(lua_State *L, int idx)
 	return p;
 }
 
+/* 把 struct interface 编成一张 Lua 表压栈，字段包括 name / ifindex /
+ * status / flags / metric / speed / mtu / mtu6 / bandwidth / link_ifindex
+ * / linklayer_type，供脚本读取接口的各项属性。 */
 void lua_pushinterface(lua_State *L, const struct interface *ifp)
 {
 	lua_newtable(L);
@@ -109,6 +189,9 @@ void lua_pushinterface(lua_State *L, const struct interface *ifp)
 	lua_setfield(L, -2, "linklayer_type");
 }
 
+/* 反向：从栈上 idx 处的表逐字段解码进 *ifp。每读一个字段就 getfield
+ * 取值、tointeger 转换、pop 弹栈，最后再 pop 掉整表。字符串 name 用
+ * strlcpy 做边界安全拷贝。字段名必须与 lua_pushinterface 严格一致。 */
 void lua_decode_interface(lua_State *L, int idx, struct interface *ifp)
 {
 	lua_getfield(L, idx, "name");
@@ -147,6 +230,8 @@ void lua_decode_interface(lua_State *L, int idx, struct interface *ifp)
 	/* pop the table */
 	lua_pop(L, 1);
 }
+/* 便捷封装：新分配 interface（MTYPE_SCRIPT_RES）并解码填充后返回。注意
+ * 这是游离快照，未挂进全局接口树，调用者负责释放。 */
 void *lua_tointerface(lua_State *L, int idx)
 {
 	struct interface *ifp =
@@ -156,6 +241,8 @@ void *lua_tointerface(lua_State *L, int idx)
 	return ifp;
 }
 
+/* 把 IPv4 地址编成表压栈，含两个字段：value = 32 位原始整数，string =
+ * 点分十进制文本（inet_ntop 生成），方便 Lua 侧按需取用。 */
 void lua_pushinaddr(lua_State *L, const struct in_addr *addr)
 {
 	char buf[INET_ADDRSTRLEN];
@@ -169,6 +256,7 @@ void lua_pushinaddr(lua_State *L, const struct in_addr *addr)
 	lua_setfield(L, -2, "string");
 }
 
+/* 反向：取 value 字段（原始 32 位整数）还原 IPv4 地址，最后 pop 掉整表。 */
 void lua_decode_inaddr(lua_State *L, int idx, struct in_addr *inaddr)
 {
 	lua_getfield(L, idx, "value");
@@ -178,6 +266,7 @@ void lua_decode_inaddr(lua_State *L, int idx, struct in_addr *inaddr)
 	lua_pop(L, 1);
 }
 
+/* 新分配 in_addr（MTYPE_SCRIPT_RES）并解码返回，调用者负责释放。 */
 void *lua_toinaddr(lua_State *L, int idx)
 {
 	struct in_addr *inaddr =
@@ -187,6 +276,9 @@ void *lua_toinaddr(lua_State *L, int idx)
 }
 
 
+/* 把 IPv6 地址编成表压栈：value 是 16 字节原始数据（lua_pushlstring 存
+ * 二进制），string 是冒号十六进制文本。注意 raw 数据超过 32 位，不能塞
+ * 进 lua_pushinteger。 */
 void lua_pushin6addr(lua_State *L, const struct in6_addr *addr)
 {
 	char buf[INET6_ADDRSTRLEN];
@@ -200,6 +292,8 @@ void lua_pushin6addr(lua_State *L, const struct in6_addr *addr)
 	lua_setfield(L, -2, "string");
 }
 
+/* 反向：取 string 字段用 inet_pton 解析回 IPv6（未用 value 原始字节，
+ * 与 push 侧不对称但等价），最后 pop 掉整表。 */
 void lua_decode_in6addr(lua_State *L, int idx, struct in6_addr *in6addr)
 {
 	lua_getfield(L, idx, "string");
@@ -209,6 +303,7 @@ void lua_decode_in6addr(lua_State *L, int idx, struct in6_addr *in6addr)
 	lua_pop(L, 1);
 }
 
+/* 新分配 in6_addr（MTYPE_SCRIPT_RES）并解码返回，调用者负责释放。 */
 void *lua_toin6addr(lua_State *L, int idx)
 {
 	struct in6_addr *in6addr =
@@ -217,6 +312,8 @@ void *lua_toin6addr(lua_State *L, int idx)
 	return in6addr;
 }
 
+/* 统一地址 struct ipaddr 可按 v4/v6 承载；这里用 IS_IPADDR_V4 判断实际
+ * 族，分派到对应的 push 函数，脚本侧无需关心底层是哪种。 */
 void lua_pushipaddr(lua_State *L, const struct ipaddr *addr)
 {
 	if (IS_IPADDR_V4(addr))
@@ -225,6 +322,8 @@ void lua_pushipaddr(lua_State *L, const struct ipaddr *addr)
 		lua_pushin6addr(L, &addr->ipaddr_v6);
 }
 
+/* 把 MAC 地址编成表压栈，只有一个 octet 字段（把 6 字节当作整数读出）。
+ * 注意：这里取的是首元素的值，不是完整 6 字节数组，仅够做简单比较。 */
 void lua_pushethaddr(lua_State *L, const struct ethaddr *addr)
 {
 	lua_newtable(L);
@@ -232,6 +331,9 @@ void lua_pushethaddr(lua_State *L, const struct ethaddr *addr)
 	lua_setfield(L, -2, "octet");
 }
 
+/* 把套接字地址 sockunion 编成表压栈：value 是变长原始地址字节（v4 为
+ * 4 字节、v6 为 16 字节，长度由 sockunion_get_addrlen 给出），string 是
+ * 文本形式（sockunion2str，形如 "1.2.3.4" 或 "[::1]"）。 */
 void lua_pushsockunion(lua_State *L, const union sockunion *su)
 {
 	char buf[SU_ADDRSTRLEN];
@@ -246,6 +348,8 @@ void lua_pushsockunion(lua_State *L, const union sockunion *su)
 	lua_setfield(L, -2, "string");
 }
 
+/* 反向：取 string 字段用 str2sockunion 解析；解析失败会打一条 zlog_err
+ * 但仍继续（su 内容可能不可靠）。最后 pop 掉整表。 */
 void lua_decode_sockunion(lua_State *L, int idx, union sockunion *su)
 {
 	lua_getfield(L, idx, "string");
@@ -257,6 +361,7 @@ void lua_decode_sockunion(lua_State *L, int idx, union sockunion *su)
 	lua_pop(L, 1);
 }
 
+/* 新分配 sockunion（MTYPE_SCRIPT_RES）并解码返回，调用者负责释放。 */
 void *lua_tosockunion(lua_State *L, int idx)
 {
 	union sockunion *su =
@@ -266,11 +371,14 @@ void *lua_tosockunion(lua_State *L, int idx)
 	return su;
 }
 
+/* 把 int 直接压栈（不带表包装），最轻量的一种编码。 */
 void lua_pushintegerp(lua_State *L, const int *num)
 {
 	lua_pushinteger(L, *num);
 }
 
+/* 从栈上 idx 处读一个数，用 lua_tonumberx 同时拿到「是否为数字」标志
+ * isnum；随后 pop，并用 assert 保证确实取到了数字（类型不符会在此断言）。 */
 void lua_decode_integerp(lua_State *L, int idx, int *num)
 {
 	int isnum;
@@ -279,6 +387,7 @@ void lua_decode_integerp(lua_State *L, int idx, int *num)
 	assert(isnum);
 }
 
+/* 新分配 int（MTYPE_SCRIPT_RES）并解码返回，调用者负责释放。 */
 void *lua_tointegerp(lua_State *L, int idx)
 {
 	int *num = XCALLOC(MTYPE_SCRIPT_RES, sizeof(int));
@@ -287,6 +396,11 @@ void *lua_tointegerp(lua_State *L, int idx)
 	return num;
 }
 
+/* 把单条下一跳编成表压栈。公共字段：vrf_id / ifindex / type / flags /
+ * weight / backup_num / backup_idx / nh_label_type / nh_encap_type /
+ * srte_color。再按 type 追加类型相关字段：黑洞路由带 bh_type；IPv4/IPv6
+ * 网关分别用 lua_pushinaddr / lua_pushin6addr 编成嵌套的 gate 表；VXLAN
+ * 封装带 vni。 */
 void lua_pushnexthop(lua_State *L, const struct nexthop *nexthop)
 {
 	lua_newtable(L);
@@ -326,6 +440,9 @@ void lua_pushnexthop(lua_State *L, const struct nexthop *nexthop)
 	lua_setfield(L, -2, "srte_color");
 }
 
+/* 把整个下一跳组编成表压栈：用 ALL_NEXTHOPS_PTR 遍历链表，每条 nexthop
+ * 递归编成子表后 lua_seti 以 1 起始的整数下标写进数组，最终得到 Lua 的
+ * 数组风格 table。 */
 void lua_pushnexthop_group(lua_State *L, const struct nexthop_group *ng)
 {
 	lua_newtable(L);
@@ -339,12 +456,16 @@ void lua_pushnexthop_group(lua_State *L, const struct nexthop_group *ng)
 	}
 }
 
+/* 把 long long 压栈。Lua 的 integer 在 64 位构建下就是 64 位，可直接
+ * 承载，无需拆成高低位。 */
 void lua_pushlonglongp(lua_State *L, const long long *num)
 {
 	/* lua library function; this can take a long long */
 	lua_pushinteger(L, *num);
 }
 
+/* 从栈上 idx 处读一个数并转为 long long；与 decode_integerp 同样用
+ * lua_tonumberx 校验类型后 assert，最后 pop。 */
 void lua_decode_longlongp(lua_State *L, int idx, long long *num)
 {
 	int isnum;
@@ -353,6 +474,7 @@ void lua_decode_longlongp(lua_State *L, int idx, long long *num)
 	assert(isnum);
 }
 
+/* 新分配 long long（MTYPE_SCRIPT_RES）并解码返回，调用者负责释放。 */
 void *lua_tolonglongp(lua_State *L, int idx)
 {
 	long long *num = XCALLOC(MTYPE_SCRIPT_RES, sizeof(long long));
@@ -361,12 +483,17 @@ void *lua_tolonglongp(lua_State *L, int idx)
 	return num;
 }
 
+/* 从栈上 idx 处取字符串，strlcpy 拷进调用者缓冲区 *str，随后 pop。
+ * 注意拷贝长度用 strlen(str) + 1，即假定调用者已把 str 初始化到目标大小，
+ * 是个隐含契约。 */
 void lua_decode_stringp(lua_State *L, int idx, char *str)
 {
 	strlcpy(str, lua_tostring(L, idx), strlen(str) + 1);
 	lua_pop(L, 1);
 }
 
+/* 取出栈上 idx 处字符串，用 XSTRDUP(MTYPE_SCRIPT_RES) 复制一份返回；
+ * 调用者负责 XFREE(MTYPE_SCRIPT_RES, ..)。 */
 void *lua_tostringp(lua_State *L, int idx)
 {
 	char *string = XSTRDUP(MTYPE_SCRIPT_RES, lua_tostring(L, idx));
@@ -374,11 +501,14 @@ void *lua_tostringp(lua_State *L, int idx)
 	return string;
 }
 
+/* 日志导出区：把 FRR 的 zlog 各日志级别包装成 Lua 可直接调用的 log.* */
 /*
  * Logging.
  *
  * Lua-compatible wrappers for FRR logging functions.
  */
+/* 所有 log.* 函数的公共适配层：校验调用方恰好传了 1 个参数（否则 assert
+ * 失败），并返回该参数（字符串）。真正的日志级别由各 frrlua_log_xxx 决定。 */
 static const char *frrlua_log_thunk(lua_State *L)
 {
 	int nargs;
@@ -389,42 +519,51 @@ static const char *frrlua_log_thunk(lua_State *L)
 	return lua_tostring(L, 1);
 }
 
+/* log.trace：不做普通日志，而是把整个 Lua 栈 dump 出来打到 debug，用于
+ * 脚本调试时观察栈内容。 */
 static int frrlua_log_trace(lua_State *L)
 {
 	zlog_debug("%s", frrlua_stackdump(L));
 	return 0;
 }
 
+/* log.debug：转调 zlog_debug 输出脚本给的字符串。 */
 static int frrlua_log_debug(lua_State *L)
 {
 	zlog_debug("%s", frrlua_log_thunk(L));
 	return 0;
 }
 
+/* log.info：转调 zlog_info。 */
 static int frrlua_log_info(lua_State *L)
 {
 	zlog_info("%s", frrlua_log_thunk(L));
 	return 0;
 }
 
+/* log.notice：转调 zlog_notice。 */
 static int frrlua_log_notice(lua_State *L)
 {
 	zlog_notice("%s", frrlua_log_thunk(L));
 	return 0;
 }
 
+/* log.warn：转调 zlog_warn。 */
 static int frrlua_log_warn(lua_State *L)
 {
 	zlog_warn("%s", frrlua_log_thunk(L));
 	return 0;
 }
 
+/* log.error：转调 zlog_err。 */
 static int frrlua_log_error(lua_State *L)
 {
 	zlog_err("%s", frrlua_log_thunk(L));
 	return 0;
 }
 
+/* 注册表：把 Lua 里看到的函数名映射到 C 实现，末尾必须以空项收尾（{ }）,
+ * 供 luaL_setfuncs 一次性批量注册。 */
 static const luaL_Reg log_funcs[] = {
 	{ "trace", frrlua_log_trace },
 	{ "debug", frrlua_log_debug },
@@ -435,6 +574,8 @@ static const luaL_Reg log_funcs[] = {
 	{},
 };
 
+/* 建一张新表，用 log_funcs 把六个日志函数灌进去，再以全局名 log 挂到
+ * Lua 环境里，于是脚本可直接写 log.info("...") 等。 */
 void frrlua_export_logging(lua_State *L)
 {
 	lua_newtable(L);
@@ -442,10 +583,15 @@ void frrlua_export_logging(lua_State *L)
 	lua_setglobal(L, "log");
 }
 
+/* 调试工具区：把 Lua 栈 / table 转成可读字符串，排查脚本问题时用。 */
 /*
  * Debugging.
  */
 
+/* 递归地把栈上 index 处的值格式化进 buf。用 lua_next 遍历 table 的每个
+ * 键值对：先按 key 类型（字符串/数字）输出键，再按 value 类型分别处理
+ * 字符串、布尔、数字，遇到嵌套 table 就递归（level + 1 控制缩进）。
+ * 遍历期间 lua_pop(1) 弹出值、保留键，是 lua_next 的标准用法。 */
 void lua_table_dump(lua_State *L, int index, struct buffer *buf, int level)
 {
 	char tmpbuf[64] = {};
@@ -507,6 +653,9 @@ void lua_table_dump(lua_State *L, int index, struct buffer *buf, int level)
 	}
 }
 
+/* 把整个 Lua 栈（从下标 1 到栈顶）格式化成一个字符串返回：逐元素按类型
+ * 打印，遇到 table 调 lua_table_dump。返回串用 MTYPE_TMP 复制，调用者
+ * 需 XFREE(MTYPE_TMP, ..)。主要给 log.trace 和人工调试用。 */
 char *frrlua_stackdump(lua_State *L)
 {
 	int top = lua_gettop(L);
@@ -553,4 +702,5 @@ char *frrlua_stackdump(lua_State *L)
 	return result;
 }
 
+/* 结束 HAVE_SCRIPTING 条件编译块，本文件到此结束。 */
 #endif /* HAVE_SCRIPTING */

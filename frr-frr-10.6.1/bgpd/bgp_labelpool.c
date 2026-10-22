@@ -5,6 +5,48 @@
  * Copyright (C) 2018 LabN Consulting, L.L.C.
  */
 
+/*
+ * ============================================================================
+ * 【文件导读】bgp_labelpool.c —— 标签池：向 zebra 申请 label chunk 并按需分配
+ * ============================================================================
+ * 【它解决什么问题】
+ *   MPLS 转发要有本机“出标签”。20 位标签空间由 zebra 的标签管理器统一掌管，bgpd
+ *   不能自己乱取。做法是向 zebra 申请**一段连续标签(chunk)**，再在本地把这段标签
+ *   按需分配给不同用途。本文件就是这套“本地标签池”的实现。
+ *
+ * 【三层数据结构（务必先理解，其余都是围绕它们的操作）】
+ *   ledger(跳表) : 键 = labelid(请求者唯一标识)，值 = struct lp_lcb。
+ *                  “已受理的请求账本”。哪怕标签还没分下来也会先登记，用于识别
+ *                  重复请求、释放时校验归属。
+ *   inuse (跳表) : 键 = 标签值，值 = labelid。“当前已分配出去的标签”，用于从标签
+ *                  反查到请求者、释放时确认标签确实在用。
+ *   chunks(链表) : zebra 授予的连续标签段 struct lp_chunk，每段带一个 bitfield 标记
+ *                  哪些标签已分配(allocated_map)与剩余空闲数(nfree)。分配就在这些
+ *                  段里找空闲位；找不到就再向 zebra 要一段。
+ *
+ * 【异步与状态机】
+ *   与 zebra 的交互是异步的：bgp_lp_get() 里若本地池有货就立刻排队回调；否则把请求挂到
+ *   requests FIFO，并向 zebra 申请 chunk；等 bgp_lp_event_chunk() 收到 chunk 后，再由
+ *   bgp_sync_label_manager() 把 FIFO 里的请求逐个满足。
+ *   回调不直接调用，而是投递到 callback_q(工作队列)里执行，避免在消息处理路径上重入。
+ *   与 zebra 断连时允许继续用旧标签(bgp_lp_event_zebra_down 空实现)；重连时
+ *   (bgp_lp_event_zebra_up) 把旧标签全部作废，通过回调(allocated=false)通知请求者，
+ *   并重新为其分配，因此请求者无需自己重发申请。
+ *
+ * 【引用计数 / 共享】
+ *   同一条路由可能被多处引用同一个标签，必须等所有使用者都不再用了才能释放
+ *   (bgp_lp_release 会校验 labelid / type)。chunk 只有在整段都空闲、且没有待处理请求
+ *   时，才归还 zebra 并释放。
+ *
+ * 【建议阅读顺序】
+ *   常量与数据结构(lp_chunk / lp_lcb / lp_fifo / lp_cbq_item) → bgp_lp_init →
+ *   bgp_lp_get(快 / 慢路径) → get_label_from_pool → bgp_lp_release →
+ *   bgp_sync_label_manager / bgp_lp_event_chunk / bgp_lp_event_zebra_up(状态机) →
+ *   show 命令 → 末尾 bgp_label_per_nexthop_* 一族。
+ *   BGP_LABELPOOL_ENABLE_TESTS 包住的测试代码默认关闭，可略读。
+ * ============================================================================
+ */
+
 #include <zebra.h>
 
 #include "log.h"
@@ -27,6 +69,7 @@
 #include "bgpd/bgp_vty.h"
 #include "bgpd/bgp_rd.h"
 
+/* 【编译开关】置 1 才会编入文件末尾的压测代码(lptest)；默认 0，生产构建不含。 */
 #define BGP_LABELPOOL_ENABLE_TESTS 0
 
 #include "bgpd/bgp_labelpool_clippy.c"
@@ -45,8 +88,13 @@ static void bgp_lp_release(mpls_label_t label, void *labelid, int type, bool che
 /*
  * Remember where pool data are kept
  */
+/* 模块全局单例指针，指向 bgp_lp_init() 传入的 labelpool 实例；后续操作都作用于它。 */
 static struct labelpool *lp;
 
+/* 【关键常量】chunk 大小策略：首次申请 LP_CHUNK_SIZE_MIN=128 个，之后每次翻倍直到上限
+ * LP_CHUNK_SIZE_MAX = 1<<(20-4) = 65536（即整个 20 位标签空间的 1/16）。
+ * 为何不一次要很多：标签空间在本机各 FRR 进程间共享，贪心申请既浪费又挤占别人；限制在
+ * 1/16 可减少浪费，代价是本进程空闲标签的查找会稍慢一点。 */
 /*
  * Number of labels requested at a time from the zebra label manager.
  * We start small but double the request size each time up to a
@@ -61,11 +109,17 @@ static struct labelpool *lp;
 #define LP_CHUNK_SIZE_MIN 128
 #define LP_CHUNK_SIZE_MAX (1 << (20 - 4))
 
+/* 【内存类型】交给 FRR 内存统计系统的类型标签，便于用 show memory 追踪各结构用量。 */
 DEFINE_MTYPE_STATIC(BGPD, BGP_LABEL_CHUNK, "BGP Label Chunk");
 DEFINE_MTYPE_STATIC(BGPD, BGP_LABEL_FIFO, "BGP Label FIFO item");
 DEFINE_MTYPE_STATIC(BGPD, BGP_LABEL_CB, "BGP Dynamic Label Assignment");
 DEFINE_MTYPE_STATIC(BGPD, BGP_LABEL_CBQ, "BGP Dynamic Label Callback");
 
+/* 【结构】struct lp_chunk —— zebra 授予的一段连续标签 [first, last]。
+ *   nfree             : 这段里尚未分配的标签个数（为 0 说明整段用满）。
+ *   idx_last_allocated: 上次分配到的位下标，下次从这里往后找，避免重复扫描。
+ *   allocated_map     : 位图，第 i 位为 1 表示标签 first+i 已分配。
+ * 分配(get_label_from_pool)与释放(bgp_lp_release)都在这个位图上做置位 / 清位。 */
 struct lp_chunk {
 	uint32_t	first;
 	uint32_t	last;
@@ -77,6 +131,13 @@ struct lp_chunk {
 /*
  * label control block
  */
+/* 【结构】struct lp_lcb —— Label Control Block，记账“一个请求”的全部信息。
+ *   label   : 已分配到本请求的标签；MPLS_LABEL_NONE 表示还没分配（在排队等 chunk）。
+ *   type    : 用途(LP_TYPE_*)。
+ *   labelid : 请求者唯一标识，作为回调句柄回传。
+ *   vrf_id  : 所属 VRF，回调时用来找 bgp 实例。
+ *   cbfunc  : 回调；allocated=false 表示原先的标签失效（例如 zebra 重连）。
+ * ledger 跳表就是 labelid → lp_lcb 的映射。 */
 struct lp_lcb {
 	mpls_label_t	label;		/* MPLS_LABEL_NONE = not allocated */
 	int		type;
@@ -90,6 +151,8 @@ struct lp_lcb {
 	int		(*cbfunc)(mpls_label_t label, void *lblid, bool alloc);
 };
 
+/* 【结构】struct lp_fifo —— 挂在 requests FIFO 上的元素：内嵌一份 lp_lcb 副本(快照)。
+ * 用副本而非指针，是因为 FIFO 里的请求可能在被处理前就已失效，副本可避免悬空引用。 */
 struct lp_fifo {
 	struct lp_fifo_item fifo;
 	struct lp_lcb	lcb;
@@ -97,6 +160,9 @@ struct lp_fifo {
 
 DECLARE_LIST(lp_fifo, struct lp_fifo, fifo);
 
+/* 【结构】struct lp_cbq_item —— 投递到 callback_q 工作队列的一项“待执行回调”。
+ * 把 label、labelid、vrf_id、allocated 等参数打包，延迟到工作队列里再调用请求者的
+ * cbfunc；这样分配动作与回调执行解耦，避免重入。 */
 struct lp_cbq_item {
 	int		(*cbfunc)(mpls_label_t label, void *lblid, bool alloc);
 	int		type;
@@ -106,6 +172,13 @@ struct lp_cbq_item {
 	bool		allocated;	/* false = lost */
 };
 
+/* 【函数】lp_cbq_docallback —— 工作队列里真正执行回调的地方。要点：
+ *   - 若 label==MPLS_LABEL_NONE（不应发生）则记错误并返回。
+ *   - 找不到对应 bgp 实例时，如果标签是“已分配”的，仍需把它还回池里(bgp_lp_release)，
+ *     否则会泄漏；然后不再回调。
+ *   - allocated=true 但回调返回非 0，表示请求者拒收（常见于请求发出后配置又变了）；
+ *     此时释放该标签。
+ * 返回值恒为 WQ_SUCCESS。 */
 static wq_item_status lp_cbq_docallback(struct work_queue *wq, void *data)
 {
 	struct lp_cbq_item *lcbq = data;
@@ -155,16 +228,19 @@ static wq_item_status lp_cbq_docallback(struct work_queue *wq, void *data)
 	return WQ_SUCCESS;
 }
 
+/* 【函数】lp_cbq_item_free —— 工作队列删除元素时释放 lp_cbq_item 内存。 */
 static void lp_cbq_item_free(struct work_queue *wq, void *data)
 {
 	XFREE(MTYPE_BGP_LABEL_CBQ, data);
 }
 
+/* 【函数】lp_lcb_free —— ledger 跳表的元素删除回调：释放 lp_lcb 内存。 */
 static void lp_lcb_free(void *goner)
 {
 	XFREE(MTYPE_BGP_LABEL_CB, goner);
 }
 
+/* 【函数】lp_chunk_free —— chunks 链表的元素删除回调：释放位图与 lp_chunk 自身。 */
 static void lp_chunk_free(void *goner)
 {
 	struct lp_chunk *chunk = (struct lp_chunk *)goner;
@@ -173,6 +249,14 @@ static void lp_chunk_free(void *goner)
 	XFREE(MTYPE_BGP_LABEL_CHUNK, goner);
 }
 
+/* 【函数】bgp_lp_init —— 建立标签池的各数据结构并绑定回调工作队列。
+ * 这里把模块全局指针 lp 指向调用方传入的 pool；后续所有操作都作用于它。
+ *   ledger / inuse : 两个跳表(skiplist)，分别以 labelid / 标签值为键。
+ *   chunks         : lp_chunk 链表，删除回调为 lp_chunk_free。
+ *   requests       : 请求 FIFO(侵入式链表)。
+ *   callback_q     : 工作队列，workfunc=lp_cbq_docallback，del_item_data=lp_cbq_item_free，
+ *                    且 max_retries=0(回调失败不重试)。
+ *   next_chunksize : 初始为最小值，之后逐次翻倍。 */
 void bgp_lp_init(struct event_loop *master, struct labelpool *pool)
 {
 	if (BGP_DEBUG(labelpool, LABELPOOL))
@@ -198,6 +282,9 @@ void bgp_lp_init(struct event_loop *master, struct labelpool *pool)
 #endif
 }
 
+/* 【函数】check_bgp_lu_cb_unlock / check_bgp_lu_cb_lock —— 针对 BGP-LU 请求的特殊处理：
+ * LU 请求在排队 / 回调期间需要持有对应 dest 节点的锁(bgp_dest_lock_node)，以防节点在
+ * 等待标签时被删除。二者成对使用，请求作废或回调结束时解锁。 */
 /* check if a label callback was for a BGP LU node, and if so, unlock it */
 static void check_bgp_lu_cb_unlock(struct lp_lcb *lcb)
 {
@@ -212,6 +299,10 @@ static void check_bgp_lu_cb_lock(struct lp_lcb *lcb)
 		bgp_dest_lock_node(lcb->labelid);
 }
 
+/* 【函数】bgp_lp_finish —— 模块退出清理：把手上所有 chunk 归还 zebra、清空 requests
+ * FIFO（顺带给其中的 LU 请求解锁）、并遍历 callback_q 里尚未执行的回调给对应 LU 节点
+ * 解锁。注意“为何要手动遍历 callback_q”：工作队列的删除回调在“执行完成”时也会被调用，
+ * 若在删除回调里解锁会造成重复解锁，故这里显式遍历处理（见代码中 ugh 注释）。 */
 void bgp_lp_finish(void)
 {
 	struct lp_fifo *lf;
@@ -256,6 +347,13 @@ void bgp_lp_finish(void)
 	lp = NULL;
 }
 
+/* 【函数】get_label_from_pool —— 在本池已授予的 chunks 里找一个空闲标签。
+ *   - 跳过 nfree==0 的段；
+ *   - 用 bf_find_next_clear_bit_wrap 从上次位置之后“绕圈”找第一个空闲位
+ *     (idx_last_allocated 记录上次落点，分摊扫描成本)；
+ *   - 找到后把标签值插入 inuse 跳表(键=标签，值=labelid)，再置位、更新 nfree 并返回；
+ *   - 都不行则返回 MPLS_LABEL_NONE，调用方据此决定“向 zebra 再要一段”。
+ * 注意：只从“已到账”的 chunk 里取，不含尚未到账的。 */
 static mpls_label_t get_label_from_pool(void *labelid)
 {
 	struct listnode *node;
@@ -318,6 +416,9 @@ static mpls_label_t get_label_from_pool(void *labelid)
 /*
  * Success indicated by value of "label" field in returned LCB
  */
+/* 【函数】lcb_alloc —— 分配并初始化一个 lp_lcb。其中立刻尝试 get_label_from_pool()：
+ * 若分到标签则 lcb->label 非 NONE（成功）；否则为 MPLS_LABEL_NONE，表示需要排队等 chunk。
+ * 即“是否已成功分配”由返回 LCB 的 label 字段表示。 */
 static struct lp_lcb *lcb_alloc(int type, void *labelid, vrf_id_t vrf_id,
 				int (*cbfunc)(mpls_label_t label, void *labelid, bool allocated))
 {
@@ -362,6 +463,16 @@ static struct lp_lcb *lcb_alloc(int type, void *labelid, vrf_id_t vrf_id,
  * Prior requests for a given labelid are detected so that requests and
  * assignments are not duplicated.
  */
+/* 【函数】bgp_lp_get —— 申请标签的主入口(异步)。执行流程：
+ *   1) 先在 ledger 里按 labelid 查是否已受理：已存在 → requested=1（重复请求，
+ *      不重复分配）；不存在 → lcb_alloc() 造一个 lp_lcb(内部会尝试从本地池取标签)
+ *      并插入 ledger。
+ *   2) 若 lcb->label != NONE：本地池已满足（或这是已满足过的重复请求）→ 打包一个
+ *      lp_cbq_item 投入 callback_q 立即回调(allocated=true)，返回。
+ *   3) 否则(没取到标签)：若为重复请求直接返回；否则进入**慢路径**——把请求加入
+ *      requests FIFO，并在待处理请求数超过已申请量时向 zebra 再申请 next_chunksize
+ *      个标签(并把下次块大小翻倍、封顶)，最后挂定时器稍后 bgp_sync_label_manager。
+ * 【快 / 慢路径】快路径=本地有货立即回调；慢路径=登记排队，等 zebra 给 chunk。 */
 void bgp_lp_get(int type, void *labelid, vrf_id_t vrf_id,
 		int (*cbfunc)(mpls_label_t label, void *labelid, bool allocated))
 {
@@ -459,6 +570,14 @@ void bgp_lp_get(int type, void *labelid, vrf_id_t vrf_id,
 }
 
 /* Label release logic - releases label from skiplists and chunk bitfield */
+/* 【函数】bgp_lp_release —— 标签释放的公共实现，带多重校验以防误释放：
+ *   1) 在 inuse 里查该标签，且必须匹配 labelid（同一标签不能被别人释放）；
+ *   2) 在 ledger 里查该 labelid 的 lcb；普通释放(check_type=true)时还要求 label 与
+ *      type 都与 lcb 记录一致，否则直接返回、不释放；
+ *   3) 通过后从 ledger / inuse 摘除，并在所属 chunk 的位图里清位、nfree++；
+ *   4) 若整段 chunk 已全空、且 requests FIFO 也空了，就把这段 chunk 归还 zebra、
+ *      从 chunks 删除并释放内存，同时把 next_chunksize 复位为最小值。
+ * 注意：释放后不会主动去满足 FIFO 里等待的请求（留待下次 sync）。 */
 static void bgp_lp_release(mpls_label_t label, void *labelid, int type, bool check_type,
 			   bool debug_enabled)
 {
@@ -530,6 +649,12 @@ static void bgp_lp_release(mpls_label_t label, void *labelid, int type, bool che
 /*
  * Public typed release api
  */
+/* 【函数】typed release 包装 —— 把“释放”按用途固化 type，并顺手清理请求者状态：
+ *   bgp_lu_lp_release     : BGP-LU，释放后清 dest 的 local_label 有效位。
+ *   bgp_nh_lp_release     : 每下一跳标签(内部使用)。
+ *   bgp_vpn_lp_release    : VRF 出标签，释放后把 policy->tovpn_label 置 NONE。
+ *   bgp_vpn_nh_lp_release : L3VPN 每下一跳绑定标签。
+ * 都调用 bgp_lp_release(...) 且 check_type=true，确保类型匹配。 */
 void bgp_lu_lp_release(struct bgp_dest *dest, mpls_label_t label)
 {
 	bgp_lp_release(label, dest, LP_TYPE_BGP_LU, true, false);
@@ -563,6 +688,13 @@ void bgp_vpn_nh_lp_release(struct bgp_mplsvpn_nh_label_bind_cache *bmnc,
 	bgp_lp_release(label, bmnc, LP_TYPE_BGP_L3VPN_BIND, true, false);
 }
 
+/* 【函数】bgp_sync_label_manager —— 定时器驱动：把 requests FIFO 里排队的请求尽量用本地
+ * 池满足。逐个取出请求处理：
+ *   - ledger 里已查不到 → 请求已失效，跳过（顺带给 LU 解锁）；
+ *   - lcb->label 已非 NONE → 已经分到标签，跳过（顺带给 LU 解锁）；
+ *   - 尝试 get_label_from_pool：分到就投递回调；分不到说明本池又空了，就把该请求放回
+ *     FIFO 尾部、重挂定时器并跳出（等 zebra 给新 chunk）。
+ * 本质是“FIFO 请求 × 本地 chunk 空闲位”的分配循环。 */
 static void bgp_sync_label_manager(struct event *e)
 {
 	int debug = BGP_DEBUG(labelpool, LABELPOOL);
@@ -642,6 +774,10 @@ finishedrequest:
 	}
 }
 
+/* 【函数】bgp_lp_event_chunk —— zebra 授予了一段连续标签 [first,last]。把它做成一个
+ * lp_chunk：建位图、nfree=整段长度，并**插入 chunks 链表头部**（新段通常更大，放头部
+ * 让它先被扫描，提高分配命中率），最后从 pending_count 里扣掉这段长度。
+ * 若 first>last（非法）则记错误返回。 */
 void bgp_lp_event_chunk(uint32_t first, uint32_t last)
 {
 	struct lp_chunk *chunk;
@@ -675,6 +811,8 @@ void bgp_lp_event_chunk(uint32_t first, uint32_t last)
 /*
  * continue using allocated labels until zebra returns
  */
+/* 【函数】bgp_lp_event_zebra_down —— 与 zebra 断连。策略是“继续使用已分配的标签”，
+ * 所以这里是空实现(rats)；真正的作废与重分配推迟到重连(bgp_lp_event_zebra_up)时做。 */
 void bgp_lp_event_zebra_down(void)
 {
 	/* rats. */
@@ -685,6 +823,15 @@ void bgp_lp_event_zebra_down(void)
  * are not valid. Request chunk from zebra large enough to satisfy
  * previously-allocated labels plus any outstanding requests.
  */
+/* 【函数】bgp_lp_event_zebra_up —— 与 zebra 重连后的重建流程：
+ *   1) reconnect_count++；
+ *   2) 估算需要的标签数 = FIFO 中请求数 + 当前 inuse 数；按需抬高 next_chunksize，
+ *      向上取整成整段后向 zebra 一次性申请；
+ *   3) 作废当前所有 chunk（旧标签不再有效）；
+ *   4) 遍历 inuse 里每个标签：给请求者发一个 allocated=false 的失效回调，把 lcb->label
+ *      清成 NONE，并把该请求重新放回 requests FIFO（等重新分配）；随后清空 inuse；
+ *   5) 挂定时器稍后 bgp_sync_label_manager 做实际分配。
+ * 这样请求者无需自己重发申请，重连后会自动先收到“失效”、再收到“新标签”回调。 */
 void bgp_lp_event_zebra_up(void)
 {
 	unsigned int labels_needed;
@@ -768,6 +915,8 @@ void bgp_lp_event_zebra_up(void)
 			&bm->t_bgp_sync_label_manager);
 }
 
+/* 【命令】show bgp labelpool summary —— 打印台账概况：ledger / inuse / requests 各自
+ * 条目数、chunk 数、pending、重连次数；支持 json 输出。 */
 DEFUN(show_bgp_labelpool_summary, show_bgp_labelpool_summary_cmd,
       "show bgp labelpool summary [json]",
       SHOW_STR BGP_STR
@@ -811,6 +960,8 @@ DEFUN(show_bgp_labelpool_summary, show_bgp_labelpool_summary_cmd,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】show bgp labelpool ledger —— 遍历 ledger，按 type 打印每个请求对应的前缀与
+ * 标签；BGP-LU 请求若已不再标记为 BGP_NODE_LABEL_REQUESTED 则显示 INVALID。支持 json。 */
 DEFUN(show_bgp_labelpool_ledger, show_bgp_labelpool_ledger_cmd,
       "show bgp labelpool ledger [json]",
       SHOW_STR BGP_STR
@@ -914,6 +1065,11 @@ DEFUN(show_bgp_labelpool_ledger, show_bgp_labelpool_ledger_cmd,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】show bgp labelpool inuse —— 遍历 inuse（已分配标签），反查 ledger 得到 type，
+ * 打印前缀 / 标签。支持 json。
+ * 疑点（仅标注，未改动）：本命令开头有两处重复的 “if (!lp)” 检查（其一冗余）；且遍历
+ * 循环的“推进”用的是 lp->ledger 而非 lp->inuse（见下方 for 的第三段），两跳表键不同，
+ * 疑似笔误，实际行为存疑。 */
 DEFUN(show_bgp_labelpool_inuse, show_bgp_labelpool_inuse_cmd,
       "show bgp labelpool inuse [json]",
       SHOW_STR BGP_STR
@@ -1021,6 +1177,8 @@ DEFUN(show_bgp_labelpool_inuse, show_bgp_labelpool_inuse_cmd,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】show bgp labelpool requests —— 遍历 requests FIFO，打印每个等待分配请求的
+ * 前缀 / 类型。用 lp_fifo_next_safe 先取下一个再处理，防止遍历中被改动。支持 json。 */
 DEFUN(show_bgp_labelpool_requests, show_bgp_labelpool_requests_cmd,
       "show bgp labelpool requests [json]",
       SHOW_STR BGP_STR
@@ -1107,6 +1265,7 @@ DEFUN(show_bgp_labelpool_requests, show_bgp_labelpool_requests_cmd,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】show bgp labelpool chunks —— 打印每段 chunk 的 first / last / size / nfree。支持 json。 */
 DEFUN(show_bgp_labelpool_chunks, show_bgp_labelpool_chunks_cmd,
       "show bgp labelpool chunks [json]",
       SHOW_STR BGP_STR
@@ -1162,6 +1321,9 @@ DEFUN(show_bgp_labelpool_chunks, show_bgp_labelpool_chunks_cmd,
 	return CMD_SUCCESS;
 }
 
+/* 【函数】show_bgp_nexthop_label_afi —— 打印某 AFI 下“每下一跳标签缓存”树的内容：
+ * 每个下一跳的标签、引用路径数(path_count)、出接口、上次更新时间；detail 时再逐条列出
+ * 使用它的路径（含 RD / flags）。 */
 static void show_bgp_nexthop_label_afi(struct vty *vty, afi_t afi,
 				       struct bgp *bgp, bool detail)
 {
@@ -1225,6 +1387,8 @@ static void show_bgp_nexthop_label_afi(struct vty *vty, afi_t afi,
 	}
 }
 
+/* 【命令】show bgp [<view|vrf> VIEWVRFNAME] label-nexthop [detail] —— 按 VRF（缺省用默认
+ * 实例）分别对 AFI_IP / AFI_IP6 调用上面的打印函数。 */
 DEFPY(show_bgp_nexthop_label, show_bgp_nexthop_label_cmd,
       "show bgp [<view|vrf> VIEWVRFNAME] label-nexthop [detail]",
       SHOW_STR BGP_STR BGP_INSTANCE_HELP_STR
@@ -1259,6 +1423,9 @@ DEFPY(show_bgp_nexthop_label, show_bgp_nexthop_label_cmd,
  *			Testing code start
  *------------------------------------------------------------------------*/
 
+/* 【测试区开始】以下代码由 BGP_LABELPOOL_ENABLE_TESTS 控制，默认关闭（宏为 0），生产
+ * 构建不会包含。用途是压测标签池的分配 / 释放：批量申请标签、记录时间戳，统计吞吐。
+ * 无相关需求可直接略读，跳到 bgp_lp_vty_init。 */
 DEFINE_MTYPE_STATIC(BGPD, LABELPOOL_TEST, "Label pool test");
 
 #define LPT_STAT_INSERT_FAIL 0
@@ -1302,6 +1469,9 @@ struct lp_test {
 #define LPT_TS_INTERVAL 10000 /* timestamp every this many labels */
 
 
+/* 【测试】test_cb —— 压测用回调：allocated 时把 labelid → label 记入 tcb->labels，并按
+ * 间隔打时间戳；失效(allocated=false)时从记录中删除。labelid 高位是 generation，用于
+ * 找到对应的测试。 */
 static int test_cb(mpls_label_t label, void *labelid, bool allocated)
 {
 	uintptr_t generation;
@@ -1351,6 +1521,8 @@ static int test_cb(mpls_label_t label, void *labelid, bool allocated)
 	return 0;
 }
 
+/* 【测试】labelpool_test_event_handler —— 分批发起标签申请(每轮 request_blocksize 个)，
+ * 直到达到 request_maximum；构造 32 位 labelid = generation<<24 | count。 */
 static void labelpool_test_event_handler(struct event *event)
 {
 	struct lp_test *tcb;
@@ -1387,6 +1559,7 @@ static void labelpool_test_event_handler(struct event *event)
 				 0, &tcb->event_thread);
 }
 
+/* 【测试】lptest_stop —— 停止当前压测：取消其事件线程并清 lpt_inprogress。 */
 static void lptest_stop(void)
 {
 	struct lp_test *tcb;
@@ -1408,6 +1581,8 @@ static void lptest_stop(void)
 	lpt_inprogress = false;
 }
 
+/* 【测试】lptest_start —— 启动一次压测：检查是否有测试在跑、generation 位宽是否够，
+ * 然后建 tcb 并投递首轮事件。 */
 static int lptest_start(struct vty *vty)
 {
 	struct lp_test *tcb;
@@ -1470,6 +1645,8 @@ static int lptest_start(struct vty *vty)
 	return 0;
 }
 
+/* 【测试命令】debug bgp lptest {start|show|stop|release|clear} —— 启动 / 查看 / 停止 /
+ * 按比例释放 / 清理压测（仅测试构建可用）。 */
 DEFPY(start_labelpool_perf_test, start_labelpool_perf_test_cmd,
       "debug bgp lptest start",
       DEBUG_STR BGP_STR
@@ -1480,6 +1657,7 @@ DEFPY(start_labelpool_perf_test, start_labelpool_perf_test_cmd,
 	return CMD_SUCCESS;
 }
 
+/* 【测试】lptest_print_stats —— 打印计数(插入失败 / 删除失败 / 分配 / 释放)与时间戳表。 */
 static void lptest_print_stats(struct vty *vty, struct lp_test *tcb)
 {
 	unsigned int i;
@@ -1596,6 +1774,8 @@ DEFPY(clear_labelpool_perf_test, clear_labelpool_perf_test_cmd,
  * of the allocator in a subsequent test.
  */
 /* clang-format off */
+/* 【测试命令】debug bgp lptest release test GENERATION every N —— 按 1/N 的比例释放某次
+ * 测试记录里的标签，用来打散标签占用、在后续测试里触发分配器位图的“绕圈”行为。 */
 DEFPY(release_labelpool_perf_test, release_labelpool_perf_test_cmd,
       "debug bgp lptest release test GENERATION$generation every (1-5)$every_nth",
       DEBUG_STR
@@ -1664,6 +1844,8 @@ DEFPY(release_labelpool_perf_test, release_labelpool_perf_test_cmd,
 	return CMD_SUCCESS;
 }
 
+/* 【测试】lptest_delete —— lp_tests 跳表的删除回调：释放一次测试的全部记录、时间戳，
+ * 取消其事件线程并释放 tcb。 */
 static void lptest_delete(void *val)
 {
 	struct lp_test *tcb = (struct lp_test *)val;
@@ -1699,11 +1881,13 @@ static void lptest_delete(void *val)
 	XFREE(MTYPE_LABELPOOL_TEST, tcb);
 }
 
+/* 【测试】lptest_init —— 建立 lp_tests 跳表（键=generation，值=lp_test）。 */
 static void lptest_init(void)
 {
 	lp_tests = skiplist_new(0, NULL, lptest_delete);
 }
 
+/* 【测试】lptest_finish —— 销毁 lp_tests 跳表。 */
 static void lptest_finish(void)
 {
 	if (lp_tests) {
@@ -1717,6 +1901,8 @@ static void lptest_finish(void)
  *------------------------------------------------------------------------*/
 #endif /* BGP_LABELPOOL_ENABLE_TESTS */
 
+/* 【函数】bgp_lp_vty_init —— 在 VIEW 节点安装各 show bgp labelpool ... 命令；若开启测试
+ * 宏，再安装 ENABLE 节点下的 lptest 调试命令。 */
 void bgp_lp_vty_init(void)
 {
 	install_element(VIEW_NODE, &show_bgp_labelpool_summary_cmd);
@@ -1734,12 +1920,14 @@ void bgp_lp_vty_init(void)
 #endif /* BGP_LABELPOOL_ENABLE_TESTS */
 }
 
+/* 【内存类型】每下一跳标签缓存的内存类型标签（用于内存统计）。 */
 DEFINE_MTYPE_STATIC(BGPD, LABEL_PER_NEXTHOP_CACHE,
 		    "BGP Label Per Nexthop entry");
 
 /* The nexthops values are compared to
  * find in the tree the appropriate cache entry
  */
+/* 【函数】bgp_label_per_nexthop_cache_cmp —— RB-tree 比较：按 nexthop 前缀比较。 */
 int bgp_label_per_nexthop_cache_cmp(const struct bgp_label_per_nexthop_cache *a,
 				    const struct bgp_label_per_nexthop_cache *b)
 {
@@ -1747,6 +1935,8 @@ int bgp_label_per_nexthop_cache_cmp(const struct bgp_label_per_nexthop_cache *a,
 }
 
 struct bgp_label_per_nexthop_cache *
+/* 【函数】bgp_label_per_nexthop_new —— 新建一个每下一跳标签缓存：label 初始化为
+ * MPLS_INVALID_LABEL、复制 nexthop、初始化 paths 链表，然后挂入给定树。 */
 bgp_label_per_nexthop_new(struct bgp_label_per_nexthop_cache_head *tree,
 			  struct prefix *nexthop)
 {
@@ -1764,6 +1954,8 @@ bgp_label_per_nexthop_new(struct bgp_label_per_nexthop_cache_head *tree,
 }
 
 struct bgp_label_per_nexthop_cache *
+/* 【函数】bgp_label_per_nexthop_find —— 按 nexthop 在树中查找；tree 为空返回 NULL。
+ * 用栈上的临时 blnc 只填 nexthop 作为查找键。 */
 bgp_label_per_nexthop_find(struct bgp_label_per_nexthop_cache_head *tree,
 			   struct prefix *nexthop)
 {
@@ -1776,6 +1968,9 @@ bgp_label_per_nexthop_find(struct bgp_label_per_nexthop_cache_head *tree,
 	return bgp_label_per_nexthop_cache_find(tree, &blnc);
 }
 
+/* 【函数】bgp_label_per_nexthop_free —— 释放一个缓存：若持有标签，先通知 zebra 删除该
+ * 标签(ZEBRA_MPLS_LABELS_DELETE)并归还标签池；再从树中摘除、释放 nh 与自身。
+ * 疑点：这里直接取 blnc->nh->ifindex，未检查 nh 是否为 NULL，若 nh 为空会解引用空指针。 */
 void bgp_label_per_nexthop_free(struct bgp_label_per_nexthop_cache *blnc)
 {
 	if (blnc->label != MPLS_INVALID_LABEL) {
@@ -1792,6 +1987,7 @@ void bgp_label_per_nexthop_free(struct bgp_label_per_nexthop_cache *blnc)
 	XFREE(MTYPE_LABEL_PER_NEXTHOP_CACHE, blnc);
 }
 
+/* 【函数】bgp_label_per_nexthop_init —— 安装 show bgp ... label-nexthop 命令。 */
 void bgp_label_per_nexthop_init(void)
 {
 	install_element(VIEW_NODE, &show_bgp_nexthop_label_cmd);

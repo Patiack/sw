@@ -2,6 +2,50 @@
 /* BGP attributes management routines.
  * Copyright (C) 1996, 97, 98, 1999 Kunihiro Ishiguro
  */
+/* ============================================================================
+ * 【文件导读】bgp_attr.c —— BGP 路径属性的“解析(解码) / 编码 / 共享”中枢
+ * ============================================================================
+ * 职责与定位：
+ *   BGP UPDATE 报文由“路径属性(Path Attributes) + NLRI”两部分组成，属性决定一条
+ *   路由的全部语义(AS_PATH、NEXT_HOP、MED、LOCAL_PREF、团体、MP_REACH…)。本文件
+ *   与 bgp_attr.h(数据模型)、bgp_packet.c(报文收发)配合，负责三件事：
+ *     1) 接收方向：把线格式的路径属性字节流“解析”进 struct attr
+ *        (bgp_attr_parse 及各 bgp_attr_* 解析函数)，并按 RFC4271/RFC7606 处理错误。
+ *     2) 发送方向：把 struct attr“编码”成属性字节流(bgp_packet_attribute、
+ *        bgp_packet_mpattr_start 等)，交给 bgp_packet.c 写入报文。
+ *     3) 属性共享(interning)：海量路由的属性高度重复，用哈希表去重，靠 refcnt 管理
+ *        生命周期(见“属性主哈希表”与“属性共享”两段)。
+ *
+ * 关键路径：
+ *   - 调用方：bgp_packet.c 的 bgp_update_receive() 解析收到属性时调用 bgp_attr_parse()；
+ *     发送路由时调用 bgp_packet_attribute() 及其子函数。
+ *   - 被调用：各解析/编码函数内部调用 aspath_*、community_*、ecommunity_*、
+ *     lcommunity_* 等模块。
+ *
+ * 两个最重要的概念(务必先建立)：
+ *   1) struct attr 是“一条路径全部属性”的聚合，被 bgp_path_info->attr 引用。flag
+ *      位图记录“本次出现了哪些属性”，ATTR_FLAG_BIT(id) 把属性号映射成位。读写指针
+ *      成员务必用 bgp_attr_set_ / bgp_attr_get_ 系列函数，以保持 flag 与内容一致。
+ *   2) 属性共享(intern)：内容相同的 attr 在哈希表 attrhash 中只保留一份，多个
+ *      path_info 共享同一指针并靠 refcnt 计数。被 intern 的 attr 必须只读；要改先复制。
+ *      bgp_attr_intern()/bgp_attr_unintern() 是进入/离开共享表的入口。
+ *
+ * 关键函数清单(建议阅读顺序)：
+ *   1) bgp_attr_parse          —— 接收侧总入口：逐属性循环、分派、错误处理
+ *   2) bgp_attr_check          —— 校验必备的 well-known 属性是否齐全
+ *   3) bgp_attr_origin/aspath/nexthop/... —— 各属性的单属性解析器
+ *   4) bgp_mp_reach_parse / bgp_mp_unreach_parse —— MP-BGP 的 NLRI 解析
+ *   5) bgp_attr_intern / bgp_attr_unintern / bgp_attr_flush —— 属性共享生命周期
+ *   6) bgp_packet_attribute    —— 发送侧总入口：把 attr 编码成字节流
+ *   7) bgp_packet_mpattr_start/prefix/end —— MP_REACH 属性编码
+ *   8) bgp_dump_routes_attr    —— 把路由属性导出(供 dump/MRT 等)
+ *
+ * 建议阅读顺序：
+ *   先看“属性主哈希表 / 属性共享”段理解 refcnt 与哈希模型 → 再看 bgp_attr_parse
+ *   把握解析主循环 → 逐个属性解析器 → 最后看编码侧与 init/finish。
+ * ============================================================================
+ */
+/* ========== 1. 头文件包含与日志用属性名表 ========== */
 
 #include <zebra.h>
 
@@ -46,6 +90,8 @@
 #include "bgp_flowspec_private.h"
 #include "bgp_mac.h"
 
+/* attr_str：把属性类型码(BGP_ATTR_*)映射成可读字符串，供 lookup_msg()/日志打印。
+ * 顺序与 RFC 中属性号一致，仅用于显示，不参与协议逻辑判断。 */
 /* Attribute strings for logging. */
 static const struct message attr_str[] = {
 	{BGP_ATTR_ORIGIN, "ORIGIN"},
@@ -76,6 +122,8 @@ static const struct message attr_str[] = {
 	{BGP_ATTR_NHC, "Next Hop Dependent Characteristics"},
 	{0}};
 
+/* attr_flag_str：属性标志位(Optional/Transitive/Partial/Extended Length)的可读名。
+ * 注意：bgp_attr_flags_diagnose() 依赖 EXTLEN 这一项排在列表最后(见下面英文注释)。 */
 static const struct message attr_flag_str[] = {
 	{BGP_ATTR_FLAG_OPTIONAL, "Optional"},
 	{BGP_ATTR_FLAG_TRANS, "Transitive"},
@@ -85,8 +133,14 @@ static const struct message attr_flag_str[] = {
 	{BGP_ATTR_FLAG_EXTLEN, "Extended Length"},
 	{0}};
 
+/* ========== 2. cluster_list（路由反射器集群列表）共享 ========== */
+/* cluster_hash：全局共享哈希表，“集群列表内容 -> 唯一 cluster_list”。
+ * cluster_list 表示路由反射(RR)场景 CLUSTER_LIST 属性里的一串 IPv4 地址。
+ * 与其它 intern 表一样，内容相同的列表只保留一份，靠 refcnt 计数复用。 */
 static struct hash *cluster_hash;
 
+/* 哈希表插入新 key 时若未命中，则调用本函数分配“堆上的副本”。
+ * 参数 p 是调用方在栈上临时构造的 cluster_list(仅填了 length/list)，返回深拷贝。 */
 static void *cluster_hash_alloc(void *p)
 {
 	const struct cluster_list *val = (const struct cluster_list *)p;
@@ -106,6 +160,10 @@ static void *cluster_hash_alloc(void *p)
 	return cluster;
 }
 
+/* cluster_parse：从线上原始字节解析 CLUSTER_LIST 属性。
+ * pnt 指向地址数组首字节，length 是字节数(=地址个数*4)。
+ * 内部构造临时 tmp 交给 cluster_hash 去重，命中则复用并 refcnt++，返回共享对象。
+ * 调用时机：解析 CLUSTER_LIST 属性(见 bgp_attr_cluster_list)。 */
 /* Cluster list related functions. */
 static struct cluster_list *cluster_parse(struct in_addr *pnt, int length)
 {
@@ -120,6 +178,9 @@ static struct cluster_list *cluster_parse(struct in_addr *pnt, int length)
 	return cluster;
 }
 
+/* cluster_loop_check：检查 originator 是否已出现在 cluster 列表中，用于 RR 环路检测。
+ * 路由反射器在把路由反射给客户端前，会先检查自己的 router-id 是否已在 CLUSTER_LIST 中，
+ * 以避免反射环路。返回 true 表示检测到环路。 */
 bool cluster_loop_check(struct cluster_list *cluster, struct in_addr originator)
 {
 	int i;
@@ -130,6 +191,7 @@ bool cluster_loop_check(struct cluster_list *cluster, struct in_addr originator)
 	return false;
 }
 
+/* cluster_hash_key_make：对地址串做 jhash，得到哈希桶键。 */
 static unsigned int cluster_hash_key_make(const void *p)
 {
 	const struct cluster_list *cluster = p;
@@ -137,6 +199,8 @@ static unsigned int cluster_hash_key_make(const void *p)
 	return jhash(cluster->list, cluster->length, 0);
 }
 
+/* cluster_hash_cmp：判定两个 cluster_list 内容是否相同(长度相等且逐字节一致)。
+ * 任何一方 list 为空(NULL)且非同一指针时视为不同。 */
 static bool cluster_hash_cmp(const void *p1, const void *p2)
 {
 	const struct cluster_list *cluster1 = p1;
@@ -154,12 +218,15 @@ static bool cluster_hash_cmp(const void *p1, const void *p2)
 	return (memcmp(cluster1->list, cluster2->list, cluster1->length) == 0);
 }
 
+/* cluster_free：释放 cluster_list 及其内部的地址数组。 */
 static void cluster_free(struct cluster_list *cluster)
 {
 	XFREE(MTYPE_CLUSTER_VAL, cluster->list);
 	XFREE(MTYPE_CLUSTER, cluster);
 }
 
+/* cluster_intern：把 cluster 加入共享表。若表中已有相同内容，释放传入对象并复用，
+ * 最终对命中的共享对象 refcnt++。返回共享对象。 */
 static struct cluster_list *cluster_intern(struct cluster_list *cluster)
 {
 	struct cluster_list *find;
@@ -172,6 +239,8 @@ static struct cluster_list *cluster_intern(struct cluster_list *cluster)
 	return find;
 }
 
+/* cluster_unintern：refcnt--，归零则从共享表移除并释放，并把调用方指针置 NULL。
+ * 传入的是二级指针，便于置空调用方的引用。 */
 static void cluster_unintern(struct cluster_list **cluster)
 {
 	if (!*cluster)
@@ -188,17 +257,25 @@ static void cluster_unintern(struct cluster_list **cluster)
 	}
 }
 
+/* cluster_init/cluster_finish：进程启动时建表、退出时清空销毁(见 bgp_attr_init/finish)。 */
 static void cluster_init(void)
 {
 	cluster_hash = hash_create(cluster_hash_key_make, cluster_hash_cmp,
 				   "BGP Cluster");
 }
 
+/* cluster_finish：清空并释放整张 cluster 表(进程退出时调用)。 */
 static void cluster_finish(void)
 {
 	hash_clean_and_free(&cluster_hash, (void (*)(void *))cluster_free);
 }
 
+/* ========== 3. Encap / VNC 子 TLV 共享 ========== */
+/* encap_hash：BGP_ATTR_ENCAP(Tunnel Encap，RFC5512) 子 TLV 链表的共享哈希表。
+ * vnc_hash：ENABLE_BGP_VNC 时的 VNC 属性子 TLV 共享表(格式类似)。
+ * srv6_l3service_hash / srv6_vpn_hash：SRv6 Service TLV 的共享表(见第 6 段)。
+ * evpn_overlay_hash：EVPN overlay 信息(网关 IP 等)的共享表。
+ * bgp_nhc_hash：NHC(Next Hop Dependent Characteristics)属性的共享表。 */
 static struct hash *encap_hash = NULL;
 #ifdef ENABLE_BGP_VNC
 static struct hash *vnc_hash = NULL;
@@ -208,6 +285,8 @@ static struct hash *srv6_vpn_hash;
 static struct hash *evpn_overlay_hash;
 static struct hash *bgp_nhc_hash;
 
+/* encap_tlv_dup：深拷贝一条子 TLV 链表(逐节点 XCALLOC + memcpy)。
+ * 参数 orig 为源链表头，返回新链表头。每个节点是“定长头部 + value[0] 柔性数组”。 */
 struct bgp_attr_encap_subtlv *encap_tlv_dup(struct bgp_attr_encap_subtlv *orig)
 {
 	struct bgp_attr_encap_subtlv *new;
@@ -230,6 +309,7 @@ struct bgp_attr_encap_subtlv *encap_tlv_dup(struct bgp_attr_encap_subtlv *orig)
 	return new;
 }
 
+/* encap_free：释放整条子 TLV 链表。 */
 static void encap_free(struct bgp_attr_encap_subtlv *p)
 {
 	struct bgp_attr_encap_subtlv *next;
@@ -241,6 +321,8 @@ static void encap_free(struct bgp_attr_encap_subtlv *p)
 	}
 }
 
+/* bgp_attr_flush_encap：清空 attr 上的 encap(以及可选 VNC)子 TLV 链表并置 NULL。
+ * 用于解析失败/丢弃属性时回收未 intern 的临时 encap 数据。 */
 void bgp_attr_flush_encap(struct attr *attr)
 {
 	if (!attr)
@@ -269,6 +351,9 @@ void bgp_attr_flush_encap(struct attr *attr)
  *
  * This algorithm could be made faster if needed
  */
+/* encap_same：判断两条 encap 子 TLV 链表是否“等价”(顺序无关)。
+ * 双向遍历：先确认 h1 的每个元素都能在 h2 找到，再反过来。
+ * 返回 true=等价，false=不等价。算法为 O(n^2)，如需可优化。 */
 static bool encap_same(const struct bgp_attr_encap_subtlv *h1,
 		       const struct bgp_attr_encap_subtlv *h2)
 {
@@ -307,12 +392,15 @@ static bool encap_same(const struct bgp_attr_encap_subtlv *h1,
 	return true;
 }
 
+/* encap_hash_alloc：encap 结构在插入前已分配好，直接返回自身作为共享对象(不做拷贝)。 */
 static void *encap_hash_alloc(void *p)
 {
 	/* Encap structure is already allocated.  */
 	return p;
 }
 
+/* encap_subtlv_type：区分同一套共享逻辑用于哪种属性——ENCAP 还是(可选的)VNC 属性。
+ * VNC 子 TLV 使用独立的 vnc_hash 表。 */
 typedef enum {
 	ENCAP_SUBTLV_TYPE,
 #ifdef ENABLE_BGP_VNC
@@ -320,6 +408,8 @@ typedef enum {
 #endif
 } encap_subtlv_type;
 
+/* encap_intern：把 encap 子 TLV 链表加入共享表(按 type 选择 encap_hash/vnc_hash)。
+ * 命中则释放传入对象并复用；返回共享对象，refcnt++。 */
 static struct bgp_attr_encap_subtlv *
 encap_intern(struct bgp_attr_encap_subtlv *encap, encap_subtlv_type type)
 {
@@ -338,6 +428,7 @@ encap_intern(struct bgp_attr_encap_subtlv *encap, encap_subtlv_type type)
 	return find;
 }
 
+/* encap_unintern：refcnt--，归零则从对应共享表移除并释放，并置空调用方指针。 */
 static void encap_unintern(struct bgp_attr_encap_subtlv **encapp,
 			   encap_subtlv_type type)
 {
@@ -361,6 +452,7 @@ static void encap_unintern(struct bgp_attr_encap_subtlv **encapp,
 	}
 }
 
+/* encap_hash_key_make：对子 TLV 的 value 做 jhash 作为桶键。 */
 static unsigned int encap_hash_key_make(const void *p)
 {
 	const struct bgp_attr_encap_subtlv *encap = p;
@@ -368,12 +460,14 @@ static unsigned int encap_hash_key_make(const void *p)
 	return jhash(encap->value, encap->length, 0);
 }
 
+/* encap_hash_cmp：以 encap_same 判定两条子 TLV 链表是否等价。 */
 static bool encap_hash_cmp(const void *p1, const void *p2)
 {
 	return encap_same((const struct bgp_attr_encap_subtlv *)p1,
 			  (const struct bgp_attr_encap_subtlv *)p2);
 }
 
+/* encap_init/encap_finish：建/销毁 encap(及 VNC)子 TLV 共享表。 */
 static void encap_init(void)
 {
 	encap_hash = hash_create(encap_hash_key_make, encap_hash_cmp,
@@ -384,6 +478,7 @@ static void encap_init(void)
 #endif
 }
 
+/* encap_finish：清空并释放 encap(及 VNC)共享表。 */
 static void encap_finish(void)
 {
 	hash_clean_and_free(&encap_hash, (void (*)(void *))encap_free);
@@ -392,6 +487,8 @@ static void encap_finish(void)
 #endif
 }
 
+/* overlay_index_same：比较两个 attr 的 EVPN overlay 信息是否相同(用于属性去重比较)。
+ * 全空视为相同；一空一非空视为不同。 */
 static bool overlay_index_same(const struct attr *a1, const struct attr *a2)
 {
 	if (!a1 && a2)
@@ -405,21 +502,27 @@ static bool overlay_index_same(const struct attr *a1, const struct attr *a2)
 				   bgp_attr_get_evpn_overlay(a2));
 }
 
+/* ========== 4. 未知传递属性（transit）共享 ========== */
+/* transit：保存“可选+传递”但本机不认识的属性原始字节，以便继续向下游转发。
+ * 语义见 RFC4271 §5：不认识的传递属性必须原样携带(并在转发时置 PARTIAL 位)。 */
 /* Unknown transit attribute. */
 static struct hash *transit_hash;
 
+/* transit_free：释放 transit 的原始字节缓冲区及其结构体。 */
 static void transit_free(struct transit *transit)
 {
 	XFREE(MTYPE_TRANSIT_VAL, transit->val);
 	XFREE(MTYPE_TRANSIT, transit);
 }
 
+/* transit_hash_alloc：transit 对象在插入前已分配好，直接返回自身(共享)。 */
 static void *transit_hash_alloc(void *p)
 {
 	/* Transit structure is already allocated.  */
 	return p;
 }
 
+/* transit_intern：把 transit 加入共享表(按字节内容去重)，命中则复用，返回共享对象。 */
 static struct transit *transit_intern(struct transit *transit)
 {
 	struct transit *find;
@@ -432,6 +535,7 @@ static struct transit *transit_intern(struct transit *transit)
 	return find;
 }
 
+/* transit_unintern：refcnt--，归零则从共享表移除并释放，并置空调用方指针。 */
 static void transit_unintern(struct transit **transit)
 {
 	if (!*transit)
@@ -447,6 +551,11 @@ static void transit_unintern(struct transit **transit)
 	}
 }
 
+/* ========== 5. AIGP 辅助与带标签前缀编码 ========== */
+/* bgp_attr_aigp_get_tlv_metric：从 AIGP 属性(RFC7311)中提取 Metric TLV 的值。
+ * AIGP 属性由若干 TLV 组成，按 type/length 逐段前进；遇 BGP_AIGP_TLV_METRIC 时
+ * 读取 8 字节(64 位)metric 到 *aigp。若其值为 0xffff...ffff(最大)则视为格式错误
+ * 返回 false(RFC7311 明文规定)。pnt=属性值首字节，length=属性值字节数。 */
 static bool bgp_attr_aigp_get_tlv_metric(uint8_t *pnt, int length,
 					 uint64_t *aigp)
 {
@@ -487,6 +596,8 @@ static bool bgp_attr_aigp_get_tlv_metric(uint8_t *pnt, int length,
 	return false;
 }
 
+/* stream_put_bgp_aigp_tlv_metric：把 64 位 AIGP metric 编码成 TLV(type,len=11,value)。
+ * 编码侧与上面的解析侧对应。 */
 static void stream_put_bgp_aigp_tlv_metric(struct stream *s, uint64_t aigp)
 {
 	stream_putc(s, BGP_AIGP_TLV_METRIC);
@@ -494,6 +605,12 @@ static void stream_put_bgp_aigp_tlv_metric(struct stream *s, uint64_t aigp)
 	stream_putq(s, aigp);
 }
 
+/* bgp_attr_stream_put_labeled_prefix：把“带可选标签、可选 Add-Path”的 NLRI 前缀
+ * 编码进 stream(RFC3107 / BGP-LU)。用于 SAFI_LABELED_UNICAST 的 NLRI 输出。
+ * 参数：p 前缀；labels/num_labels 标签栈；addpath_capable/addpath_tx_id Add-Path
+ * (RFC7911) 支持时先写 4 字节发送者标识。
+ * 关键点：BGP-LU 的前缀长度字段 = 原前缀长度 + 标签位数；标签总长不得超过 255，
+ * 放不下时会截断并只对最后一个标签置 BOS(栈底)位，写完后恢复原标签。 */
 /* Put NLRI with optional label and optional addpath*/
 int bgp_attr_stream_put_labeled_prefix(struct stream *s, const struct prefix *p,
 				       mpls_label_t *labels, uint8_t num_labels,
@@ -551,6 +668,10 @@ int bgp_attr_stream_put_labeled_prefix(struct stream *s, const struct prefix *p,
 	return stream_write(s, buffer, endp - buffer);
 }
 
+/* bgp_attr_aigp_valid：校验整个 AIGP 属性值的 TLV 结构是否合法。
+ * 检查：属性总长 >= 3；每个 TLV 有足够字节读 type(1)+length(2)；TLV 长度不越界；
+ * Metric TLV(type=BGP_AIGP_TLV_METRIC) 的长度必须恰为 BGP_AIGP_TLV_METRIC_LEN。
+ * 返回 true=结构合法。 */
 static bool bgp_attr_aigp_valid(uint8_t *pnt, int length)
 {
 	uint8_t *data = pnt;
@@ -603,16 +724,22 @@ static bool bgp_attr_aigp_valid(uint8_t *pnt, int length)
 	return true;
 }
 
+/* ========== 6. EVPN overlay / NHC / SRv6 共享表 ========== */
+/* 这些表结构一致，均遵守 intern 模式：hash_alloc 返回“已分配好的对象自身”，
+ * intern 命中则释放传入对象并复用，unintern 递减 refcnt，归零则移除释放。 */
+/* evpn_overlay_hash_alloc：对象已分配，直接返回自身。 */
 static void *evpn_overlay_hash_alloc(void *p)
 {
 	return p;
 }
 
+/* evpn_overlay_free：释放 bgp_route_evpn(overlay 网关信息)结构。 */
 void evpn_overlay_free(struct bgp_route_evpn *bre)
 {
 	XFREE(MTYPE_BGP_EVPN_OVERLAY, bre);
 }
 
+/* evpn_overlay_intern：把 EVPN overlay 信息加入共享表并 refcnt++，返回共享对象。 */
 struct bgp_route_evpn *evpn_overlay_intern(struct bgp_route_evpn *bre)
 {
 	struct bgp_route_evpn *find;
@@ -624,6 +751,7 @@ struct bgp_route_evpn *evpn_overlay_intern(struct bgp_route_evpn *bre)
 	return find;
 }
 
+/* evpn_overlay_unintern：refcnt--，归零则移除释放并置空调用方指针。 */
 static void evpn_overlay_unintern(struct bgp_route_evpn **brep)
 {
 	struct bgp_route_evpn *bre = *brep;
@@ -641,6 +769,7 @@ static void evpn_overlay_unintern(struct bgp_route_evpn **brep)
 	}
 }
 
+/* evpn_overlay_hash_key_make：对网关 IP(按 v4/v6)、类型、以太网段标识做 jhash。 */
 static uint32_t evpn_overlay_hash_key_make(const void *p)
 {
 	const struct bgp_route_evpn *bre = p;
@@ -657,6 +786,7 @@ static uint32_t evpn_overlay_hash_key_make(const void *p)
 	return key;
 }
 
+/* evpn_overlay_hash_cmp：以 bgp_route_evpn_same 判定两个 overlay 是否相同。 */
 static bool evpn_overlay_hash_cmp(const void *p1, const void *p2)
 {
 	const struct bgp_route_evpn *bre1 = p1;
@@ -665,6 +795,7 @@ static bool evpn_overlay_hash_cmp(const void *p1, const void *p2)
 	return bgp_route_evpn_same(bre1, bre2);
 }
 
+/* evpn_overlay_init/evpn_overlay_finish：建/销毁 EVPN overlay 共享表。 */
 static void evpn_overlay_init(void)
 {
 	evpn_overlay_hash = hash_create(evpn_overlay_hash_key_make,
@@ -672,12 +803,15 @@ static void evpn_overlay_init(void)
 					"BGP EVPN Overlay");
 }
 
+/* evpn_overlay_finish：清空并释放 EVPN overlay 共享表。 */
 static void evpn_overlay_finish(void)
 {
 	hash_clean_and_free(&evpn_overlay_hash,
 			    (void (*)(void *))evpn_overlay_free);
 }
 
+/* bgp_nhc_same：判断两个 NHC(Next Hop Dependent Characteristics)结构是否等价。
+ * 先比 afi/safi/next-hop 长度/各 TLV，再对 TLV 链表双向比对(顺序无关)。 */
 static bool bgp_nhc_same(const struct bgp_nhc *nhc1, const struct bgp_nhc *nhc2)
 {
 	const struct bgp_nhc_tlv *p;
@@ -721,11 +855,13 @@ static bool bgp_nhc_same(const struct bgp_nhc *nhc1, const struct bgp_nhc *nhc2)
 	return true;
 }
 
+/* bgp_nhc_hash_alloc：对象已分配，直接返回自身。 */
 static void *bgp_nhc_hash_alloc(void *p)
 {
 	return p;
 }
 
+/* bgp_nhc_intern：把 NHC 加入共享表并 refcnt++，命中则释放传入对象复用。 */
 static struct bgp_nhc *bgp_nhc_intern(struct bgp_nhc *nhc)
 {
 	struct bgp_nhc *find;
@@ -738,6 +874,7 @@ static struct bgp_nhc *bgp_nhc_intern(struct bgp_nhc *nhc)
 	return find;
 }
 
+/* bgp_nhc_unintern：refcnt--，归零则移除释放并置空调用方指针。 */
 static void bgp_nhc_unintern(struct bgp_nhc **nhcp)
 {
 	struct bgp_nhc *nhc = *nhcp;
@@ -755,6 +892,7 @@ static void bgp_nhc_unintern(struct bgp_nhc **nhcp)
 	}
 }
 
+/* bgp_nhc_hash_key_make：对 afi/safi/nh 长度、v4/v6 地址及全部 TLV 做 jhash。 */
 static uint32_t bgp_nhc_hash_key_make(const void *p)
 {
 	const struct bgp_nhc *nhc = p;
@@ -776,6 +914,7 @@ static uint32_t bgp_nhc_hash_key_make(const void *p)
 	return key;
 }
 
+/* bgp_nhc_hash_cmp：以 bgp_nhc_same 判定两个 NHC 是否等价。 */
 static bool bgp_nhc_hash_cmp(const void *p1, const void *p2)
 {
 	const struct bgp_nhc *nhc1 = p1;
@@ -784,27 +923,32 @@ static bool bgp_nhc_hash_cmp(const void *p1, const void *p2)
 	return bgp_nhc_same(nhc1, nhc2);
 }
 
+/* nhc_init：创建 NHC 共享表。 */
 static void nhc_init(void)
 {
 	bgp_nhc_hash = hash_create(bgp_nhc_hash_key_make, bgp_nhc_hash_cmp,
 				   "BGP Next Hop Dependent Characteristics");
 }
 
+/* nhc_finish：清空并释放 NHC 共享表。 */
 static void nhc_finish(void)
 {
 	hash_clean_and_free(&bgp_nhc_hash, (void (*)(void *))bgp_nhc_free);
 }
 
+/* srv6_l3service_hash_alloc：对象已分配，直接返回自身。 */
 static void *srv6_l3service_hash_alloc(void *p)
 {
 	return p;
 }
 
+/* bgp_attr_srv6_l3service_free：释放 SRv6 L3 Service 结构。 */
 void bgp_attr_srv6_l3service_free(struct bgp_attr_srv6_l3service *l3service)
 {
 	XFREE(MTYPE_BGP_SRV6_L3SERVICE, l3service);
 }
 
+/* bgp_attr_srv6_l3service_intern：把 SRv6 L3 Service 加入共享表并 refcnt++。 */
 struct bgp_attr_srv6_l3service *
 bgp_attr_srv6_l3service_intern(struct bgp_attr_srv6_l3service *l3service)
 {
@@ -817,6 +961,7 @@ bgp_attr_srv6_l3service_intern(struct bgp_attr_srv6_l3service *l3service)
 	return find;
 }
 
+/* srv6_l3service_unintern：refcnt--，归零则移除释放并置空调用方指针。 */
 static void srv6_l3service_unintern(struct bgp_attr_srv6_l3service **l3servicep)
 {
 	struct bgp_attr_srv6_l3service *l3service = *l3servicep;
@@ -834,16 +979,19 @@ static void srv6_l3service_unintern(struct bgp_attr_srv6_l3service **l3servicep)
 	}
 }
 
+/* srv6_vpn_hash_alloc：对象已分配，直接返回自身。 */
 static void *srv6_vpn_hash_alloc(void *p)
 {
 	return p;
 }
 
+/* srv6_vpn_free：释放 SRv6 VPN Service 结构。 */
 static void srv6_vpn_free(struct bgp_attr_srv6_vpn *vpn)
 {
 	XFREE(MTYPE_BGP_SRV6_VPN, vpn);
 }
 
+/* srv6_vpn_intern：把 SRv6 VPN Service 加入共享表并 refcnt++。 */
 static struct bgp_attr_srv6_vpn *srv6_vpn_intern(struct bgp_attr_srv6_vpn *vpn)
 {
 	struct bgp_attr_srv6_vpn *find;
@@ -855,6 +1003,7 @@ static struct bgp_attr_srv6_vpn *srv6_vpn_intern(struct bgp_attr_srv6_vpn *vpn)
 	return find;
 }
 
+/* srv6_vpn_unintern：refcnt--，归零则移除释放并置空调用方指针。 */
 static void srv6_vpn_unintern(struct bgp_attr_srv6_vpn **vpnp)
 {
 	struct bgp_attr_srv6_vpn *vpn = *vpnp;
@@ -872,6 +1021,7 @@ static void srv6_vpn_unintern(struct bgp_attr_srv6_vpn **vpnp)
 	}
 }
 
+/* srv6_l3service_hash_key_make：对 SID 及各级长度/行为/偏移做 jhash。 */
 static uint32_t srv6_l3service_hash_key_make(const void *p)
 {
 	const struct bgp_attr_srv6_l3service *l3service = p;
@@ -885,6 +1035,7 @@ static uint32_t srv6_l3service_hash_key_make(const void *p)
 	return key;
 }
 
+/* srv6_l3service_hash_cmp：逐字段比较两个 SRv6 L3 Service 是否相同。 */
 static bool srv6_l3service_hash_cmp(const void *p1, const void *p2)
 {
 	const struct bgp_attr_srv6_l3service *l3service1 = p1;
@@ -901,6 +1052,7 @@ static bool srv6_l3service_hash_cmp(const void *p1, const void *p2)
 	       l3service1->transposition_offset == l3service2->transposition_offset;
 }
 
+/* srv6_l3service_same：同一指针或均非空且哈希比较相等则视为 same。 */
 static bool srv6_l3service_same(const struct bgp_attr_srv6_l3service *h1,
 				const struct bgp_attr_srv6_l3service *h2)
 {
@@ -912,6 +1064,7 @@ static bool srv6_l3service_same(const struct bgp_attr_srv6_l3service *h1,
 		return srv6_l3service_hash_cmp((const void *)h1, (const void *)h2);
 }
 
+/* srv6_vpn_hash_key_make：对 VPN SID 及 sid_flags 做 jhash。 */
 static unsigned int srv6_vpn_hash_key_make(const void *p)
 {
 	const struct bgp_attr_srv6_vpn *vpn = p;
@@ -922,6 +1075,7 @@ static unsigned int srv6_vpn_hash_key_make(const void *p)
 	return key;
 }
 
+/* srv6_vpn_hash_cmp：比较 SID 与 sid_flags。 */
 static bool srv6_vpn_hash_cmp(const void *p1, const void *p2)
 {
 	const struct bgp_attr_srv6_vpn *vpn1 = p1;
@@ -931,6 +1085,7 @@ static bool srv6_vpn_hash_cmp(const void *p1, const void *p2)
 	       && vpn1->sid_flags == vpn2->sid_flags;
 }
 
+/* srv6_vpn_same：同一指针或均非空且哈希比较相等则视为 same。 */
 static bool srv6_vpn_same(const struct bgp_attr_srv6_vpn *h1,
 			  const struct bgp_attr_srv6_vpn *h2)
 {
@@ -942,6 +1097,7 @@ static bool srv6_vpn_same(const struct bgp_attr_srv6_vpn *h1,
 		return srv6_vpn_hash_cmp((const void *)h1, (const void *)h2);
 }
 
+/* srv6_init/srv6_finish：建/销毁 SRv6 L3 Service 与 VPN Service 两张共享表。 */
 static void srv6_init(void)
 {
 	srv6_l3service_hash = hash_create(srv6_l3service_hash_key_make, srv6_l3service_hash_cmp,
@@ -950,12 +1106,14 @@ static void srv6_init(void)
 				    "BGP Prefix-SID SRv6-VPN-Service-TLV");
 }
 
+/* srv6_finish：清空并释放 SRv6 两张共享表。 */
 static void srv6_finish(void)
 {
 	hash_clean_and_free(&srv6_l3service_hash, (void (*)(void *))bgp_attr_srv6_l3service_free);
 	hash_clean_and_free(&srv6_vpn_hash, (void (*)(void *))srv6_vpn_free);
 }
 
+/* transit_hash_key_make：对未知传递属性的原始字节做 jhash。 */
 static unsigned int transit_hash_key_make(const void *p)
 {
 	const struct transit *transit = p;
@@ -963,6 +1121,7 @@ static unsigned int transit_hash_key_make(const void *p)
 	return jhash(transit->val, transit->length, 0);
 }
 
+/* transit_hash_cmp：长度相同且逐字节一致则相等。 */
 static bool transit_hash_cmp(const void *p1, const void *p2)
 {
 	const struct transit *transit1 = p1;
@@ -972,37 +1131,54 @@ static bool transit_hash_cmp(const void *p1, const void *p2)
 		&& memcmp(transit1->val, transit2->val, transit1->length) == 0);
 }
 
+/* transit_init/transit_finish：建/销毁未知传递属性共享表。 */
 static void transit_init(void)
 {
 	transit_hash = hash_create(transit_hash_key_make, transit_hash_cmp,
 				   "BGP Transit Hash");
 }
 
+/* transit_finish：清空并释放未知传递属性共享表。 */
 static void transit_finish(void)
 {
 	hash_clean_and_free(&transit_hash, (void (*)(void *))transit_free);
 }
 
+/* ========== 7. 属性主哈希表 attrhash（属性共享核心） ========== */
+/* attrhash：全局属性表。“内容的哈希 + 逐字段比较”决定 attr 是否重复。
+ * 关键设计：attrhash_key_make/attrhash_cmp 覆盖了 struct attr 里几乎每个字段
+ * (含各子结构指针是否相同、以及会话/团体等内容的比较)。所有子结构在 intern 之后
+ * 都应处于“已共享(interned)状态”，因此比较指针即可判定相等——这是 attrhash_cmp
+ * 大量使用指针比较的原因。 */
 /* Attribute hash routines. */
 static struct hash *attrhash;
 
+/* attr_count/attr_unknown_count：分别返回属性表、未知传递属性表中的条目数，
+ * 供 `show bgp ... summary` 之类统计输出使用。 */
 unsigned long int attr_count(void)
 {
 	return attrhash->count;
 }
 
+/* attr_unknown_count：返回未知传递属性(transit)表中的条目数。 */
 unsigned long int attr_unknown_count(void)
 {
 	return transit_hash->count;
 }
 
+/* attrhash_key_make：计算 struct attr 的哈希键。
+ * 把“定长标量字段”用 MIX/MIX3 混入，把“指针/内容字段”(aspath、各类团体、cluster、
+ * transit、encap 等，以及 IPv6 nexthop、rmac 等)也一并混入，保证“内容相同 => 键相同”。
+ * 该函数是 attrhash 能否正确去重的关键，新增 struct attr 字段时必须同步更新。 */
 unsigned int attrhash_key_make(const void *p)
 {
 	const struct attr *attr = (struct attr *)p;
 	uint32_t key = 0;
+/* MIX/MIX3：把 1 个/3 个 32 位字混入累积键 key(就地更新，无需返回值)。 */
 #define MIX(val)	key = jhash_1word(val, key)
 #define MIX3(a, b, c)	key = jhash_3words((a), (b), (c), key)
 
+	/* 先混入 origin / IPv4 nexthop / MED 三个核心标量。 */
 	MIX3(attr->origin, attr->nexthop.s_addr, attr->med);
 	MIX3(attr->local_pref, attr->aggregator_as,
 	     attr->aggregator_addr.s_addr);
@@ -1052,6 +1228,10 @@ unsigned int attrhash_key_make(const void *p)
 	return key;
 }
 
+/* attrhash_cmp：判定两条 attr 是否逻辑相等(哈希命中后的精确比较)。
+ * 由于各子结构均已 intern，可直接用指针相等来比较 aspath/团体/cluster/transit 等；
+ * 但部分内容(如 encap 子 TLV、EVPN overlay、SRv6、NHC、MP nexthop 地址、rmac 等)
+ * 需要逐字节/逐字段比较。它是“属性去重”正确性的最后一道关。 */
 bool attrhash_cmp(const void *p1, const void *p2)
 {
 	const struct attr *attr1 = p1;
@@ -1104,6 +1284,7 @@ bool attrhash_cmp(const void *p1, const void *p2)
 	return false;
 }
 
+/* attrhash_init/attrhash_finish：建/销毁属性主哈希表。 */
 static void attrhash_init(void)
 {
 	attrhash =
@@ -1113,16 +1294,20 @@ static void attrhash_init(void)
 /*
  * special for hash_clean below
  */
+/* attr_vfree：hash_clean 回调，释放单个 attr 结构(不触发子结构 unintern)。 */
 static void attr_vfree(void *attr)
 {
 	XFREE(MTYPE_ATTR, attr);
 }
 
+/* attrhash_finish：进程退出时清空并释放属性主表。 */
 static void attrhash_finish(void)
 {
 	hash_clean_and_free(&attrhash, attr_vfree);
 }
 
+/* attr_show_all_iterator：遍历 attrhash 的回调。args[] 传 vty/计数器数组/summary 标志。
+ * summary 模式只统计每种属性的出现次数；否则逐条打印 attr 详情。 */
 static void attr_show_all_iterator(struct hash_bucket *bucket, void *args[])
 {
 	struct attr *attr = bucket->data;
@@ -1134,6 +1319,7 @@ static void attr_show_all_iterator(struct hash_bucket *bucket, void *args[])
 	bool summary = *(bool *)args[2];
 	unsigned int i;
 
+	/* 统计本 attr 上出现了哪些属性：flag 的第 (i-1) 位对应属性号 i。 */
 	for (i = 1; i <= BGP_ATTR_MAX; i++) {
 		if (CHECK_FLAG(attr->flag, 1ULL << (i - 1)))
 			counters[i]++;
@@ -1174,6 +1360,8 @@ static void attr_show_all_iterator(struct hash_bucket *bucket, void *args[])
 	}
 }
 
+/* attr_show_all：`show bgp attr-info` 的实现。先遍历打印/统计，再(在 summary 模式)
+ * 汇总每种属性的总数。 */
 void attr_show_all(struct vty *vty, bool summary)
 {
 	unsigned int i;
@@ -1205,6 +1393,13 @@ void attr_show_all(struct vty *vty, bool summary)
 	}
 }
 
+/* bgp_attr_hash_alloc：attrhash 未命中时，为新 key 分配一份“堆上的 attr 副本”。
+ * 注意这里做的是“浅拷贝”之后再把部分字段处理干净：
+ *   - refcnt 清零(共享表中每个 attr 独立计引用)；
+ *   - attr_intern_reuse 缓存清空；
+ *   - encap_subtlvs(及可选的 VNC 子 TLV)从源对象“摘走”(置 NULL)，避免双重释放，
+ *     因为子 TLV 的 intern 由调用方负责。
+ * 返回可放入哈希表的 attr。 */
 static void *bgp_attr_hash_alloc(void *p)
 {
 	struct attr *val = (struct attr *)p;
@@ -1228,6 +1423,16 @@ static void *bgp_attr_hash_alloc(void *p)
 	return attr;
 }
 
+/* ========== 8. 属性共享：intern / unintern / flush ========== */
+/* bgp_attr_intern：把一条路径的全部属性“共享化”。
+ * 步骤：
+ *   1) 先对每个子结构(aspath/团体/大团体/cluster/transit/encap/EVPN/SRv6/NHC…)做
+ *      intern：若其 refcnt 为 0 则加入各自的共享表，否则直接 refcnt++(说明已是共享对象)。
+ *   2) 再把处理后的 attr 本身放进 attrhash 去重：命中则复用共享 attr 并 refcnt++；
+ *      未命中则通过 bgp_attr_hash_alloc 新建一份。
+ *   3) attr_intern_reuse 是“解析结果未变时可复用上次 intern 结果”的缓存(见下方注释)。
+ * 返回值：指向共享 attr 的新引用(调用方拿到的是“已 +1 的引用”，用完后须 unintern)。
+ * 调用时机：解析完一个 UPDATE 的属性和生成聚合/network 属性时。 */
 /* Internet argument attribute. */
 struct attr *bgp_attr_intern(struct attr *attr)
 {
@@ -1361,6 +1566,9 @@ struct attr *bgp_attr_intern(struct attr *attr)
 	 * If the incoming attr equals the original parsed attr, reuse the
 	 * cached attr. Otherwise, do new intern and populate the cache.
 	 */
+	/* 复用缓存：若调用方设置了 anchor(自身的 parsed_attr)，且本次 attr 与该 anchor
+	 * 完全相同(说明解析后未发生任何属性改动)，则直接复用上次缓存的 interned 引用，
+	 * 避免重复查表/新建。命中后同样 refcnt++ 返回新引用。 */
 	if (reuse_anchor && reuse_anchor->attr_intern_reuse.valid &&
 	    reuse_anchor->attr_intern_reuse.parsed_attr &&
 	    reuse_anchor->attr_intern_reuse.parsed_attr ==
@@ -1382,6 +1590,9 @@ struct attr *bgp_attr_intern(struct attr *attr)
 	return find;
 }
 
+/* bgp_attr_default_set：构造 network 命令产生的静态路由的默认属性。
+ * 清零后设置 origin、空 AS_PATH、默认 weight、无效标签、NEXT_HOP、默认 local-pref。
+ * 注意：这里只是设置“未 intern 的临时 attr”，随后需 bgp_attr_intern。 */
 /* Make network statement's attribute. */
 struct attr *bgp_attr_default_set(struct attr *attr, struct bgp *bgp,
 				  uint8_t origin)
@@ -1403,6 +1614,10 @@ struct attr *bgp_attr_default_set(struct attr *attr, struct bgp *bgp,
 	return attr;
 }
 
+/* bgp_attr_aggregate_intern：为聚合路由(aggregate-address)构造并 intern 属性。
+ * 依据 atomic_aggregate / aggregate->as_set 决定是否置 ATOMIC_AGGREGATE；总是设置
+ * AGGREGATOR(联盟时用 confed_id 作 AS)。若配置了 route-map，则先 apply 再 intern。
+ * 返回 NULL 表示 route-map 拒绝(显式不生成该聚合)。 */
 /* Create the attributes for an aggregate */
 struct attr *bgp_attr_aggregate_intern(
 	struct bgp *bgp, uint8_t origin, struct aspath *aspath,
@@ -1523,6 +1738,8 @@ struct attr *bgp_attr_aggregate_intern(
 	return new;
 }
 
+/* bgp_attr_unintern_sub：只对 attr 的“子结构”做 unintern(不处理 attr 本身)。
+ * 先取出各子指针(避免 unintern 把它们置空后丢失)，逐个 unintern 并写回 NULL/setter。 */
 /* Unintern just the sub-components of the attr, but not the attr */
 void bgp_attr_unintern_sub(struct attr *attr)
 {
@@ -1585,6 +1802,9 @@ void bgp_attr_unintern_sub(struct attr *attr)
 	bgp_attr_set_evpn_overlay(attr, NULL);
 }
 
+/* bgp_attr_unintern_clear_reuse：先清理 anchor 的复用缓存，再 unintern。
+ * 若缓存里记录的 interned 正好是即将 unintern 的 attr，则该缓存已失效必须清空，
+ * 否则后续可能复用到已释放对象。 */
 /* Clear cached intern_attr if it points to the attr that is being uninterned */
 void bgp_attr_unintern_clear_reuse(struct attr *parsed_attr, struct attr **p)
 {
@@ -1596,6 +1816,9 @@ void bgp_attr_unintern_clear_reuse(struct attr *parsed_attr, struct attr **p)
 	bgp_attr_unintern(p);
 }
 
+/* bgp_attr_unintern：释放对共享 attr 的一个引用。
+ * refcnt-- 后若归零，则从 attrhash 移除并释放 attr 本体；无论归零与否，都要把
+ * attr 的各子结构 unintern(用局部 tmp 快照，因为 unintern 会把指针置空)。 */
 /* Free bgp attribute and aspath. */
 void bgp_attr_unintern(struct attr **pattr)
 {
@@ -1619,6 +1842,9 @@ void bgp_attr_unintern(struct attr **pattr)
 	bgp_attr_unintern_sub(&tmp);
 }
 
+/* bgp_attr_flush：释放一个“尚未 intern(或 intern 失败)”的临时 attr 上的子结构。
+ * 与 unintern_sub 的区别：这里只释放 refcnt==0 的子结构(即未被共享的临时对象)，
+ * 已被共享(refcnt>0)的不能在此释放。用于解析失败/中途丢弃时回收临时内存。 */
 void bgp_attr_flush(struct attr *attr)
 {
 	struct ecommunity *ecomm;
@@ -1699,6 +1925,15 @@ void bgp_attr_flush(struct attr *attr)
 	}
 }
 
+/* ========== 9. 属性解析总控与错误处理 ========== */
+/* bgp_attr_malformed：统一的“属性非法”处理入口(RFC7606 错误处理)。
+ * 根据属性类型与 flag，决定采用三种处理方式之一：
+ *   - BGP_ATTR_PARSE_ERROR          : 发 NOTIFY 并(由上层)重置会话/关闭 AFI-SAFI；
+ *   - BGP_ATTR_PARSE_WITHDRAW       : treat-as-withdraw(把该 UPDATE 当作撤消处理，不断会话)；
+ *   - BGP_ATTR_PARSE_PROCEED        : 忽略该属性，其余照常处理。
+ * 参数：args 携带连接/属性/flag/起止指针；subcode 是 NOTIFY 的 Error Subcode；
+ * length>0 时把起始数据带入 NOTIFY 的 Data 字段。
+ * 关键点：MP_REACH/MP_UNREACH 一旦长度错就无法定位 NLRI，必须走“会话重置/AFI 禁用”。 */
 /* Implement draft-scudder-idr-optional-transitive behaviour and
  * avoid resetting sessions for malformed attributes which are
  * are partial/optional and hence where the error likely was not
@@ -1716,6 +1951,7 @@ bgp_attr_malformed(struct bgp_attr_parser_args *args, uint8_t subcode,
 	 * send the attribute data with the NOTIFY depends on the error,
 	 * the caller therefore signals this with the separate length argument
 	 */
+	/* length>0 表示要随 NOTIFY 发送属性原始数据(便于对端定位问题)；否则发 NULL。 */
 	uint8_t *notify_datap = (length > 0 ? args->startp : NULL);
 
 	/* Only do expensive string formatting if debug or trace is enabled. */
@@ -1754,6 +1990,8 @@ bgp_attr_malformed(struct bgp_attr_parser_args *args, uint8_t subcode,
 	 * the whole session to be reset. Instead treat it as a withdrawal
 	 * of the routes, if possible.
 	 */
+	/* 可选+传递+Partial 的属性出错，多半是中转设备引入的问题而非直连邻居，
+	 * 按 draft-scudder 的宽松策略只做 treat-as-withdraw，不重置整个会话。 */
 	if (CHECK_FLAG(flags, BGP_ATTR_FLAG_TRANS) &&
 	    CHECK_FLAG(flags, BGP_ATTR_FLAG_OPTIONAL) &&
 	    CHECK_FLAG(flags, BGP_ATTR_FLAG_PARTIAL))
@@ -1817,6 +2055,8 @@ bgp_attr_malformed(struct bgp_attr_parser_args *args, uint8_t subcode,
    Extended Length. Checking O/T/P bits at once implies, that the attribute
    being diagnosed is defined by RFC as either a "well-known" or an "optional,
    non-transitive" attribute. */
+/* bgp_attr_flags_diagnose：比较“实际 flag”与“RFC 期望 flag”，把不一致的 O/T/P 位
+ * 逐个打印出来。desired_flags 是 RFC 规定的应有标志。只诊断不修改，供日志排查。 */
 static void
 bgp_attr_flags_diagnose(struct bgp_attr_parser_args *args,
 			uint8_t desired_flags /* how RFC says it must be */
@@ -1848,6 +2088,8 @@ bgp_attr_flags_diagnose(struct bgp_attr_parser_args *args,
 	}
 }
 
+/* attr_flags_values：每种属性“按 RFC 规定应有的标志位”。校验时 EXTLEN 位会被忽略，
+ * 对“可选+传递”属性 PARTIAL 位也会被忽略(因为中转可能置过)。 */
 /* Required flags for attributes. EXTLEN will be masked off when testing,
  * as will PARTIAL for optional+transitive attributes.
  */
@@ -1881,6 +2123,10 @@ const uint8_t attr_flags_values[] = {
 };
 static const size_t attr_flags_values_max = array_size(attr_flags_values) - 1;
 
+/* bgp_attr_flag_invalid：校验属性的 O/T/P 标志位是否合法(RFC4271 §4.3 / §6.3)。
+ * 规则：well-known 必须置 Transitive；well-known 与非传递可选不得置 Partial。
+ * 若邻居配置了 path-attribute discard/treat-as-withdraw 则跳过校验(交由后处理)。
+ * 返回 true 表示“标志非法”，调用方据此发 Attribute Flags Error。 */
 static bool bgp_attr_flag_invalid(struct bgp_attr_parser_args *args)
 {
 	uint8_t mask = BGP_ATTR_FLAG_EXTLEN;
@@ -1950,6 +2196,13 @@ static bool bgp_attr_flag_invalid(struct bgp_attr_parser_args *args)
 	return true;
 }
 
+/* ========== 10. 单属性解析器 ========== */
+/* 本节每个函数解析一种属性，签名统一为 bgp_attr_xxx(struct bgp_attr_parser_args*)，
+ * 从 connection->curr 流中读取属性值写入 args->attr，并设置对应的 flag 位。
+ * 出错时普遍调用 bgp_attr_malformed() 统一处理(见第 9 段)。
+ * 返回枚举 bgp_attr_parse_ret：PROCEED 正常 / WITHDRAW treat-as-withdraw / ERROR 出错。 */
+/* bgp_attr_origin：解析 ORIGIN(RFC4271 §4.3)。长度须为 1，取值须为 IGP/EGP/INCOMPLETE。
+ * 触发时机：收到带 ORIGIN 属性的 UPDATE。 */
 /* Get origin attribute of the update message. */
 static enum bgp_attr_parse_ret
 bgp_attr_origin(struct bgp_attr_parser_args *args)
@@ -1990,6 +2243,10 @@ bgp_attr_origin(struct bgp_attr_parser_args *args)
 	return 0;
 }
 
+/* bgp_attr_aspath：解析 AS_PATH(RFC4271 §4.3 / RFC6793)。是对 aspath_parse 的封装。
+ * 关键点：是否按 4 字节 AS 解析，取决于本端与对端是否都具备 AS4(PEER_CAP_AS4_RCV/ADV)。
+ * IBGP 场景 length 可能为 0(空 path 合法)。若开启 reject-as-sets 且含 AS_SET/AS_CONFED_SET
+ * 则按 RFC7606 treat-as-withdraw。 */
 /* Parse AS path information.  This function is wrapper of
    aspath_parse. */
 static int bgp_attr_aspath(struct bgp_attr_parser_args *args)
@@ -2042,6 +2299,9 @@ static int bgp_attr_aspath(struct bgp_attr_parser_args *args)
 	return BGP_ATTR_PARSE_PROCEED;
 }
 
+/* bgp_attr_aspath_check：AS_PATH 的“语义”检查，延迟到 AS_PATH 与 AS4_PATH 合成之后做。
+ * 检查项：联盟(AS_CONFED_*)一致性、EBGP 的 first-as(enforce-first-as)、AS 号 0
+ * (Codification of AS 0 Processing)、以及 local-as 的 prepend。返回 WITHDRAW 表示丢弃该路由。 */
 static enum bgp_attr_parse_ret bgp_attr_aspath_check(struct peer *const peer,
 						     struct attr *const attr)
 {
@@ -2104,6 +2364,9 @@ static enum bgp_attr_parse_ret bgp_attr_aspath_check(struct peer *const peer,
 	return BGP_ATTR_PARSE_PROCEED;
 }
 
+/* bgp_attr_as4_path：解析 AS4_PATH(RFC6793)。对 aspath_parse 的又一层封装，
+ * 固定按 4 字节 AS 解析(因为该属性本身就是 4 字节 AS 的载体)。
+ * as4_path 通过二级指针回传给 bgp_attr_parse，供后续合成 AS_PATH。 */
 /* Parse AS4 path information.  This function is another wrapper of
    aspath_parse. */
 static int bgp_attr_as4_path(struct bgp_attr_parser_args *args,
@@ -2153,6 +2416,9 @@ static int bgp_attr_as4_path(struct bgp_attr_parser_args *args,
 /*
  * Check that the nexthop attribute is valid.
  */
+/* bgp_attr_nexthop_valid：语义校验 NEXT_HOP——若为 martian 地址(非法/保留)且未允许
+ * (bgp->allow_martian)，发 Invalid NEXT_HOP 的 NOTIFY 并回 ERROR。
+ * 注意：这是“语义错误”，RFC4271 允许发 NOTIFY；而语法错误在 bgp_attr_nexthop 处理。 */
 enum bgp_attr_parse_ret bgp_attr_nexthop_valid(struct peer *peer,
 					       struct attr *attr)
 {
@@ -2177,6 +2443,8 @@ enum bgp_attr_parse_ret bgp_attr_nexthop_valid(struct peer *peer,
 	return BGP_ATTR_PARSE_PROCEED;
 }
 
+/* bgp_attr_nexthop：解析 NEXT_HOP(RFC4271 §4.3)，长度必须为 4 字节的 IPv4。
+ * 语法长度错误走 Attribute Length Error。 */
 /* Nexthop attribute. */
 static enum bgp_attr_parse_ret
 bgp_attr_nexthop(struct bgp_attr_parser_args *args)
@@ -2200,6 +2468,8 @@ bgp_attr_nexthop(struct bgp_attr_parser_args *args)
 	return BGP_ATTR_PARSE_PROCEED;
 }
 
+/* bgp_attr_med：解析 MULTI_EXIT_DISC(MED，RFC4271 §4.3)，长度必须为 4。
+ * MED 是可选非传递属性，用于向相邻 AS 提示入口点的优劣。 */
 /* MED attribute. */
 static enum bgp_attr_parse_ret bgp_attr_med(struct bgp_attr_parser_args *args)
 {
@@ -2221,6 +2491,9 @@ static enum bgp_attr_parse_ret bgp_attr_med(struct bgp_attr_parser_args *args)
 	return BGP_ATTR_PARSE_PROCEED;
 }
 
+/* bgp_attr_local_pref：解析 LOCAL_PREF(RFC4271 §4.3)。
+ * 语义：IBGP(或 EBGP-OAD)收到的 LOCAL_PREF 长度不为 4 视为 malformed(treat-as-withdraw)；
+ * 从 EBGP 收到时该属性必须被忽略(直接跳过 length 字节)。 */
 /* Local preference attribute. */
 static enum bgp_attr_parse_ret
 bgp_attr_local_pref(struct bgp_attr_parser_args *args)
@@ -2264,6 +2537,8 @@ stream_failure:
 				  args->total);
 }
 
+/* bgp_attr_atomic：解析 ATOMIC_AGGREGATE(RFC4271 §4.3)，长度必须为 0(仅是个标志)。
+ * 若配置了 discard/withdraw 则按 bgp_attr_ignore 处理。 */
 /* Atomic aggregate. */
 static int bgp_attr_atomic(struct bgp_attr_parser_args *args)
 {
@@ -2295,6 +2570,8 @@ atomic_ignore:
 	return bgp_attr_ignore(peer, args->type);
 }
 
+/* bgp_attr_aggregator：解析 AGGREGATOR(RFC4271 §4.3)。长度 6(2 字节 AS) 或
+ * 8(4 字节 AS，双方都支持 AS4 时)。AS 号为 0 视为异常(记录但不置 flag)。 */
 /* Aggregator attribute */
 static int bgp_attr_aggregator(struct bgp_attr_parser_args *args)
 {
@@ -2355,6 +2632,8 @@ aggregator_ignore:
 	return bgp_attr_ignore(peer, args->type);
 }
 
+/* bgp_attr_as4_aggregator：解析 AS4_AGGREGATOR(RFC6793)，长度固定 8 字节(4 字节 AS+4 字节 addr)。
+ * 结果通过二级/指针参数回传给 bgp_attr_parse，用于与 AS4_PATH 一起合成。 */
 /* New Aggregator attribute */
 static enum bgp_attr_parse_ret
 bgp_attr_as4_aggregator(struct bgp_attr_parser_args *args,
@@ -2407,6 +2686,11 @@ as4_aggregator_ignore:
 	return bgp_attr_ignore(peer, args->type);
 }
 
+/* bgp_attr_munge_as4_attrs：为 16 位 AS 邻居合成 AS_PATH/AGGREGATOR(RFC6793)。
+ * 规则(按 RFC6793 §4.2.3)：
+ *   - 对端支持 AS4：直接忽略它发来的 AS4_PATH/AS4_AGGREGATOR(它不应发)；
+ *   - 否则：若 AGGREGATOR 的 AS != AS_TRANS 则忽略 AS4_* ；否则用 AS4_AGGREGATOR 覆盖；
+ *     并用 aspath_reconcile_as4 把 AS_PATH 与 AS4_PATH 合成出真实的 AS_PATH。 */
 /* Munge Aggregator and New-Aggregator, AS_PATH and NEW_AS_PATH.
  */
 static enum bgp_attr_parse_ret
@@ -2513,6 +2797,8 @@ bgp_attr_munge_as4_attrs(struct peer *const peer, struct attr *const attr,
 	return BGP_ATTR_PARSE_PROCEED;
 }
 
+/* bgp_attr_community：解析 COMMUNITY(RFC1997)。长度必须为非零的 4 的倍数，否则 malformed。
+ * 用 community_parse 解析为共享的 community 对象；解析后手工前移读指针(历史遗留)。 */
 /* Community attribute. */
 static enum bgp_attr_parse_ret
 bgp_attr_community(struct bgp_attr_parser_args *args)
@@ -2552,6 +2838,8 @@ community_ignore:
 	return bgp_attr_ignore(peer, args->type);
 }
 
+/* bgp_attr_originator_id：解析 ORIGINATOR_ID(RFC4456，路由反射用)。
+ * 语义：从 EBGP 收到须丢弃；从 IBGP 收到长度须为 4，否则 treat-as-withdraw。 */
 /* Originator ID attribute. */
 static enum bgp_attr_parse_ret
 bgp_attr_originator_id(struct bgp_attr_parser_args *args)
@@ -2598,6 +2886,9 @@ originator_id_ignore:
 	return bgp_attr_ignore(peer, args->type);
 }
 
+/* bgp_attr_cluster_list：解析 CLUSTER_LIST(RFC4456，路由反射用)。
+ * 语义：从 EBGP 收到须丢弃；从 IBGP 收到长度须为非零的 4 的倍数，否则 treat-as-withdraw。
+ * 解析结果经 cluster_parse 进入集群列表共享表。 */
 /* Cluster list attribute. */
 static enum bgp_attr_parse_ret
 bgp_attr_cluster_list(struct bgp_attr_parser_args *args)
@@ -2645,6 +2936,8 @@ cluster_list_ignore:
 	return bgp_attr_ignore(peer, args->type);
 }
 
+/* bgp_attr_get_color：取出 SR-TE 的 color 值：优先本地配置的 srte_color，
+ * 否则从 ecommunity 中按 RFC5512 的 Color 扩展团体选取。无则返回 0。 */
 /* get locally configure or received srte-color value*/
 uint32_t bgp_attr_get_color(struct attr *attr)
 {
@@ -2655,6 +2948,12 @@ uint32_t bgp_attr_get_color(struct attr *attr)
 	return 0;
 }
 
+/* ========== 11. MP-BGP：MP_REACH_NLRI / MP_UNREACH_NLRI 解析 ========== */
+/* bgp_mp_reach_parse：解析 MP_REACH_NLRI(RFC4760)，承载非 IPv4-unicast 的 NLRI 及其 next-hop。
+ * 结构：AFI(2)+SAFI(1)+next-hop 长度(1)+next-hop(N)+SNPA(1，已废弃)+NLRI。
+ * 依据 mp_nexthop_len 的取值(4/12/16/24/32/40)决定 next-hop 的布局，并处理 VPN(RD)、
+ * link-local 等情形。NLRI 部分仅记录指针与长度(mp_update)，真正的解码在 bgp_update_receive。
+ * 关键点：报文中 AFI/SAFI 是 IANA 编号，须用 bgp_map_afi_safi_iana2int 转成内部枚举。 */
 /* Multiprotocol reachability information parse. */
 int bgp_mp_reach_parse(struct bgp_attr_parser_args *args,
 		       struct bgp_nlri *mp_update)
@@ -2678,6 +2977,7 @@ int bgp_mp_reach_parse(struct bgp_attr_parser_args *args,
 /* safe to read statically sized header? */
 #define BGP_MP_REACH_MIN_SIZE 5
 #define LEN_LEFT	(length - (stream_get_getp(s) - start))
+	/* 先做边界校验：属性长度既不能超过流中可读字节，也不能小于最小长度 5。 */
 	if ((length > STREAM_READABLE(s)) || (length < BGP_MP_REACH_MIN_SIZE)) {
 		zlog_info("%s: %s sent invalid length, %lu, of MP_REACH_NLRI",
 			  __func__, peer->host, (unsigned long)length);
@@ -2715,6 +3015,8 @@ int bgp_mp_reach_parse(struct bgp_attr_parser_args *args,
 		return BGP_ATTR_PARSE_ERROR_NOTIFYPLS;
 	}
 
+	/* 依据 next-hop 长度选择布局：4=IPv4；12=VPNv4(RD+v4)；16=IPv6；24/32=IPv6 全球+链路本地；
+	 * 40=VPNv6 全球+链路本地(VPN 情形会先跳过 RD)。flowspec 允许长度 0。 */
 	/* Nexthop length check. */
 	switch (attr->mp_nexthop_len) {
 	case 0:
@@ -2868,6 +3170,7 @@ int bgp_mp_reach_parse(struct bgp_attr_parser_args *args,
 				peer->host, val);
 	}
 
+	/* 属性剩余部分即为 NLRI。记为 mp_update 的指针+长度，交由上层解析。 */
 	/* must have nrli_len, what is left of the attribute */
 	nlri_len = LEN_LEFT;
 	if (nlri_len > STREAM_READABLE(s)) {
@@ -2898,6 +3201,9 @@ int bgp_mp_reach_parse(struct bgp_attr_parser_args *args,
 #undef LEN_LEFT
 }
 
+/* bgp_mp_unreach_parse：解析 MP_UNREACH_NLRI(RFC4760)，即 MP-BGP 的撤消。
+ * 结构最简单：AFI(2)+SAFI(1)+待撤消的 NLRI(剩余全部)。同样记录指针+长度到 mp_withdraw。
+ * 返回 PROCEED；AFI/SAFI 无法映射或长度越界则 ERROR。 */
 /* Multiprotocol unreachable parse */
 int bgp_mp_unreach_parse(struct bgp_attr_parser_args *args,
 			 struct bgp_nlri *mp_withdraw)
@@ -2953,6 +3259,9 @@ int bgp_mp_unreach_parse(struct bgp_attr_parser_args *args,
 	return BGP_ATTR_PARSE_PROCEED;
 }
 
+/* ========== 12. 单属性解析器（下） ========== */
+/* bgp_attr_large_community：解析 LARGE_COMMUNITY(RFC8092，每个 12 字节)。
+ * 长度为零视为 malformed；用 lcommunity_parse 解析为共享对象。 */
 /* Large Community attribute. */
 static enum bgp_attr_parse_ret
 bgp_attr_large_community(struct bgp_attr_parser_args *args)
@@ -2991,6 +3300,9 @@ large_community_ignore:
 	return bgp_attr_ignore(peer, args->type);
 }
 
+/* bgp_attr_ext_communities：解析 EXTENDED_COMMUNITIES(RFC4360，每个 8 字节)。
+ * 除常规解析外，还从中提取 EVPN 相关字段：DF 选举偏好、MAC 移动序号、默认网关、
+ * NA 标志(R 位)、Router MAC、隧道类型(Encap 扩展团体)、链路带宽等。 */
 /* Extended Community attribute. */
 static enum bgp_attr_parse_ret
 bgp_attr_ext_communities(struct bgp_attr_parser_args *args)
@@ -3064,6 +3376,8 @@ bgp_attr_ext_communities(struct bgp_attr_parser_args *args)
 	return BGP_ATTR_PARSE_PROCEED;
 }
 
+/* bgp_attr_ipv6_ext_communities：解析 IPv6 Extended Communities(RFC5701，每个 20 字节)。
+ * 长度为零视为 malformed；同时用于提取链路带宽。 */
 /* IPv6 Extended Community attribute. */
 static enum bgp_attr_parse_ret
 bgp_attr_ipv6_ext_communities(struct bgp_attr_parser_args *args)
@@ -3105,6 +3419,10 @@ ipv6_ext_community_ignore:
 	return bgp_attr_ignore(peer, args->type);
 }
 
+/* bgp_attr_encap：解析 Tunnel Encap 属性(RFC5512)。结构为“外层 T+L(隧道类型+总长)
+ * + 若干子 TLV”。当类型为 ENCAP 时先读外层 TLV；每个子 TLV 按 subtype 高低位决定
+ * length 宽度(1 或 2 字节)。解析出的子 TLV 挂到 attr->encap_subtlvs 链表。
+ * 注意：本函数同时服务于 ENCAP 与 VNC(ENABLE_BGP_VNC)两种属性。 */
 /* Parse Tunnel Encap attribute in an UPDATE */
 static int bgp_attr_encap(struct bgp_attr_parser_args *args)
 {
@@ -3286,6 +3604,9 @@ encap_ignore:
 /* SRv6 Service Data Sub-Sub-TLV attribute
  * draft-ietf-bess-srv6-services-07
  */
+/* bgp_attr_srv6_service_data：解析 SRv6 Service Data 的 Sub-Sub-TLV(SID Structure)。
+ * 读出 loc_block/node/function/arg/transposition 各段长度并写入 attr->srv6_l3service。
+ * 前置条件：attr->srv6_l3service 已由 bgp_attr_srv6_service 分配。 */
 static enum bgp_attr_parse_ret
 bgp_attr_srv6_service_data(struct bgp_attr_parser_args *args)
 {
@@ -3367,6 +3688,10 @@ bgp_attr_srv6_service_data(struct bgp_attr_parser_args *args)
 /* SRv6 Service Sub-TLV attribute
  * draft-ietf-bess-srv6-services-07
  */
+/* bgp_attr_srv6_service：解析 SRv6 Service Sub-TLV(SID Information)。
+ * 读出 SID、sid_flags、endpoint_behavior，分配并填充 attr->srv6_l3service；
+ * 若该子 TLV 后面还有 Sub-Sub-TLV(长度大于固定部分)，继续调用 srv6_service_data。
+ * 重复出现同一 L3 Service 视为 malformed。 */
 static enum bgp_attr_parse_ret
 bgp_attr_srv6_service(struct bgp_attr_parser_args *args)
 {
@@ -3467,6 +3792,14 @@ bgp_attr_srv6_service(struct bgp_attr_parser_args *args)
 	return BGP_ATTR_PARSE_PROCEED;
 }
 
+/* bgp_attr_psid_sub：解析 Prefix-SID 属性里的单个子 TLV(draft-ietf-idr-bgp-prefix-sid)。
+ * 按 type 分派：
+ *   - LABEL_INDEX          : 记录 label_index(供 IPv4/6 LU 使用)；
+ *   - IPV6                 : 读取 IPv6 SID(仅解析不存储)；
+ *   - ORIGINATOR_SRGB      : 解析并跳过 SRGB 列表(2 字节 flag + N*6 字节 SRGB)；
+ *   - VPN_SID              : 解析并 intern attr->srv6_vpn；
+ *   - SRV6_L3_SERVICE      : 转发到 bgp_attr_srv6_service。
+ * 其它 type 跳过。返回解析结果。 */
 /*
  * Read an individual SID value returning how much data we have read
  * Returns 0 if there was an error that needs to be passed up the stack
@@ -3646,6 +3979,9 @@ bgp_attr_psid_sub(uint8_t type, uint16_t length,
 	return BGP_ATTR_PARSE_PROCEED;
 }
 
+/* bgp_attr_prefix_sid：解析 Prefix-SID 属性总入口(draft-ietf-idr-bgp-prefix-sid)。
+ * 循环读取各子 TLV(type 1 字节 + length 2 字节)并交给 bgp_attr_psid_sub；
+ * 维护已解析长度 psid_parsed_length，防止 TLV 溢出属性边界。 */
 /* Prefix SID attribute
  * draft-ietf-idr-bgp-prefix-sid-05
  */
@@ -3714,6 +4050,8 @@ prefix_sid_ignore:
 	return bgp_attr_ignore(peer, args->type);
 }
 
+/* bgp_attr_pmsi_tunnel：解析 PMSI_TUNNEL 属性(RFC6514，MVPN/EVPN)。这里做基本校验：
+ * 长度下限(2+3)、隧道类型合法、Ingress Replication 类型长度须为 9，并读取 3 字节 label/VNI。 */
 /* PMSI tunnel attribute (RFC 6514)
  * Basic validation checks done here.
  */
@@ -3773,6 +4111,9 @@ pmsi_tunnel_ignore:
 	return bgp_attr_ignore(peer, args->type);
 }
 
+/* bgp_attr_aigp：解析 AIGP 属性(RFC7311)。
+ * 语义：在未启用 AIGP 的 EBGP(非 OAD)会话上，AIGP 必须“当作不认识的非传递属性”静默忽略；
+ * 通过校验后提取 Metric TLV 写入 attr->aigp_metric。 */
 /* AIGP attribute (rfc7311) */
 static enum bgp_attr_parse_ret bgp_attr_aigp(struct bgp_attr_parser_args *args)
 {
@@ -3817,6 +4158,11 @@ aigp_ignore:
 	return bgp_attr_ignore(peer, args->type);
 }
 
+/* bgp_attr_nhc：解析 NHC(Next Hop Dependent Characteristics，draft-ietf-idr-nhc)。
+ * 结构：AFI(2)+SAFI(1)+Next-hop 长度(1)+Next-hop(N)+若干 TLV(每 TLV: code 2+len 2+value)。
+ * 校验 AFI/SAFI、next-hop 长度(4 或 16)、各 TLV 边界；对 NNHN/BGPID 等 TLV 做专门校验；
+ * 若为 link-local next-hop 且缺少必需的 BGPID TLV 则判为 malformed。
+ * 结果 intern 进 attr->nhc。 */
 static int bgp_attr_nhc(struct bgp_attr_parser_args *args)
 {
 	struct peer_connection *const connection = args->connection;
@@ -4032,6 +4378,8 @@ nhc_ignore:
 	return bgp_attr_ignore(peer, type);
 }
 
+/* bgp_attr_otc：解析 OTC(Only-To-Customer)属性(RFC9234，用于防路由泄露)。长度须为 4，
+ * 且值不能为 0。 */
 /* OTC attribute. */
 static enum bgp_attr_parse_ret bgp_attr_otc(struct bgp_attr_parser_args *args)
 {
@@ -4068,6 +4416,12 @@ otc_ignore:
 	return bgp_attr_ignore(peer, args->type);
 }
 
+/* bgp_attr_unknown：处理“本机不认识”的属性(RFC4271 §6.3 / §5)。
+ *   - 非可选(well-known 但未识别)          => Unrecognized Well-known Attribute(报错)；
+ *   - 可选且非传递                          => 静默忽略，不转发；
+ *   - 可选且传递                            => 置 PARTIAL 位，把原始字节追加到 attr->transit，
+ *                                              以便原样向下游转发。
+ * 另外受 path-attribute discard/withdraw 配置影响。 */
 /* BGP unknown attribute treatment. */
 static enum bgp_attr_parse_ret
 bgp_attr_unknown(struct bgp_attr_parser_args *args)
@@ -4130,6 +4484,12 @@ bgp_attr_unknown(struct bgp_attr_parser_args *args)
 	return BGP_ATTR_PARSE_PROCEED;
 }
 
+/* ========== 13. 属性解析主循环与必备属性校验 ========== */
+/* bgp_attr_check：校验“必备的 well-known 属性”是否齐全。
+ * 规则：ORIGIN、AS_PATH 必须存在；NEXT_HOP 在无 MP_REACH_NLRI 时必须存在；
+ * IBGP 的 LOCAL_PREF 必须存在。缺任一则 treat-as-withdraw(RFC7606)。
+ * 特例：仅含 MP_UNREACH_NLRI 的 UPDATE(撤消)不要求其它属性。
+ * 另一特例：GR 的 End-of-RIB(空 UPDATE)直接 treat-as-withdraw，避免被当作普通 UPDATE。 */
 /* Well-known attribute check. */
 static int bgp_attr_check(struct peer *peer, struct attr *attr,
 			  bgp_size_t length)
@@ -4184,6 +4544,18 @@ static int bgp_attr_check(struct peer *peer, struct attr *attr,
 	return BGP_ATTR_PARSE_PROCEED;
 }
 
+/* bgp_attr_parse：接收侧属性解析“总入口”。由 bgp_packet.c 的 bgp_update_receive() 调用。
+ * 流程：
+ *   1) 初始化 seen 位图(用于检测重复属性)；
+ *   2) 循环取出每个属性：先校验剩余长度足够放属性头、解析 flag/type/length；
+ *      再检查是否重复、标志位是否合法(bgp_attr_flag_invalid)；
+ *   3) 按 type 分派到对应的 bgp_attr_xxx 解析函数；
+ *   4) 根据返回码统一处理(PROCEED/WITHDRAW/ERROR，含发 NOTIFY)；
+ *   5) 循环结束后校验必备属性(bgp_attr_check)、NEXT_HOP、AS4 合成(bgp_attr_munge_as4_attrs)
+ *      与 AS_PATH 语义检查(bgp_attr_aspath_check)。
+ * 参数：size 是“总属性长度(Total Path Attribute Length)”；attr 为输出；mp_update/mp_withdraw
+ * 用于回传 MP_REACH/MP_UNREACH 中的 NLRI。
+ * 返回：见 enum bgp_attr_parse_ret。 */
 /* Read attribute of update packet.  This function is called from
    bgp_update_receive() in bgp_packet.c.  */
 enum bgp_attr_parse_ret bgp_attr_parse(struct peer *peer, struct attr *attr,
@@ -4213,6 +4585,7 @@ enum bgp_attr_parse_ret bgp_attr_parse(struct peer *peer, struct attr *attr,
 	/* End pointer of BGP attribute. */
 	endp = BGP_INPUT_PNT(connection) + size;
 
+	/* 逐属性循环，直到读完整个属性区(以 endp 为界)。 */
 	/* Get attributes to the end of attribute length. */
 	while (BGP_INPUT_PNT(connection) < endp) {
 		startp = BGP_INPUT_PNT(connection);
@@ -4255,6 +4628,8 @@ enum bgp_attr_parse_ret bgp_attr_parse(struct peer *peer, struct attr *attr,
 		 * unused. They MUST be zero when sent and MUST be ignored when
 		 * received.
 		 */
+		/* 属性头：1 字节 flag + 1 字节 type。用 0xF0 掩掉低 4 位(RFC4271 规定发送时必须为 0、
+		 * 接收时忽略)。 */
 		flag = CHECK_FLAG(0xF0, stream_getc(BGP_INPUT(connection)));
 		type = stream_getc(BGP_INPUT(connection));
 
@@ -4313,6 +4688,8 @@ enum bgp_attr_parse_ret bgp_attr_parse(struct peer *peer, struct attr *attr,
 		 * other than the first occurrence is discarded. (RFC7606 3g)
 		 */
 
+		/* 重复属性检测(RFC7606 §3g)：MP_REACH/MP_UNREACH 重复 => Malformed Attribute List；
+		 * 其它属性重复则丢弃后出现的那个(仅对 eBGP 宽松处理)。 */
 		if (CHECK_BITMAP(seen, type)) {
 			/* Only relax error handling for eBGP peers */
 			if (peer->sort != BGP_PEER_EBGP ||
@@ -4373,6 +4750,8 @@ enum bgp_attr_parse_ret bgp_attr_parse(struct peer *peer, struct attr *attr,
 			goto done;
 		}
 
+		/* 按属性类型分派到各自的解析器。attr_args 汇总本次属性的连接/长度/起止指针，
+		 * 一路传给解析函数与错误处理。 */
 		/* OK check attribute and store it's value. */
 		switch (type) {
 		case BGP_ATTR_ORIGIN:
@@ -4595,6 +4974,8 @@ done:
 	aspath_unintern(&as4_path);
 
 	transit = bgp_attr_get_transit(attr);
+	/* 解析成功(PROCEED)时，把未知传递属性(transit)与 encap 子 TLV intern 进共享表；
+	 * 否则释放这些未 intern 的临时数据。 */
 	/* If we received an UPDATE with mandatory attributes, then
 	 * the unrecognized transitive optional attribute of that
 	 * path MUST be passed. Otherwise, it's an error, and from
@@ -4643,6 +5024,9 @@ done:
 	return ret;
 }
 
+/* ========== 14. 属性编码（发送侧） ========== */
+/* bgp_attr_extcom_tunnel_type：从(扩展)团体里提取隧道类型写回 *tunnel_type。
+ * 用于 EVPN/MPLS 场景判断如何封装。第一个匹配到的即返回。 */
 /*
  * Extract the tunnel type from extended community
  */
@@ -4667,6 +5051,11 @@ void bgp_attr_extcom_tunnel_type(struct attr *attr,
 	return;
 }
 
+/* bgp_packet_mpattr_start：开始编码 MP_REACH_NLRI 属性的“前缀部分”。
+ * 写入属性头(OPTIONAL|EXTLEN、type)，预留 2 字节属性长度(返回其位置 sizep，稍后由
+ * bgp_packet_mpattr_end 回填)，写 AFI/SAFI、next-hop(按 nh_afi 与 safi 选择布局)、SNPA(0)。
+ * vecarr 用于记录 next-hop 在流中的位置，供后续按 peer 做“隐式 next-hop self”改写。
+ * 返回：属性长度字段的写入位置。 */
 size_t bgp_packet_mpattr_start(struct stream *s, struct peer *peer, afi_t afi,
 			       safi_t safi, struct bpacket_attr_vec_arr *vecarr,
 			       struct attr *attr)
@@ -4807,6 +5196,10 @@ size_t bgp_packet_mpattr_start(struct stream *s, struct peer *peer, afi_t afi,
 	return sizep;
 }
 
+/* bgp_packet_nhc：编码 NHC 属性(draft-ietf-idr-entropy-label / nhc)。
+ * 仅当存在 multipath(>=2 条等价路径)或 attr 已带 NHC 时才发送。
+ * 写入属性头、AFI/SAFI、next-hop，然后写 NNHN TLV(携带本机与各 multipath 下一跳的
+ * BGP ID)以及 attr 中已存在的其它 TLV；最后回填属性长度。 */
 static void bgp_packet_nhc(struct stream *s, struct peer *peer, afi_t afi, safi_t safi,
 			   struct attr *attr, struct bgp_path_info *bpi)
 {
@@ -4902,6 +5295,10 @@ static void bgp_packet_nhc(struct stream *s, struct peer *peer, afi_t afi, safi_
 	stream_putc_at(s, sizep, (stream_get_endp(s) - sizep) - 1);
 }
 
+/* bgp_packet_mpattr_prefix：编码一条 MP-BGP 的 NLRI(前缀)。
+ * 按 SAFI 分派：VPN 写 label+RD+前缀；EVPN 交给 bgp_evpn_encode_prefix；LU 走带标签前缀；
+ * flowspec 写 flowspec 前缀；普通 unicast/multicast 走带可选 Add-Path 的前缀编码。
+ * 若支持 Add-Path(RFC7911)，开头先写 4 字节 addpath_tx_id。 */
 void bgp_packet_mpattr_prefix(struct stream *s, afi_t afi, safi_t safi,
 			      const struct prefix *p,
 			      const struct prefix_rd *prd, mpls_label_t *label,
@@ -4952,6 +5349,8 @@ void bgp_packet_mpattr_prefix(struct stream *s, afi_t afi, safi_t safi,
 	}
 }
 
+/* bgp_packet_mpattr_prefix_size：预估一条 MP-BGP NLRI 的编码字节数(用于预留空间)。
+ * VPN 额外 +88(位)；LU 固定按最大 32 字节；EVPN 按 +232；flowspec 取其 prefixlen。 */
 size_t bgp_packet_mpattr_prefix_size(afi_t afi, safi_t safi,
 				     const struct prefix *p)
 {
@@ -4993,6 +5392,9 @@ size_t bgp_packet_mpattr_prefix_size(afi_t afi, safi_t safi,
 	return size;
 }
 
+/* bgp_packet_mpattr_tea：编码 Tunnel Encap(以及可选 VNC)属性。
+ * attrtype 决定是 ENCAP 还是 VNC。先按子 TLV 总长决定用 1 字节还是 2 字节长度字段，
+ * ENCAP 还要写外层 T+L(隧道类型+长度)，然后逐个写子 TLV。总长超过 0xffff 则放弃发送。 */
 /*
  * Encodes the tunnel encapsulation attribute,
  * and with ENABLE_BGP_VNC the VNC attribute which uses
@@ -5090,6 +5492,8 @@ static void bgp_packet_mpattr_tea(struct bgp *bgp, struct peer *peer,
 	}
 }
 
+/* bgp_packet_mpattr_end：回填 MP_REACH 属性的长度字段(= 当前末尾 - 长度字段位置 - 2，
+ * 减 2 是因为长度字段本身占 2 字节)。 */
 void bgp_packet_mpattr_end(struct stream *s, size_t sizep)
 {
 	/* Set MP attribute length. Don't count the (2) bytes used to encode
@@ -5097,6 +5501,9 @@ void bgp_packet_mpattr_end(struct stream *s, size_t sizep)
 	stream_putw_at(s, sizep, (stream_get_endp(s) - sizep) - 2);
 }
 
+/* bgp_append_local_as：判断“local-as”是否应被附加到出向 AS_PATH。
+ * 私有 AS 且配置了 remove-private-as(任意变体)时，不改写本地 AS(由 remove 逻辑处理)，
+ * 否则需要附加。返回 true 表示应附加。 */
 static bool bgp_append_local_as(struct peer *peer, afi_t afi, safi_t safi)
 {
 	if (!BGP_AS_IS_PRIVATE(peer->local_as)
@@ -5113,6 +5520,8 @@ static bool bgp_append_local_as(struct peer *peer, afi_t afi, safi_t safi)
 	return false;
 }
 
+/* bgp_packet_ecommunity_attribute：编码一个扩展团体属性(EXT_COMMUNITIES 或
+ * IPV6_EXT_COMMUNITIES)。当总字节数 > 255 时使用 2 字节长度(EXTLEN)，否则 1 字节。 */
 static void bgp_packet_ecommunity_attribute(struct stream *s, struct peer *peer,
 					    struct ecommunity *ecomm, int attribute)
 {
@@ -5132,6 +5541,11 @@ static void bgp_packet_ecommunity_attribute(struct stream *s, struct peer *peer,
 	stream_put(s, ecomm->val, ecomm->size * ecomm->unit_size);
 }
 
+/* bgp_packet_attribute：出向 UPDATE 报文“路径属性”编码总入口(发送侧核心)。
+ * 依次编码 ORIGIN / AS_PATH(含 local-as、4 字节 ASN 处理、AS4_PATH 合成) / NEXT_HOP /
+ * MED / LOCAL_PREF / ATOMIC_AGGREGATE / AGGREGATOR / COMMUNITY / ORIGINATOR_ID /
+ * CLUSTER_LIST / 扩展团体 / MP 属性等。返回值 = 本属性段总字节数(供 bgp_update_packet
+ * 回填 UPDATE 长度)。use32bit 依据对端 AS4 能力决定是否用 4 字节 ASN(RFC6793)。 */
 /* Make attribute packet. */
 bgp_size_t bgp_packet_attribute(struct bgp *bgp, struct peer *peer, struct stream *s,
 				struct attr *attr, struct bpacket_attr_vec_arr *vecarr,
@@ -5639,6 +6053,8 @@ bgp_size_t bgp_packet_attribute(struct bgp *bgp, struct peer *peer, struct strea
 	return stream_get_endp(s) - cp;
 }
 
+/* bgp_packet_mpunreach_start：开始编码 MP_UNREACH_NLRI 属性(撤销)。
+ * 总是用 2 字节长度(置 EXTLEN)，写 AFI/SAFI，返回长度字段位置供 _end 回填。 */
 size_t bgp_packet_mpunreach_start(struct stream *s, afi_t afi, safi_t safi)
 {
 	unsigned long attrlen_pnt;
@@ -5661,6 +6077,8 @@ size_t bgp_packet_mpunreach_start(struct stream *s, afi_t afi, safi_t safi)
 	return attrlen_pnt;
 }
 
+/* bgp_packet_mpunreach_prefix：向 MP_UNREACH 写一条待撤销的 NLRI。
+ * 对 LU/MPLS-VPN，RFC3107 约定撤销时不指定标签，一律用兼容值 0x800000(即 wlabel)。 */
 void bgp_packet_mpunreach_prefix(struct stream *s, const struct prefix *p,
 				 afi_t afi, safi_t safi,
 				 const struct prefix_rd *prd,
@@ -5685,11 +6103,15 @@ void bgp_packet_mpunreach_prefix(struct stream *s, const struct prefix *p,
 				 addpath_capable, addpath_tx_id, attr);
 }
 
+/* bgp_packet_mpunreach_end：回填 MP_UNREACH 属性长度(复用 MP_REACH 的回填逻辑)。 */
 void bgp_packet_mpunreach_end(struct stream *s, size_t attrlen_pnt)
 {
 	bgp_packet_mpattr_end(s, attrlen_pnt);
 }
 
+/* ========== 15. 初始化 / 收尾 ========== */
+/* bgp_attr_init：在 bgpd 启动时初始化所有“属性共享哈希表”与相关缓存。
+ * 由 bgp_init() 调用；与 bgp_attr_finish 成对。 */
 /* Initialization of attribute. */
 void bgp_attr_init(void)
 {
@@ -5706,6 +6128,7 @@ void bgp_attr_init(void)
 	nhc_init();
 }
 
+/* bgp_attr_finish：bgpd 退出时释放上述各哈希表；与 bgp_attr_init 一一对应。 */
 void bgp_attr_finish(void)
 {
 	aspath_finish();
@@ -5721,6 +6144,10 @@ void bgp_attr_finish(void)
 	nhc_finish();
 }
 
+/* ========== 16. 路由转储(MRT) / VTY 配置 / 辅助函数 ========== */
+/* bgp_dump_routes_attr：把一条路由的属性按“标准属性块”格式写入流，用于 MRT
+ * TABLE_DUMP 输出。与 bgp_packet_attribute 类似但更精简(不依赖对端能力，含 Add-Path 占位)。
+ * 先在开头写占位长度，编码完所有属性后回填(cp 处)。 */
 /* Make attribute packet. */
 void bgp_dump_routes_attr(struct stream *s, struct bgp_path_info *bpi,
 			  const struct prefix *prefix)
@@ -5910,6 +6337,9 @@ void bgp_dump_routes_attr(struct stream *s, struct bgp_path_info *bpi,
 	stream_putw_at(s, cp, len);
 }
 
+/* bgp_path_attribute_discard_vty：处理 “neighbor ... path-attribute discard <n...>”
+ * 命令，把指定属性号标记为 peer->discard_attrs[](收到即丢弃，RFC7606 attribute-discard)。
+ * 不带属性号时清空全部；set=false 即 no 形式。最终触发软清。 */
 void bgp_path_attribute_discard_vty(struct vty *vty, struct peer *peer,
 				    const char *discard_attrs, bool set)
 {
@@ -5980,6 +6410,9 @@ void bgp_path_attribute_discard_vty(struct vty *vty, struct peer *peer,
 	}
 }
 
+/* bgp_path_attribute_withdraw_vty：处理 “neighbor ... path-attribute treat-as-withdraw <n...>”
+ * 命令，把指定属性号标记为 peer->withdraw_attrs[](收到即整条路由按撤销处理，RFC7606)。
+ * 部分属性不允许被忽略；set=false 即 no 形式。最终触发软清。 */
 void bgp_path_attribute_withdraw_vty(struct vty *vty, struct peer *peer,
 				     const char *withdraw_attrs, bool set)
 {
@@ -6050,6 +6483,10 @@ void bgp_path_attribute_withdraw_vty(struct vty *vty, struct peer *peer,
 	}
 }
 
+/* bgp_attr_ignore：统一的“属性忽略”策略决策点，被各属性解析器的错误分支调用。
+ * 依据该属性在 VTY 里的配置：treat-as-withdraw → 返回 WITHDRAW_IGNORE；
+ * 否则是按 attribute-discard 丢弃(stat_pfx_discard++ 后返回 PROCEED)。
+ * 注意：stat_pfx_withdraw 的累加由 bgp_update_receive() 负责，此处不重复计数。 */
 enum bgp_attr_parse_ret bgp_attr_ignore(struct peer *peer, uint8_t type)
 {
 	bool discard = peer->discard_attrs[type];
@@ -6070,6 +6507,8 @@ enum bgp_attr_parse_ret bgp_attr_ignore(struct peer *peer, uint8_t type)
 	return BGP_ATTR_PARSE_PROCEED;
 }
 
+/* route_matches_soo：判断一条路由是否携带指定的 SoO(Site of Origin，RFC4360 扩展团体)。
+ * 用于 EVPN 中“本地/远端同一站点”的判定(如防环路)。无扩展团体直接返回 false。 */
 bool route_matches_soo(struct bgp_path_info *pi, struct ecommunity *soo)
 {
 	struct attr *attr = pi->attr;

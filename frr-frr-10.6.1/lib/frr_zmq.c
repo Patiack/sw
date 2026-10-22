@@ -12,6 +12,45 @@
  * upon what is happening.  Those assumptions are supposed to be
  * tested in the test_zmq.c
  */
+/*
+ * ============================================================================
+ * frr_zmq.c —— libfrrzmq：ZeroMQ 与 FRR 事件主循环的桥接实现
+ * ============================================================================
+ * 职责：把 libzmq socket 暴露的底层 fd 注册到 libfrr 的事件主循环，并用
+ *   持久化的读 / 写事件回调把 ZMQ 消息分发给上层；同时处理 ZMQ 的边沿
+ *   触发语义（一轮内可能积压多条消息）。接口声明见 frr_zmq.h。
+ *
+ * 核心数据结构 / 全局变量：
+ *   struct frrzmq_cb   每个 ZMQ socket 的绑定容器（含 read / write 两个
+ *                      cb_core），定义在 frr_zmq.h
+ *   frrzmq_context     全局 libzmq context
+ *   frrzmq_initcount   引用计数，控制 context 的创建 / 销毁
+ *
+ * 关键函数：
+ *   frrzmq_init / frrzmq_finish         context 生命周期（引用计数）
+ *   frrzmq_read_msg / frrzmq_write_msg  事件主循环回调，循环排空 ZMQ 事件
+ *   _frrzmq_event_add_read / write      注册读 / 写事件
+ *   frrzmq_thread_cancel                取消绑定
+ *   frrzmq_check_events                 边沿触发下复查 ZMQ_EVENTS 并重排事件
+ *
+ * 与其他模块关系：
+ *   frrevent.h 提供 event / event_add_read 等；memory.h 提供 MTYPE 内存管理；
+ *   本文件与 test_zmq.c 有极脆弱的耦合（见文件头英文说明），改实现须跑
+ *   make check。
+ *
+ * 阅读顺序：
+ *   frrzmq_init / finish -> frrzmq_read_msg -> _frrzmq_event_add_read ->
+ *   frrzmq_write_msg -> _frrzmq_event_add_write -> frrzmq_thread_cancel ->
+ *   frrzmq_check_events。
+ *
+ * 易踩的坑：
+ *   1) cb 指针所有权在“回调内 / 外”不同：回调内取消不释放内存，由回调
+ *      返回前依 cancelled 分支判断；
+ *   2) 事件回调是持久的，回调末尾会重新 event_add_read / write；
+ *   3) ZMQ 为边沿触发，读写后必须调用 frrzmq_check_events 复查。
+ * ============================================================================
+ */
+
 #include <zebra.h>
 #include <zmq.h>
 
@@ -21,14 +60,20 @@
 #include "log.h"
 #include "lib_errors.h"
 
+// 为本编译单元设置 xref 交叉引用支持（与其它 libfrr 文件一致）。
 XREF_SETUP();
 
+// DEFINE_MTYPE_STATIC(LIB, ZEROMQ_CB) —— 分配 struct frrzmq_cb 用的私有内存类型。
 DEFINE_MTYPE_STATIC(LIB, ZEROMQ_CB, "ZeroMQ callback");
 
 /* libzmq's context */
+// frrzmq_context —— 全局 libzmq context，初值 NULL，由 frrzmq_init 创建。
 void *frrzmq_context = NULL;
+// frrzmq_initcount —— context 的引用计数：0 到 1 时创建，回到 0 时销毁。
 static unsigned frrzmq_initcount = 0;
 
+// frrzmq_init —— 初始化 libzmq context（引用计数 +1）：首次调用时
+// zmq_ctx_new() 创建 context 并开启 IPv6（ZMQ_IPV6）。
 void frrzmq_init(void)
 {
 	if (frrzmq_initcount++ == 0) {
@@ -37,6 +82,8 @@ void frrzmq_init(void)
 	}
 }
 
+// frrzmq_finish —— 反初始化（引用计数 -1）：减到 0 时 zmq_ctx_term() 销毁
+// context 并把它置回 NULL。
 void frrzmq_finish(void)
 {
 	if (--frrzmq_initcount == 0) {
@@ -45,6 +92,14 @@ void frrzmq_finish(void)
 	}
 }
 
+// frrzmq_read_msg —— 读事件主循环回调（event 的参数即 cb 指针的地址 cbp）：
+//   循环调用 zmq_poll 排空当前所有可读消息：
+//   - 若注册的是 cb_msg，则每轮调用一次（单条消息语义）；
+//   - 否则用 ZMQ_NOBLOCK 逐 part 接收，对每个 part 调 cb_part，
+//     再用 ZMQ_RCVMORE 判断是否还有后续 part；
+//   每处理一轮后若已取消，则做收尾（复查写事件、必要时释放 cb）并返回；
+//   函数末尾重新 event_add_read，保持回调持久。
+// 出错走 out_err：打日志并调用 cb_error。
 static void frrzmq_read_msg(struct event *t)
 {
 	struct frrzmq_cb **cbp = EVENT_ARG(t);
@@ -150,6 +205,12 @@ out_err:
 		cb->read.cb_error(cb->read.arg, cb->zmqsock);
 }
 
+// _frrzmq_event_add_read —— 注册读事件：
+//   校验参数（cbp 非空；msgfunc 与 partfunc 二选一）；
+//   取 ZMQ_FD 与 ZMQ_EVENTS；若 cbp 尚未分配则新建 frrzmq_cb
+//   （并把 write 方向标记为 cancelled）；
+//   填好 read 核心各字段后：若已有可读事件则用 event_add_event 立即排入，
+//   否则用 event_add_read 等待。返回 0 成功，-1 失败。
 int _frrzmq_event_add_read(const struct xref_eventsched *xref,
 			   struct event_loop *master,
 			   void (*msgfunc)(void *arg, void *zmqsock),
@@ -199,6 +260,10 @@ int _frrzmq_event_add_read(const struct xref_eventsched *xref,
 	return 0;
 }
 
+// frrzmq_write_msg —— 写事件主循环回调：与读回调对称，
+//   循环 zmq_poll 排空 ZMQ_POLLOUT，每轮调用 cb_msg 写一条消息；
+//   已取消时复查读事件并收尾（必要时释放 cb）；末尾重新 event_add_write。
+// 出错走 out_err：打日志并调用 cb_error。
 static void frrzmq_write_msg(struct event *t)
 {
 	struct frrzmq_cb **cbp = EVENT_ARG(t);
@@ -255,6 +320,11 @@ out_err:
 		cb->write.cb_error(cb->write.arg, cb->zmqsock);
 }
 
+// _frrzmq_event_add_write —— 注册写事件：
+//   校验参数（cbp 非空；msgfunc 非空）；取 ZMQ_FD 与 ZMQ_EVENTS；
+//   必要时新建 frrzmq_cb（把 read 方向标记为 cancelled）；
+//   填好 write 核心各字段后：若已可写则用 _event_add_event 立即排入，
+//   否则用 event_add_write 等待。返回 0 成功，-1 失败。
 int _frrzmq_event_add_write(const struct xref_eventsched *xref,
 			    struct event_loop *master,
 			    void (*msgfunc)(void *arg, void *zmqsock),
@@ -302,6 +372,10 @@ int _frrzmq_event_add_write(const struct xref_eventsched *xref,
 	return 0;
 }
 
+// frrzmq_thread_cancel —— 取消 cb 上的一个事件核心：
+//   置 core->cancelled = true 并 event_cancel(&core->event)；
+//   若正处于回调中（in_cb）则直接返回，不在此释放内存；
+//   否则当读 / 写均已取消且无挂起 event 时，释放整个 frrzmq_cb。
 void frrzmq_thread_cancel(struct frrzmq_cb **cb, struct cb_core *core)
 {
 	if (!cb || !*cb)
@@ -321,6 +395,10 @@ void frrzmq_thread_cancel(struct frrzmq_cb **cb, struct cb_core *core)
 		XFREE(MTYPE_ZEROMQ_CB, *cb);
 }
 
+// frrzmq_check_events —— 边沿触发语义下的补漏：在 send / recv 之后调用，
+//   复查 ZMQ_EVENTS；若目标 event（ZMQ_POLLIN 或 ZMQ_POLLOUT）已就绪、
+//   core->event 存在且未取消，则取消原 event 并按方向重新排入
+//   frrzmq_read_msg 或 frrzmq_write_msg。
 void frrzmq_check_events(struct frrzmq_cb **cbp, struct cb_core *core,
 			 int event)
 {

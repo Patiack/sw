@@ -3,6 +3,54 @@
  * BGP pbr
  * Copyright (C) 6WIND
  */
+/*
+ * 【文件导读】bgp_pbr.c —— BGP PBR / FlowSpec 的落地实现
+ *
+ * 一、这个文件解决什么问题
+ *   把 BGP 学到的 FlowSpec 规则(以及本机 ip rule 策略)翻译成 zebra 能接受、
+ *   内核能执行的策略路由对象，并负责下发(install)与回收(uninstall / delete)。
+ *   翻译的产物有三类：
+ *     bgp_pbr_match / bgp_pbr_match_entry   ipset 集合与集合内条目
+ *     bgp_pbr_rule                          ip rule(ip rule / ip route)
+ *     bgp_pbr_action                        动作(fwmark / table_id / nexthop，或丢弃)
+ *   最终通过 bgp_zebra.c 里的 bgp_send_pbr_*() 系列把请求发给 zebra。
+ *
+ * 二、为什么这样设计
+ *   - 匹配与动作分离：FlowSpec 语义本就是"匹配什么 + 做什么"，
+ *     这里分别用 match 结构 / action 结构承载，互不干扰。
+ *   - 每个 BGP 实例维护三套哈希表：
+ *       pbr_match_hash   按"匹配特征 + vrf + family"组织的入口集合
+ *       pbr_rule_hash    按 IP rule 条目组织
+ *       pbr_action_hash  按归一化动作(table_id / fwmark / afi)组织
+ *     这样内容相同的对象能天然去重并被共享，避免重复下发。
+ *   - 引用计数 refcnt：同一个 action 可能被多条 rule / match 引用；
+ *     只有 refcnt 归零且已安装时，才真正向 zebra 发送 delete(见 bgp_pbr_bpa_remove)。
+ *   - 请求-回执配对：每个对象带 unique 编号，下发与回收用同一编号配对；
+ *     installed / install_in_progress 标志防止重复下发与竞态。
+ *   - deferred / 批量展开：OR 语义的匹配(tcpflags / dscp / 分片 / icmp 等)无法用单个
+ *     ipset 表达，于是拆成多个条目逐条下发，见 bgp_pbr_policyroute_*_recursive() 系列。
+ *
+ * 三、关键数据结构(定义在 bgp_pbr.h)
+ *   bgp_pbr_entry_main   一条规则的临时完整视图(match + actions)
+ *   bgp_pbr_filter       下发前的中间指令集(只含匹配部分)
+ *   bgp_pbr_or_filter    需要展开成多条规则的 OR 匹配集合
+ *   bgp_pbr_action / bgp_pbr_rule / bgp_pbr_match / bgp_pbr_match_entry  见 .h
+ *
+ * 四、推荐阅读顺序
+ *   1) bgp_pbr_init / bgp_pbr_cleanup            建立 / 拆除三套哈希
+ *   2) 各 *_hash_key / *_hash_equal / *_lookup   理解去重与查找
+ *   3) bgp_pbr_build_and_validate_entry          外部输入 -> 内部
+ *   4) bgp_pbr_validate_policy_route             支持矩阵与拒绝逻辑
+ *   5) bgp_pbr_handle_entry                      主调度：按动作类型分发
+ *   6) bgp_pbr_policyroute_add_to_zebra_unit     真正构造并下发对象
+ *   7) flush / remove 系列                       撤销与回收
+ *
+ * 五、两类来源的区分
+ *   BGP_PBR_IPSET : FlowSpec 生成，走 ipset / iptables 路径
+ *   BGP_PBR_IPRULE: 本机 ip rule 策略，走 bgp_pbr_rule / ip rule 路径
+ *   注意别把二者混为一谈：iprule 分支通常只支持重定向到 IP，
+ *   不支持 drop / 改 DSCP / 重定向 VRF。
+ */
 
 #include "zebra.h"
 #include "prefix.h"
@@ -25,6 +73,10 @@
 #include "bgpd/bgp_flowspec_private.h"
 #include "bgpd/bgp_errors.h"
 
+/*
+ * FRR 的内存类型登记：用于内存统计与泄漏排查。
+ * 每类对象对应一个 MTYPE，分配 / 释放时(XCALLOC / XFREE)带上它。
+ */
 DEFINE_MTYPE_STATIC(BGPD, PBR_MATCH_ENTRY, "PBR match entry");
 DEFINE_MTYPE_STATIC(BGPD, PBR_MATCH, "PBR match");
 DEFINE_MTYPE_STATIC(BGPD, PBR_ACTION, "PBR action");
@@ -32,20 +84,36 @@ DEFINE_MTYPE_STATIC(BGPD, PBR_RULE, "PBR rule");
 DEFINE_MTYPE_STATIC(BGPD, PBR, "BGP PBR Context");
 DEFINE_MTYPE_STATIC(BGPD, PBR_VALMASK, "BGP PBR Val Mask Value");
 
+/* 下面两个是超过一行长度的日志串，单独抽成宏 */
 /* chain strings too long to fit in one line */
 #define FSPEC_ACTION_EXCEED_LIMIT "flowspec actions exceeds limit"
 #define IPV6_FRAGMENT_INVALID "fragment not valid for IPv6 for this implementation"
 
+/*
+ * 生成接口红黑树的增删查找函数，并初始化全局 v4 接口树。
+ * 注意 ifaces_by_name_ipv4 是文件级全局变量(头文件里 extern 声明)，
+ * 而 v6 接口树挂在 bgp_pbr_config 里(见 bgp_pbr_reset)。
+ */
 RB_GENERATE(bgp_pbr_interface_head, bgp_pbr_interface,
 	    id_entry, bgp_pbr_interface_compare);
 struct bgp_pbr_interface_head ifaces_by_name_ipv4 =
 	RB_INITIALIZER(&ifaces_by_name_ipv4);
 
+/*
+ * 全局递增计数器：给各类对象分配 unique 编号。
+ * unique 一旦分配就被写进对象并随下发请求发给 zebra，回执时靠它找回对象。
+ * 注意它们是进程级全局量(不是 per-bgp)，因此全进程内 unique 不重复。
+ */
 static int bgp_pbr_match_counter_unique;
 static int bgp_pbr_match_entry_counter_unique;
 static int bgp_pbr_action_counter_unique;
 static int bgp_pbr_match_iptable_counter_unique;
 
+/*
+ * "查找上下文"小结构：配合 hash_walk 使用。
+ * 调用方填入要查的 unique，walkcb 遍历时把命中的对象写回 *_found。
+ * 下面 4 个分别用于 ipset 集合(iptable)、ipset 条目、action、ip rule。
+ */
 struct bgp_pbr_match_iptable_unique {
 	uint32_t unique;
 	struct bgp_pbr_match *bpm_found;
@@ -66,6 +134,7 @@ struct bgp_pbr_rule_unique {
 	struct bgp_pbr_rule *bpr_found;
 };
 
+/* 遍历回调：在 pbr_rule_hash 里按 unique 找 ip rule 条目，命中即中止遍历 */
 static int bgp_pbr_rule_walkcb(struct hash_bucket *bucket, void *arg)
 {
 	struct bgp_pbr_rule *bpr = (struct bgp_pbr_rule *)bucket->data;
@@ -80,6 +149,7 @@ static int bgp_pbr_rule_walkcb(struct hash_bucket *bucket, void *arg)
 	return HASHWALK_CONTINUE;
 }
 
+/* 遍历回调：在 pbr_action_hash 里按 unique 找 action，命中即中止遍历 */
 static int bgp_pbr_action_walkcb(struct hash_bucket *bucket, void *arg)
 {
 	struct bgp_pbr_action *bpa = (struct bgp_pbr_action *)bucket->data;
@@ -94,6 +164,7 @@ static int bgp_pbr_action_walkcb(struct hash_bucket *bucket, void *arg)
 	return HASHWALK_CONTINUE;
 }
 
+/* 遍历回调：在某集合的 entry_hash 里按 unique 找匹配项 */
 static int bgp_pbr_match_entry_walkcb(struct hash_bucket *bucket, void *arg)
 {
 	struct bgp_pbr_match_entry *bpme =
@@ -109,11 +180,13 @@ static int bgp_pbr_match_entry_walkcb(struct hash_bucket *bucket, void *arg)
 	return HASHWALK_CONTINUE;
 }
 
+/* 查找上下文：按集合名(ipset_name)查找集合 */
 struct bgp_pbr_match_ipsetname {
 	char *ipsetname;
 	struct bgp_pbr_match *bpm_found;
 };
 
+/* 遍历回调：按集合名匹配 bgp_pbr_match，用于 ipset 条目查找的第一步 */
 static int bgp_pbr_match_pername_walkcb(struct hash_bucket *bucket, void *arg)
 {
 	struct bgp_pbr_match *bpm = (struct bgp_pbr_match *)bucket->data;
@@ -129,6 +202,7 @@ static int bgp_pbr_match_pername_walkcb(struct hash_bucket *bucket, void *arg)
 	return HASHWALK_CONTINUE;
 }
 
+/* 遍历回调：按 unique2(iptable 事务编号)匹配集合 */
 static int bgp_pbr_match_iptable_walkcb(struct hash_bucket *bucket, void *arg)
 {
 	struct bgp_pbr_match *bpm = (struct bgp_pbr_match *)bucket->data;
@@ -143,11 +217,13 @@ static int bgp_pbr_match_iptable_walkcb(struct hash_bucket *bucket, void *arg)
 	return HASHWALK_CONTINUE;
 }
 
+/* 查找上下文：按 unique 查找集合 */
 struct bgp_pbr_match_unique {
 	uint32_t unique;
 	struct bgp_pbr_match *bpm_found;
 };
 
+/* 遍历回调：按 unique(ipset 事务编号)匹配集合 */
 static int bgp_pbr_match_walkcb(struct hash_bucket *bucket, void *arg)
 {
 	struct bgp_pbr_match *bpm = (struct bgp_pbr_match *)bucket->data;
@@ -162,6 +238,13 @@ static int bgp_pbr_match_walkcb(struct hash_bucket *bucket, void *arg)
 	return HASHWALK_CONTINUE;
 }
 
+/*
+ * 把单个 bgp_pbr_match_val 渲染成人类可读字符串(供日志 / show 使用)。
+ * prepend 非空时先输出该前缀(通常是没有时的字段名，如 "@srcport ")，
+ * 为空时根据 unary_operator 输出 ", or " / ", and " 连接符，
+ * 再按 compare_operator 输出 < > = match，最后输出数值。
+ * 返回写入的字符数。
+ */
 static int snprintf_bgp_pbr_match_val(char *str, int len,
 				      struct bgp_pbr_match_val *mval,
 				      const char *prepend)
@@ -209,6 +292,7 @@ static int snprintf_bgp_pbr_match_val(char *str, int len,
 	return (int)(ptr - str);
 }
 
+/* 日志拼装辅助宏：若已有内容(_cnt 非 0)则先补 "; " 分隔，然后计数器自增。 */
 #define INCREMENT_DISPLAY(_ptr, _cnt, _len) do {	\
 		int sn_delta;				\
 							\
@@ -220,6 +304,7 @@ static int snprintf_bgp_pbr_match_val(char *str, int len,
 		(_cnt)++;	\
 	} while (0)
 
+/* 一个数值区间(闭区间 min 到 max)，既能表示端口范围，也能表示报文长度范围 */
 /* this structure can be used for port range,
  * but also for other values range like packet length range
  */
@@ -228,6 +313,10 @@ struct bgp_pbr_range_port {
 	uint16_t max_port;
 };
 
+/*
+ * 带掩码的匹配值：val 是值，mask 是掩码。
+ * 支持"取反"语义(如 tcpflags 的 "not FIN")——mask 为 1 时表示该值是被取反的匹配。
+ */
 /* this structure can be used to filter with a mask
  * for instance it supports not instructions like for
  * tcpflags
@@ -237,6 +326,11 @@ struct bgp_pbr_val_mask {
 	uint16_t mask;
 };
 
+/*
+ * 下发前的中间指令集：把 bgp_pbr_entry_main 的匹配部分压缩成这套字段，
+ * 供 bgp_pbr_policyroute_add_to_zebra_unit() 构造 ipset / ip rule 条目。
+ * 指针字段为空表示该维度不参与匹配；val_mask 类字段表达取反 / 带掩码匹配。
+ */
 /* this structure is used to pass instructs
  * so that BGP can create pbr instructions to ZEBRA
  */
@@ -258,6 +352,11 @@ struct bgp_pbr_filter {
 	struct bgp_pbr_val_mask *fragment;
 };
 
+/*
+ * 需要展开成多条规则的 OR 匹配集合。
+ * 某维度(如 dscp)是"或"关系时，无法用单个 ipset 表达，
+ * 于是每个候选值存进对应 list，最终由 *_to_zebra_recursive() 逐条下发。
+ */
 /* this structure is used to contain OR instructions
  * so that BGP can create multiple pbr instructions
  * to ZEBRA
@@ -272,6 +371,10 @@ struct bgp_pbr_or_filter {
 	struct list *icmp_code;
 };
 
+/*
+ * 前置声明：这两个函数在文件后半段定义，但前面的 recursive / icmp 处理会调用到，
+ * 所以先在这里声明原型。
+ */
 static void bgp_pbr_policyroute_add_to_zebra_unit(struct bgp *bgp,
 						  struct bgp_path_info *path,
 						  struct bgp_pbr_filter *bpf,
@@ -280,6 +383,7 @@ static void bgp_pbr_policyroute_add_to_zebra_unit(struct bgp *bgp,
 
 static void bgp_pbr_dump_entry(struct bgp_pbr_filter *bpf, bool add);
 
+/* 释放一个 bgp_pbr_val_mask(供 list 的 del 回调使用) */
 static void bgp_pbr_val_mask_free(void *arg)
 {
 	struct bgp_pbr_val_mask *pbr_val_mask = arg;
@@ -287,6 +391,16 @@ static void bgp_pbr_val_mask_free(void *arg)
 	XFREE(MTYPE_PBR_VALMASK, pbr_val_mask);
 }
 
+/*
+ * 处理"取反"形式的匹配值，即形如 "not value" 的表达式。
+ * 依据 unary_operator 分两种落法：
+ *   AND：就地改写传入的 and_valmask。
+ *        - tcpflags：把 ALL_FLAGS 里对应位清零(mask 记录要匹配的位)。
+ *        - dscp / flowlabel / pktlen / fragment：val=value，mask=1(用 1 标记"取反")。
+ *   OR ：新分配一个 val_mask 追加到 or_valmask 列表，规则同上。
+ * icmp type / code 不支持取反，返回 false。
+ * 返回 true 表示处理成功。
+ */
 static bool bgp_pbr_extract_enumerate_unary_opposite(
 				 uint8_t unary_operator,
 				 struct bgp_pbr_val_mask *and_valmask,
@@ -323,6 +437,15 @@ static bool bgp_pbr_extract_enumerate_unary_opposite(
 	return true;
 }
 
+/*
+ * 把一串同逻辑运算符的匹配值(list 里 num 个)归并成 val_mask 形式。
+ * valmask 的实参形态由 unary_operator 决定：
+ *   AND 时是单个 struct bgp_pbr_val_mask(就地填充)；
+ *   OR  时是 struct list(每个值一个 val_mask 追加进去)。
+ * 列表内所有元素的 unary_operator 必须与参数一致，否则失败。
+ * 每个元素必须带 EQUAL_TO 或 EXACT_MATCH；只有"取反"(同时带 LESS_THAN 与
+ * GREATER_THAN)才走 opposite 处理。返回 true 表示全部成功。
+ */
 /* TCP : FIN and SYN -> val = ALL; mask = 3
  * TCP : not (FIN and SYN) -> val = ALL; mask = ALL & ~(FIN|RST)
  * other variables type: dscp, pkt len, fragment, flow label
@@ -391,6 +514,12 @@ static bool bgp_pbr_extract_enumerate_unary(struct bgp_pbr_match_val list[],
 	return true;
 }
 
+/*
+ * 枚举归并入口：先判 unary 是纯 OR 还是纯 AND 还是 OR 与 AND 混合。
+ * 混合时先按 AND 试，失败再退化为按 OR 试(double_check)。
+ * 纯 OR / 纯 AND 时与参数一致，直接交给 _unary 处理。
+ * 注意：OR 与 AND 同时出现在一条表达式里的真正混合组合，这里并不支持。
+ */
 /* if unary operator can either be UNARY_OR/AND/OR-AND.
  * in the latter case, combinationf of both is not handled
  */
@@ -418,6 +547,11 @@ static bool bgp_pbr_extract_enumerate(struct bgp_pbr_match_val list[],
 	return ret;
 }
 
+/*
+ * 判断一串匹配值整体采用的是 OR 还是 AND 逻辑。
+ * 从第 2 个元素起逐个检查，一旦发现两种运算符混用即返回 0(表示无法归类)。
+ * 否则返回统一的那一个运算符(默认 AND)。
+ */
 /* returns the unary operator that is in the list
  * return 0 if both operators are used
  */
@@ -443,6 +577,12 @@ static uint8_t bgp_pbr_match_val_get_operator(struct bgp_pbr_match_val list[],
 }
 
 
+/*
+ * 把匹配值列表压缩成一个区间(如 "port >= 80 且 port <= 90" 得到 min/max)。
+ * 最多 2 个元素；出现多个 EQUAL_TO 或 EQUAL_TO 之后还有别的值都判为过于复杂而失败。
+ * range 允许为 NULL(此时只做可行性判断，不落值)。
+ * 返回 true 表示成功。
+ */
 /* return true if extraction ok
  */
 static bool bgp_pbr_extract(struct bgp_pbr_match_val list[],
@@ -492,6 +632,20 @@ static bool bgp_pbr_extract(struct bgp_pbr_match_val list[],
 	return true;
 }
 
+/*
+ * 合法性 / 支持性校验：判断一条规则能否被本实现落成 PBR。
+ * 返回 1 表示通过，0 表示不支持或过于复杂(调用方据此放弃下发)。
+ *
+ * 本实现只支持以下 match 与 set 组合：
+ *   - src/dst 前缀 => 重定向 nexthop 加可选 rate
+ *   - src/dst 前缀 => 重定向 VRF 加可选 rate
+ *   - src/dst 前缀 => 丢弃
+ *   - srcport 加 IP 地址
+ * 逐步检查：协议只能有一个且必须是 UDP / ICMP / ICMPV6 / TCP；
+ * 各字段的匹配值必须能被 bgp_pbr_extract 或 bgp_pbr_extract_enumerate 归并；
+ * 端口维度之间、端口与 icmp 之间不能叠加；fragment 取值有限制且 IPv6 不支持；
+ * 最后对 iprule 类型只允许重定向 IP(见下方 iprule 分支)。
+ */
 static int bgp_pbr_validate_policy_route(struct bgp_pbr_entry_main *api)
 {
 	bool enumerate_icmp = false;
@@ -694,6 +848,10 @@ static int bgp_pbr_validate_policy_route(struct bgp_pbr_entry_main *api)
 			zlog_debug("BGP: match multiple port/imcp operations: too complex. ignoring.");
 		return 0;
 	}
+	/*
+	 * iprule 分支：本机 ip rule 策略能力有限，只支持重定向到 IP 下一跳。
+	 * 限速为 0(即 drop)、改写 DSCP、重定向到 VRF 都只告警而不生效。
+	 */
 	/* iprule only supports redirect IP */
 	if (api->type == BGP_PBR_IPRULE) {
 		int i;
@@ -723,6 +881,7 @@ static int bgp_pbr_validate_policy_route(struct bgp_pbr_entry_main *api)
 			}
 		}
 
+		/* 非 iprule 的 FlowSpec 规则必须至少匹配 src 或 dst 前缀，否则无从下手 */
 	} else if (!CHECK_FLAG(api->match_bitmask, PREFIX_SRC_PRESENT) &&
 		   !CHECK_FLAG(api->match_bitmask, PREFIX_DST_PRESENT)) {
 		if (BGP_DEBUG(pbr, PBR)) {
@@ -734,6 +893,19 @@ static int bgp_pbr_validate_policy_route(struct bgp_pbr_entry_main *api)
 	return 1;
 }
 
+/*
+ * 把一条 FlowSpec NLRI 解析成 bgp_pbr_entry_main：
+ *   第一步 用库函数 bgp_flowspec_match_rules_fill 把 NLRI 里的 match 组件填进 api；
+ *   第二步 遍历路径上的 ecommunity(含 IPv6 扩展团体)把 set 动作解析进 api->actions：
+ *          - REDIRECT_VRF 扩展团体 -> ACTION_REDIRECT(重定向到对应 VRF)
+ *          - REDIRECT_IP_NH / FLOWSPEC_REDIRECT_IPV4 扩展团体 -> ACTION_REDIRECT_IP
+ *          - 其它扩展团体交给 ecommunity_fill_pbr_action(限速 / 打标 / 流量动作)
+ *          注意当同时出现两类重定向 IP 扩展团体时，有固定的覆盖 / 保留优先级。
+ *   第三步 若发现"限速为 0"(即丢弃)动作，则把动作数组裁剪成只看这一个动作；
+ *   第四步 调 bgp_pbr_validate_policy_route 做支持性校验；
+ *   最后 检查 src/dst 前缀地址族是否一致。
+ * 返回值：成功返回 0，构建或校验失败返回 -1。
+ */
 /* return -1 if build or validation failed */
 
 int bgp_pbr_build_and_validate_entry(const struct prefix *p,
@@ -751,11 +923,13 @@ int bgp_pbr_build_and_validate_entry(const struct prefix *p,
 	bool discard_action_found = false;
 	afi_t afi = family2afi(p->u.prefix_flowspec.family);
 
+	/* 从 FlowSpec NLRI 中解析出 match 部分 */
 	/* extract match from flowspec entries */
 	ret = bgp_flowspec_match_rules_fill((uint8_t *)p->u.prefix_flowspec.ptr,
 					    p->u.prefix_flowspec.prefixlen, api, afi);
 	if (ret < 0)
 		return -1;
+	/* 从 FlowSpec 的 ecommunity 列表里解析出 action 部分 */
 	/* extract actiosn from flowspec ecom list */
 	if (path && bgp_attr_get_ecommunity(path->attr)) {
 		ecom = bgp_attr_get_ecommunity(path->attr);
@@ -937,6 +1111,10 @@ int bgp_pbr_build_and_validate_entry(const struct prefix *p,
 			}
 		}
 	}
+	/*
+	 * 如果解析出的动作里含"限速为 0"，即丢弃语义，
+	 * 则丢弃动作会覆盖其它动作：把动作数组裁剪成只剩这一个丢弃动作。
+	 */
 	/* if ECOMMUNITY_TRAFFIC_RATE = 0 as action
 	 * then reduce the API action list to that action
 	 */
@@ -947,12 +1125,14 @@ int bgp_pbr_build_and_validate_entry(const struct prefix *p,
 		api->actions[0].action = ACTION_TRAFFICRATE;
 	}
 
+	/* 校验 match / action 组合是否被本策略路由引擎支持 */
 	/* validate if incoming match/action is compatible
 	 * with our policy routing engine
 	 */
 	if (!bgp_pbr_validate_policy_route(api))
 		return -1;
 
+	/* 检查 match 规则内部一致性：src 与 dst 前缀地址族必须相同 */
 	/* check inconsistency in the match rule */
 	if (CHECK_FLAG(api->match_bitmask, PREFIX_SRC_PRESENT)) {
 		src = &api->src_prefix;
@@ -973,11 +1153,16 @@ int bgp_pbr_build_and_validate_entry(const struct prefix *p,
 	return 0;
 }
 
+/* 仅释放 bgp_pbr_match_entry 内存，不做任何 zebra 交互 */
 static void bgp_pbr_match_entry_free(struct bgp_pbr_match_entry *bpme)
 {
 	XFREE(MTYPE_PBR_MATCH_ENTRY, bpme);
 }
 
+/*
+ * 哈希表析构回调(用于 hash_clean 等)：若该匹配项已安装，先向 zebra 发删除请求，
+ * 再释放内存。installed 置 false 并把 backpointer 断链。
+ */
 static void bgp_pbr_match_entry_hash_free(void *arg)
 {
 	struct bgp_pbr_match_entry *bpme;
@@ -992,11 +1177,17 @@ static void bgp_pbr_match_entry_hash_free(void *arg)
 	bgp_pbr_match_entry_free(bpme);
 }
 
+/* 仅释放 bgp_pbr_match 内存，不做任何 zebra 交互 */
 static void bgp_pbr_match_free(struct bgp_pbr_match *bpm)
 {
 	XFREE(MTYPE_PBR_MATCH, bpm);
 }
 
+/*
+ * 集合的哈希表析构回调：先清空集合内所有匹配项(逐条发删除)，
+ * 若集合已安装则按"先删 iptable 规则、再删 ipset 集合"的顺序回收，
+ * 并把 action 的引用计数减一。最后释放 entry_hash 与集合本身。
+ */
 static void bgp_pbr_match_hash_free(void *arg)
 {
 	struct bgp_pbr_match *bpm;
@@ -1025,6 +1216,7 @@ static void bgp_pbr_match_hash_free(void *arg)
 	bgp_pbr_match_free(bpm);
 }
 
+/* hash_get 的分配回调：把传入的临时 bgp_pbr_match 深拷贝一份插入哈希表 */
 static void *bgp_pbr_match_alloc_intern(void *arg)
 {
 	struct bgp_pbr_match *bpm, *new;
@@ -1037,11 +1229,16 @@ static void *bgp_pbr_match_alloc_intern(void *arg)
 	return new;
 }
 
+/* 仅释放 bgp_pbr_rule 内存，不做任何 zebra 交互 */
 static void bgp_pbr_rule_free(struct bgp_pbr_rule *pbr)
 {
 	XFREE(MTYPE_PBR_RULE, pbr);
 }
 
+/*
+ * ip rule 的哈希表析构回调：若已安装，向 zebra 发 ip rule 删除请求，
+ * 并把 action 的引用计数减一，然后释放内存。
+ */
 static void bgp_pbr_rule_hash_free(void *arg)
 {
 	struct bgp_pbr_rule *bpr;
@@ -1058,6 +1255,7 @@ static void bgp_pbr_rule_hash_free(void *arg)
 	bgp_pbr_rule_free(bpr);
 }
 
+/* hash_get 的分配回调：把传入的临时 bgp_pbr_rule 深拷贝一份插入哈希表 */
 static void *bgp_pbr_rule_alloc_intern(void *arg)
 {
 	struct bgp_pbr_rule *bpr, *new;
@@ -1070,6 +1268,12 @@ static void *bgp_pbr_rule_alloc_intern(void *arg)
 	return new;
 }
 
+/*
+ * 回收一个 action(引用计数归零时才真正删除)。
+ * 条件是：refcnt 为 0(已无人引用)且已安装且 table_id 非 0。
+ * 只有满足时才向 zebra 撤销 ip rule 动作，并调用 bgp_zebra_announce_default
+ * 撤销之前为它宣告的默认路由。这是引用计数在回收侧的核心落点。
+ */
 static void bgp_pbr_bpa_remove(struct bgp_pbr_action *bpa)
 {
 	if ((bpa->refcnt == 0) && bpa->installed && bpa->table_id != 0) {
@@ -1080,6 +1284,10 @@ static void bgp_pbr_bpa_remove(struct bgp_pbr_action *bpa)
 	}
 }
 
+/*
+ * 安装一个 action：未安装且不在进行中时，向 zebra 下发 ip rule 动作，
+ * 并由 bgp_zebra_announce_default 为该 action 的下一跳 / 表宣告默认路由。
+ */
 static void bgp_pbr_bpa_add(struct bgp_pbr_action *bpa)
 {
 	if (!bpa->installed && !bpa->install_in_progress) {
@@ -1089,6 +1297,7 @@ static void bgp_pbr_bpa_add(struct bgp_pbr_action *bpa)
 	}
 }
 
+/* action 的哈希表析构回调：先按引用计数回收(可能向 zebra 撤销)，再释放内存 */
 static void bgp_pbr_action_free(void *arg)
 {
 	struct bgp_pbr_action *bpa = arg;
@@ -1098,6 +1307,7 @@ static void bgp_pbr_action_free(void *arg)
 	XFREE(MTYPE_PBR_ACTION, bpa);
 }
 
+/* hash_get 的分配回调：把传入的临时 bgp_pbr_action 深拷贝一份插入哈希表 */
 static void *bgp_pbr_action_alloc_intern(void *arg)
 {
 	struct bgp_pbr_action *bpa, *new;
@@ -1111,6 +1321,7 @@ static void *bgp_pbr_action_alloc_intern(void *arg)
 	return new;
 }
 
+/* hash_get 的分配回调：把传入的临时 bgp_pbr_match_entry 深拷贝一份插入集合的 entry_hash */
 static void *bgp_pbr_match_entry_alloc_intern(void *arg)
 {
 	struct bgp_pbr_match_entry *bpme, *new;
@@ -1124,6 +1335,7 @@ static void *bgp_pbr_match_entry_alloc_intern(void *arg)
 	return new;
 }
 
+/* 计算集合的哈希值：把 vrf / flags / family / 各匹配字段 / type 依次混入 jhash */
 uint32_t bgp_pbr_match_hash_key(const void *arg)
 {
 	const struct bgp_pbr_match *pbm = arg;
@@ -1143,6 +1355,10 @@ uint32_t bgp_pbr_match_hash_key(const void *arg)
 	return jhash_1word(pbm->type, key);
 }
 
+/*
+ * 判断两个集合是否同一份：比较 vrf / family / type / flags / action 指针
+ * 以及全部匹配字段。全部相等才复用同一条目(实现去重与共享)。
+ */
 bool bgp_pbr_match_hash_equal(const void *arg1, const void *arg2)
 {
 	const struct bgp_pbr_match *r1, *r2;
@@ -1191,6 +1407,7 @@ bool bgp_pbr_match_hash_equal(const void *arg1, const void *arg2)
 	return true;
 }
 
+/* 计算 ip rule 的哈希值：把 src / dst 前缀键与 vrf / flags 混入 */
 uint32_t bgp_pbr_rule_hash_key(const void *arg)
 {
 	const struct bgp_pbr_rule *pbr = arg;
@@ -1202,6 +1419,10 @@ uint32_t bgp_pbr_rule_hash_key(const void *arg)
 	return jhash_1word(prefix_hash_key(&pbr->dst), key);
 }
 
+/*
+ * 判断两条 ip rule 是否同一份：比较 vrf / flags / action，
+ * 并按 flags 决定是否比较 src / dst 前缀(仅在对应 SET 位置位时比较)。
+ */
 bool bgp_pbr_rule_hash_equal(const void *arg1, const void *arg2)
 {
 	const struct bgp_pbr_rule *r1, *r2;
@@ -1227,6 +1448,7 @@ bool bgp_pbr_rule_hash_equal(const void *arg1, const void *arg2)
 	return true;
 }
 
+/* 计算匹配项的哈希值：src / dst 前缀键加源目的端口区间与协议号 */
 uint32_t bgp_pbr_match_entry_hash_key(const void *arg)
 {
 	const struct bgp_pbr_match_entry *pbme;
@@ -1244,6 +1466,10 @@ uint32_t bgp_pbr_match_entry_hash_key(const void *arg)
 	return key;
 }
 
+/*
+ * 判断两个匹配项是否同一份：比较 src / dst 前缀、源目的端口区间与协议号。
+ * 不比较 backpointer(更新场景下无意义)，rate 也被忽略(见函数内英文注释)。
+ */
 bool bgp_pbr_match_entry_hash_equal(const void *arg1, const void *arg2)
 {
 	const struct bgp_pbr_match_entry *r1, *r2;
@@ -1281,6 +1507,7 @@ bool bgp_pbr_match_entry_hash_equal(const void *arg1, const void *arg2)
 	return true;
 }
 
+/* 计算 action 的哈希值：table_id / fwmark / afi */
 uint32_t bgp_pbr_action_hash_key(const void *arg)
 {
 	const struct bgp_pbr_action *pbra;
@@ -1293,6 +1520,10 @@ uint32_t bgp_pbr_action_hash_key(const void *arg)
 	return key;
 }
 
+/*
+ * 判断两个 action 是否同一份：比较 vrf / afi，以及下一跳是否相同。
+ * unique / table / fwmark 都是派生出来的，不参与比较；rate 暂时忽略。
+ */
 bool bgp_pbr_action_hash_equal(const void *arg1, const void *arg2)
 {
 	const struct bgp_pbr_action *r1, *r2;
@@ -1313,6 +1544,7 @@ bool bgp_pbr_action_hash_equal(const void *arg1, const void *arg2)
 	return nexthop_same(&r1->nh, &r2->nh);
 }
 
+/* 在指定 VRF 的 pbr_rule_hash 里按 unique 找 ip rule 条目 */
 struct bgp_pbr_rule *bgp_pbr_rule_lookup(vrf_id_t vrf_id,
 					 uint32_t unique)
 {
@@ -1327,6 +1559,7 @@ struct bgp_pbr_rule *bgp_pbr_rule_lookup(vrf_id_t vrf_id,
 	return bpru.bpr_found;
 }
 
+/* 在指定 VRF 的 pbr_action_hash 里按 unique 找 action */
 struct bgp_pbr_action *bgp_pbr_action_rule_lookup(vrf_id_t vrf_id,
 						  uint32_t unique)
 {
@@ -1341,6 +1574,7 @@ struct bgp_pbr_action *bgp_pbr_action_rule_lookup(vrf_id_t vrf_id,
 	return bpau.bpa_found;
 }
 
+/* 在指定 VRF 的 pbr_match_hash 里按 unique(ipset 事务编号)找集合 */
 struct bgp_pbr_match *bgp_pbr_match_ipset_lookup(vrf_id_t vrf_id,
 						 uint32_t unique)
 {
@@ -1355,6 +1589,10 @@ struct bgp_pbr_match *bgp_pbr_match_ipset_lookup(vrf_id_t vrf_id,
 	return bpmu.bpm_found;
 }
 
+/*
+ * 两步查找：先按集合名(ipset_name)在 pbr_match_hash 里找到集合，
+ * 再在该集合的 entry_hash 里按 unique 找匹配项。
+ */
 struct bgp_pbr_match_entry *bgp_pbr_match_ipset_entry_lookup(vrf_id_t vrf_id,
 						       char *ipset_name,
 						       uint32_t unique)
@@ -1379,6 +1617,7 @@ struct bgp_pbr_match_entry *bgp_pbr_match_ipset_entry_lookup(vrf_id_t vrf_id,
 	return bpmeu.bpme_found;
 }
 
+/* 在指定 VRF 的 pbr_match_hash 里按 unique2(iptable 事务编号)找集合 */
 struct bgp_pbr_match *bgp_pbr_match_iptable_lookup(vrf_id_t vrf_id,
 						   uint32_t unique)
 {
@@ -1393,6 +1632,12 @@ struct bgp_pbr_match *bgp_pbr_match_iptable_lookup(vrf_id_t vrf_id,
 	return bpmiu.bpm_found;
 }
 
+/*
+ * 拆除某 BGP 实例的全部 PBR 状态：
+ * 依次清空 match / rule / action 三套哈希(各自的析构回调会向 zebra 发送对应的删除请求)，
+ * 然后重置 v4 与 v6 接口策略，最后释放 bgp_pbr_cfg。
+ * 顺序很关键：先匹配再规则再动作，保证引用关系被正确解开。
+ */
 void bgp_pbr_cleanup(struct bgp *bgp)
 {
 	hash_clean_and_free(&bgp->pbr_match_hash, bgp_pbr_match_hash_free);
@@ -1407,6 +1652,13 @@ void bgp_pbr_cleanup(struct bgp *bgp)
 	XFREE(MTYPE_PBR, bgp->bgp_pbr_cfg);
 }
 
+/*
+ * 初始化某 BGP 实例的 PBR 状态：建立三套哈希表
+ *   pbr_match_hash   集合
+ *   pbr_action_hash  动作
+ *   pbr_rule_hash    ip rule
+ * 并分配 bgp_pbr_cfg；默认接受"任意接口"(pbr_interface_any_ipv4 = true)。
+ */
 void bgp_pbr_init(struct bgp *bgp)
 {
 	bgp->pbr_match_hash =
@@ -1427,6 +1679,12 @@ void bgp_pbr_init(struct bgp *bgp)
 	bgp->bgp_pbr_cfg->pbr_interface_any_ipv4 = true;
 }
 
+/*
+ * 把一条规则的完整视图(bgp_pbr_entry_main)格式化成一行日志并 zlog_info 输出。
+ * 先打印 "MATCH :" 段落(前缀 / 协议 / 端口 / icmp / 长度 / dscp / 流标签 / tcpflags / 分片)，
+ * 再打印 "SET :" 段落(限速 / 流量动作 / 重定向 IP / 重定向 VRF / 打标)。
+ * 纯调试 / 观测用途，不改变任何状态。
+ */
 void bgp_pbr_print_policy_route(struct bgp_pbr_entry_main *api)
 {
 	int i = 0;
@@ -1654,6 +1912,11 @@ void bgp_pbr_print_policy_route(struct bgp_pbr_entry_main *api)
 	zlog_info("%s", return_string);
 }
 
+/*
+ * 删除一条 ip rule：若已安装则向 zebra 撤销、action 引用计数减一、
+ * 并从触发它的 flowspec 路径的 bgp_fs_iprule 链表里解链，
+ * 最后把条目从哈希表摘除并释放，再尝试回收 action。
+ */
 static void bgp_pbr_flush_iprule(struct bgp *bgp, struct bgp_pbr_action *bpa,
 				  struct bgp_pbr_rule *bpr)
 {
@@ -1684,6 +1947,12 @@ static void bgp_pbr_flush_iprule(struct bgp *bgp, struct bgp_pbr_action *bpa,
 	bgp_pbr_bpa_remove(bpa);
 }
 
+/*
+ * 删除一个匹配项(必要时连同其所属集合一起删)：
+ * 若匹配项已安装则向 zebra 撤销、从触发的 flowspec 路径 bgp_fs_pbr 链表解链；
+ * 从集合 entry_hash 摘除后，若集合已空，则按"先删 iptable 再删 ipset"的顺序
+ * 回收集合、把 action 引用计数减一，最后尝试回收 action。
+ */
 static void bgp_pbr_flush_entry(struct bgp *bgp, struct bgp_pbr_action *bpa,
 				struct bgp_pbr_match *bpm,
 				struct bgp_pbr_match_entry *bpme)
@@ -1734,6 +2003,11 @@ static void bgp_pbr_flush_entry(struct bgp *bgp, struct bgp_pbr_action *bpa,
 	bgp_pbr_bpa_remove(bpa);
 }
 
+/*
+ * "找出同一规则的另一份副本"用的查找上下文：
+ * 把目标对象放进 *_to_match，遍历时把命中的旧副本写回 *_found。
+ * 用于在新增 / 更新时定位需要被替换(flush)掉的旧条目。
+ */
 struct bgp_pbr_match_entry_remain {
 	struct bgp_pbr_match_entry *bpme_to_match;
 	struct bgp_pbr_match_entry *bpme_found;
@@ -1744,6 +2018,13 @@ struct bgp_pbr_rule_remain {
 	struct bgp_pbr_rule *bpr_found;
 };
 
+/*
+ * 遍历回调：在 pbr_rule_hash 里找与 bpr_to_match 特征相同、但 action 不同的旧 ip rule。
+ * 服务两种场景：
+ *   撤销时(r2->action 为空)，找出该规则；
+ *   用不同 action 替换旧规则时(r2->action 非空)，找出旧的那条——
+ *   旧规则会在新规则之后才被移除，以避免流量中断。
+ */
 static int bgp_pbr_get_same_rule(struct hash_bucket *bucket, void *arg)
 {
 	struct bgp_pbr_rule *r1 = (struct bgp_pbr_rule *)bucket->data;
@@ -1781,6 +2062,11 @@ static int bgp_pbr_get_same_rule(struct hash_bucket *bucket, void *arg)
 	return HASHWALK_CONTINUE;
 }
 
+/*
+ * 遍历回调：在 pbr_match_hash 里寻找"同一个匹配项"遗留在其它集合中的副本。
+ * 条件是集合特征相同但 action 不同；找到后就地在该集合的 entry_hash 里确认匹配项存在。
+ * 用于新增时清理旧的、语义相同的集合条目。
+ */
 static int bgp_pbr_get_remaining_entry(struct hash_bucket *bucket, void *arg)
 {
 	struct bgp_pbr_match *bpm = (struct bgp_pbr_match *)bucket->data;
@@ -1815,6 +2101,14 @@ static int bgp_pbr_get_remaining_entry(struct hash_bucket *bucket, void *arg)
 	return HASHWALK_ABORT;
 }
 
+/*
+ * 撤销一个"单元"：根据 bpf(bgp_pbr_filter)把匹配特征还原成查找键，
+ * 在哈希表里定位对应的 ip rule 或 ipset 条目并 flush 掉。
+ * iprule 分支：构造 bgp_pbr_rule，用 bgp_pbr_get_same_rule 找到旧条目后 flush_iprule。
+ * ipset 分支：构造集合 temp 与匹配项 temp2，用 bgp_pbr_get_remaining_entry 找到后 flush_entry。
+ * 之所以要"先构造再查找"：撤销时手头只有匹配特征，没有对象指针，
+ * 必须按特征把对象找回来，这依赖特征参与哈希的键设计。
+ */
 static void bgp_pbr_policyroute_remove_from_zebra_unit(
 	struct bgp *bgp, struct bgp_path_info *path, struct bgp_pbr_filter *bpf)
 {
@@ -1979,6 +2273,10 @@ static void bgp_pbr_policyroute_remove_from_zebra_unit(
 	}
 }
 
+/*
+ * OR 展开用的类型推进链：TCP_FLAGS -> DSCP -> FLOW_LABEL -> PKT_LEN -> FRAGMENT -> ICMP_TYPE。
+ * 递归展开时按这个顺序逐个维度处理，走完返回 0(表示进入最终的下发单元)。
+ */
 static uint8_t bgp_pbr_next_type_entry(uint8_t type_entry)
 {
 	if (type_entry == FLOWSPEC_TCP_FLAGS)
@@ -1994,6 +2292,14 @@ static uint8_t bgp_pbr_next_type_entry(uint8_t type_entry)
 	return 0;
 }
 
+/*
+ * 处理 ICMP 的 type / code 展开(必须是最后一个 OR 维度)。
+ * 复用 src_port 字段承载 icmp type、dst_port 字段承载 icmp code：
+ *   - 只给了 code 没给 type：type 取 0 到 255 通配，code 逐条展开；
+ *   - 给了 type 没给 code：type 取具体值，code 取 0 到 255 通配；
+ *   - 都给了：type 与 code 做笛卡尔积，逐个组合下发。
+ * add 为真走安装，否则走撤销。收尾时把临时占用的 src/dst_port 置空。
+ */
 static void bgp_pbr_icmp_action(struct bgp *bgp, struct bgp_path_info *path,
 				struct bgp_pbr_filter *bpf,
 				struct bgp_pbr_or_filter *bpof, bool add,
@@ -2064,6 +2370,11 @@ static void bgp_pbr_icmp_action(struct bgp *bgp, struct bgp_path_info *path,
 	bpf->dst_port = NULL;
 }
 
+/*
+ * OR 展开撤销的递归主体：从 type_entry 维度开始，逐维取出候选值写入 bpf，
+ * 递归到下一维；走完(或遇 icmp 维度)就落到 remove_from_zebra_unit 撤销单个条目。
+ * 与 add 侧递归结构对称，只是终止动作是撤销。
+ */
 static void bgp_pbr_policyroute_remove_from_zebra_recursive(
 	struct bgp *bgp, struct bgp_path_info *path, struct bgp_pbr_filter *bpf,
 	struct bgp_pbr_or_filter *bpof, uint8_t type_entry)
@@ -2111,6 +2422,10 @@ static void bgp_pbr_policyroute_remove_from_zebra_recursive(
 	}
 }
 
+/*
+ * 撤销入口：若无 OR 集合(bpof 为空)直接撤销单个条目；
+ * 否则按"第一个非空的 OR 维度"启动递归展开撤销。
+ */
 static void bgp_pbr_policyroute_remove_from_zebra(
 	struct bgp *bgp, struct bgp_path_info *path, struct bgp_pbr_filter *bpf,
 	struct bgp_pbr_or_filter *bpof)
@@ -2141,6 +2456,11 @@ static void bgp_pbr_policyroute_remove_from_zebra(
 		bgp_pbr_policyroute_remove_from_zebra_unit(bgp, path, bpf);
 }
 
+/*
+ * 调试打印：把一条 bgp_pbr_filter(加 / 删) 打印成 zlog_debug 日志，
+ * 形如 "BGP: adding FS PBR from ... to ..., proto X ..."。
+ * 注意：若 tcp_flags 带掩码会把协议强制视为 TCP(仅为显示需要)。
+ */
 static void bgp_pbr_dump_entry(struct bgp_pbr_filter *bpf, bool add)
 {
 	struct bgp_pbr_range_port *src_port;
@@ -2245,6 +2565,18 @@ static void bgp_pbr_dump_entry(struct bgp_pbr_filter *bpf, bool add)
 
 }
 
+/*
+ * 安装一个"单元"，是本文件下发路径的核心：
+ *   1) 先按 (rate, nh, vrf, afi) 在 pbr_action_hash 里取/建 action；
+ *      若 action 尚无 fwmark，则判定是丢弃(blackhole)还是普通重定向——
+ *      重定向到别的 VRF 时可直接借用该 VRF 的表 id，否则用分配的 fwmark 作为 table_id。
+ *   2) iprule 分支：构造 bgp_pbr_rule 入 pbr_rule_hash，安装 action 与 ip rule，
+ *      再清理可能存在的、action 不同的旧规则(先装新再删旧，避免流量中断)。
+ *   3) 非 iprule(FlowSpec) 分支：构造 bgp_pbr_match 与 bpme 入表，
+ *      依次下发 ip rule 动作、ipset 集合、ipset 条目、iptables，
+ *      最后清理遗留在其它集合中的同匹配项副本。
+ * 注意：调用方通常已确保不重复安装(见函数内的 listnode_lookup_nocheck 检查)。
+ */
 static void bgp_pbr_policyroute_add_to_zebra_unit(struct bgp *bgp,
 						  struct bgp_path_info *path,
 						  struct bgp_pbr_filter *bpf,
@@ -2277,6 +2609,7 @@ static void bgp_pbr_policyroute_add_to_zebra_unit(struct bgp *bgp,
 	if (BGP_DEBUG(zebra, ZEBRA))
 		bgp_pbr_dump_entry(bpf, true);
 
+	/* 先在动作哈希表里按 (rate, nh, vrf, afi) 取用或新建 action */
 	/* look for bpa first */
 	memset(&temp3, 0, sizeof(temp3));
 	if (rate)
@@ -2291,6 +2624,12 @@ static void bgp_pbr_policyroute_add_to_zebra_unit(struct bgp *bgp,
 	if (nh)
 		vrf = vrf_lookup_by_id(nh->vrf_id);
 	if (bpa->fwmark == 0) {
+		/*
+		 * ba->fwmark 为 0 说明这是新 action，需要分配标识：
+		 * 丢弃(blackhole)不需要查表，直接标记已安装；
+		 * 普通重定向分配 fwmark 作为 table_id，若目标是另一个 VRF
+		 * 且非 backend netns，则直接借用该 VRF 的表 id。
+		 */
 		/* drop is handled by iptable */
 		if (nh && nh->type == NEXTHOP_TYPE_BLACKHOLE) {
 			bpa->table_id = 0;
@@ -2509,6 +2848,11 @@ static void bgp_pbr_policyroute_add_to_zebra_unit(struct bgp *bgp,
 			return;
 		}
 	}
+	/*
+	 * FlowSpec 下发顺序：ip rule 动作 -> ipset 集合 -> ipset 条目 -> iptables。
+	 * 策略不是路由条目，没有 route replace 语义，因此先安装新策略，
+	 * 旧策略再在下面按需清理，以保证最终一致。
+	 */
 	/* BGP FS: append entry to zebra
 	 * - policies are not routing entries and as such
 	 * route replace semantics don't necessarily follow
@@ -2529,6 +2873,7 @@ static void bgp_pbr_policyroute_add_to_zebra_unit(struct bgp *bgp,
 	if (!bpme->installed)
 		bgp_send_pbr_ipset_entry_match(bpme, true);
 
+	/* 最后一步：把集合与动作通过 iptables 规则关联起来 */
 	/* iptables */
 	if (!bpm->installed_in_iptable)
 		bgp_send_pbr_iptable(bpa, bpm, true);
@@ -2553,6 +2898,11 @@ static void bgp_pbr_policyroute_add_to_zebra_unit(struct bgp *bgp,
 
 }
 
+/*
+ * OR 展开安装的递归主体：从 type_entry 维度起，逐个候选值写入 bpf 后递归下一维，
+ * 走完所有维度(或遇 icmp 维度交给 bgp_pbr_icmp_action)就落到 add_to_zebra_unit 安装。
+ * 这是把"或"语义拆成多条实际条目的关键机制。
+ */
 static void bgp_pbr_policyroute_add_to_zebra_recursive(
 	struct bgp *bgp, struct bgp_path_info *path, struct bgp_pbr_filter *bpf,
 	struct bgp_pbr_or_filter *bpof, struct nexthop *nh, float *rate,
@@ -2598,6 +2948,10 @@ static void bgp_pbr_policyroute_add_to_zebra_recursive(
 	}
 }
 
+/*
+ * 安装入口：若无 OR 集合(bpof 为空)直接安装单个条目；
+ * 否则按"第一个非空的 OR 维度"启动递归展开安装。
+ */
 static void bgp_pbr_policyroute_add_to_zebra(struct bgp *bgp,
 					     struct bgp_path_info *path,
 					     struct bgp_pbr_filter *bpf,
@@ -2627,6 +2981,20 @@ static void bgp_pbr_policyroute_add_to_zebra(struct bgp *bgp,
 		bgp_pbr_policyroute_add_to_zebra_unit(bgp, path, bpf, nh, rate);
 }
 
+/*
+ * PBR 主调度器：把 bgp_pbr_entry_main(一条规则的完整视图)落到实际下发动作。
+ * 步骤：
+ *   1) 先从 api 提取 src/dst 前缀、协议、端口 / icmp / tcpflags / dscp / 分片等匹配，
+ *      组装出 bgp_pbr_filter bpf；不能压成单值的 OR 语义维度放进 bgp_pbr_or_filter bpof。
+ *   2) add 为假：直接走撤销路径后跳到 flush_bpof 清理。
+ *   3) add 为真：遍历 api->actions，按动作类型分发——
+ *        ACTION_TRAFFICRATE rate 为 0 时用 blackhole nexthop 表示丢弃，否则仅提取 rate；
+ *        ACTION_REDIRECT_IP  用重定向 IP 构造 nexthop；
+ *        ACTION_REDIRECT     用重定向 VRF 构造 nexthop；
+ *        其它(采样式流量动作 / 打标)当前只告警。
+ *      每个动作最终调用 *_to_zebra 安装；REDIRECT 类动作安装完即结束(continue_loop)。
+ *   4) flush_bpof 释放 bpof 里各列表。
+ */
 static void bgp_pbr_handle_entry(struct bgp *bgp, struct bgp_path_info *path,
 				 struct bgp_pbr_entry_main *api, bool add)
 {
@@ -2776,14 +3144,21 @@ static void bgp_pbr_handle_entry(struct bgp *bgp, struct bgp_path_info *path,
 	bpf.src_port = srcp;
 	bpf.dst_port = dstp;
 	bpf.family = afi2family(api->afi);
+	/* add 为假：这是撤销请求，走撤销路径，随后统一清理 bpof */
 	if (!add) {
 		bgp_pbr_policyroute_remove_from_zebra(bgp, path, &bpf, &bpof);
 		goto flush_bpof;
 	}
+	/*
+	 * add 为真：遍历动作并逐个安装。
+	 * 注意 REDIRECT / REDIRECT_IP 安装后就把 continue_loop 置 0 结束循环，
+	 * 因为重定向类动作不会与后续动作叠加。
+	 */
 	/* no action for add = true */
 	for (i = 0; i < api->action_num; i++) {
 		switch (api->actions[i].action) {
 		case ACTION_TRAFFICRATE:
+			/* 限速为 0 即丢弃：用 blackhole nexthop 表达 drop */
 			/* drop packet */
 			if (api->actions[i].u.r.rate == 0) {
 				struct nexthop nh = {
@@ -2857,6 +3232,7 @@ static void bgp_pbr_handle_entry(struct bgp *bgp, struct bgp_path_info *path,
 			break;
 	}
 
+/* 统一清理 bpof 里各 OR 列表(含其元素)，避免内存泄漏 */
 flush_bpof:
 	if (bpof.tcpflags)
 		list_delete(&bpof.tcpflags);
@@ -2874,6 +3250,13 @@ flush_bpof:
 		list_delete(&bpof.icmp_code);
 }
 
+/*
+ * PBR 对外主入口：由路由(NLRI)变化驱动。
+ *   - 仅处理 SAFI_FLOWSPEC，其它 safi 直接返回；
+ *   - 要求已从 zebra 拿到 table chunk(否则无法分配路由表，直接返回)；
+ *   - 构造 bgp_pbr_entry_main，用 bgp_pbr_build_and_validate_entry 解析并校验；
+ *   - 校验通过后交给 bgp_pbr_handle_entry，nlri_update 决定安装还是撤销。
+ */
 void bgp_pbr_update_entry(struct bgp *bgp, const struct prefix *p,
 			  struct bgp_path_info *info, afi_t afi, safi_t safi,
 			  bool nlri_update)
@@ -2904,12 +3287,14 @@ void bgp_pbr_update_entry(struct bgp *bgp, const struct prefix *p,
 	bgp_pbr_handle_entry(bgp, info, &api, nlri_update);
 }
 
+/* 接口红黑树的比较函数：按键名字符串比较 */
 int bgp_pbr_interface_compare(const struct bgp_pbr_interface *a,
 			  const struct bgp_pbr_interface *b)
 {
 	return strcmp(a->name, b->name);
 }
 
+/* 在给定接口红黑树里按名字查找节点；找不到返回 NULL */
 struct bgp_pbr_interface *bgp_pbr_interface_lookup(const char *name,
 					   struct bgp_pbr_interface_head *head)
 {
@@ -2920,6 +3305,9 @@ struct bgp_pbr_interface *bgp_pbr_interface_lookup(const char *name,
 			head, &pbr_if));
 }
 
+/*
+ * 按 afi 选择 v4 或 v6 接口红黑树，逐个摘下节点并释放，恢复到默认(空)状态。
+ */
 /* this function resets to the default policy routing
  * go back to default status
  */

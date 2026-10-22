@@ -4,6 +4,33 @@
  * Copyright (C) 2017  Cumulus Networks
  * Quentin Young
  */
+/*
+ * 文件导读：termtable.c —— 终端 ASCII 表格生成实现
+ *
+ * 一、这个文件做什么
+ *   实现 termtable.h 的接口：把二维文本渲染成对齐的 ASCII 表格，或转成 json
+ *   数组。用于各类 show 命令输出（如 show ip route、show bgp summary）。
+ *
+ * 二、核心机制
+ *   1. ttable_styles：两张预定义样式表（ASCII 带边框、blank 无边框）。
+ *   2. 单元格与表格的样式（边框 / 内边距 / 对齐）决定最终字符排布。
+ *   3. 渲染流程（ttable_dump）：先统计每列最大宽度，再逐行拼出 left 前缀、
+ *      各单元格、right 后缀，最后在交叉处填角字符。
+ *
+ * 三、关键数据结构
+ *   - struct ttable / ttable_cell / ttable_style / ttable_cellstyle
+ *     （定义见 termtable.h）。
+ *   - 内存统一用 MTYPE_TTABLE 系列宏（XCALLOC / XREALLOC / XFREE）管理；
+ *     临时输出缓冲用 MTYPE_TMP_TTABLE，调用方需自行释放。
+ *
+ * 四、与其他模块的关系
+ *   依赖 lib/json.h 做 json 输出、lib/printfrr.h 做格式化、lib/memory.h 管理内存。
+ *
+ * 五、阅读顺序
+ *   先看预定义样式，再看建表 / 增删行，接着看对齐与内边距，最后看 ttable_dump
+ *   渲染与 ttable_json 输出。
+ */
+
 #include <zebra.h>
 #include <stdio.h>
 
@@ -12,8 +39,17 @@
 #include "memory.h"
 #include "termtable.h"
 
+/*
+ * 注册本文件使用的内存类型 TTABLE（描述为 "ASCII table"），供内存统计与调试。
+ */
 DEFINE_MTYPE_STATIC(LIB, TTABLE, "ASCII table");
 
+/*
+ * ttable_styles — 两张预定义样式表。
+ * 下标 0：默认 ASCII 风格，带 + - | 边框，单元格左右各 1 空格内边距。
+ * 下标 1：blank 风格，全空白无边框、右内边距 3，适合做纯文本对齐。
+ * 顺序须与 termtable.h 中的 TTSTYLE_ASCII / TTSTYLE_BLANK 保持一致。
+ */
 /* clang-format off */
 const struct ttable_style ttable_styles[] = {
 	{	// default ascii
@@ -78,6 +114,10 @@ const struct ttable_style ttable_styles[] = {
 };
 /* clang-format on */
 
+/*
+ * ttable_del — 销毁表格：从末行起逐行释放单元格，再释放行数组与表结构本身。
+ * 注意：采用倒序删除，避免删除过程中数组搬移导致下标错乱。
+ */
 void ttable_del(struct ttable *tt)
 {
 	for (int i = tt->nrows - 1; i >= 0; i--)
@@ -87,6 +127,10 @@ void ttable_del(struct ttable *tt)
 	XFREE(MTYPE_TTABLE, tt);
 }
 
+/*
+ * ttable_new — 分配并初始化一张空表，样式取自 style（复制一份保存）。
+ * 返回新表；行 / 列数置 0，table 置 NULL。注意：style 会被解引用复制，不能为 NULL。
+ */
 struct ttable *ttable_new(const struct ttable_style *style)
 {
 	struct ttable *tt;
@@ -101,6 +145,14 @@ struct ttable *ttable_new(const struct ttable_style *style)
 	return tt;
 }
 
+/*
+ * ttable_insert_row_va — 建表 / 增行的公共实现，按格式串生成一行单元格。
+ * tt：目标表；i：插入位置（-1 表示追加到末尾，否则须落在 [0, nrows]）；
+ * format：以竖线分隔各列的 printf 风格串；ap：已初始化的可变参数列表。
+ * 返回新行第一个单元格指针；列数与已有表不一致时返回 NULL（no-op）。
+ * 副作用：按需扩容行指针数组，用 strsep 以竖线切分并复制各列文本。
+ * 注意：列数由格式串中竖线个数加 1 推定；首行确定整表的列数。
+ */
 /**
  * Inserts or appends a new row at the specified index.
  *
@@ -176,6 +228,10 @@ static struct ttable_cell *ttable_insert_row_va(struct ttable *tt, int i,
 	return row;
 }
 
+/*
+ * ttable_insert_row — 在行号 i 处插入一行（对外接口，可变参数版）。
+ * 内部转发给 ttable_insert_row_va。返回新行首单元格指针或 NULL。
+ */
 struct ttable_cell *ttable_insert_row(struct ttable *tt, unsigned int i,
 				      const char *format, ...)
 {
@@ -189,6 +245,9 @@ struct ttable_cell *ttable_insert_row(struct ttable *tt, unsigned int i,
 	return ret;
 }
 
+/*
+ * ttable_add_row — 在表尾追加一行（可变参数版），等价于 insert 索引取 -1。
+ */
 struct ttable_cell *ttable_add_row(struct ttable *tt, const char *format, ...)
 {
 	struct ttable_cell *ret;
@@ -201,6 +260,10 @@ struct ttable_cell *ttable_add_row(struct ttable *tt, const char *format, ...)
 	return ret;
 }
 
+/*
+ * ttable_del_row — 删除第 i 行：先释放该行各单元格文本与行数组，再前移后续行。
+ * 副作用：nrows 减一；当表变空时把 ncols 也复位为 0。
+ */
 void ttable_del_row(struct ttable *tt, unsigned int i)
 {
 	assert((int)i < tt->nrows);
@@ -219,6 +282,10 @@ void ttable_del_row(struct ttable *tt, unsigned int i)
 		tt->ncols = 0;
 }
 
+/*
+ * ttable_align — 为矩形区域 [row, row+nrow) x [col, col+ncol) 的单元格设置对齐。
+ * 越界时触发 assert。无返回值。
+ */
 void ttable_align(struct ttable *tt, unsigned int row, unsigned int col,
 		  unsigned int nrow, unsigned int ncol, enum ttable_align align)
 {
@@ -232,6 +299,10 @@ void ttable_align(struct ttable *tt, unsigned int row, unsigned int col,
 			tt->table[i][j].style.align = align;
 }
 
+/*
+ * ttable_cell_pad — 单个单元格的内边距设置辅助。
+ * align 为 LEFT 时改左内边距，否则改右内边距（此处 align 复用为"加在哪一侧"）。
+ */
 static void ttable_cell_pad(struct ttable_cell *cell, enum ttable_align align,
 			    short pad)
 {
@@ -241,6 +312,10 @@ static void ttable_cell_pad(struct ttable_cell *cell, enum ttable_align align,
 		cell->style.rpad = pad;
 }
 
+/*
+ * ttable_pad — 为矩形区域单元格设置内边距，逐个调用 ttable_cell_pad。
+ * 越界时触发 assert。无返回值。
+ */
 void ttable_pad(struct ttable *tt, unsigned int row, unsigned int col,
 		unsigned int nrow, unsigned int ncol, enum ttable_align align,
 		short pad)
@@ -255,6 +330,9 @@ void ttable_pad(struct ttable *tt, unsigned int row, unsigned int col,
 			ttable_cell_pad(&tt->table[i][j], align, pad);
 }
 
+/*
+ * ttable_restyle — 用表的默认单元格样式（tt->style.cell）覆盖所有单元格样式。
+ */
 void ttable_restyle(struct ttable *tt)
 {
 	for (int i = 0; i < tt->nrows; i++)
@@ -262,6 +340,11 @@ void ttable_restyle(struct ttable *tt)
 			tt->table[i][j].style = tt->style.cell;
 }
 
+/*
+ * ttable_colseps — 开关第 col 列每一行的左 / 右侧列分隔线。
+ * align 为 RIGHT 设置右侧，否则设置左侧；sep 为分隔字符。
+ * 注意：此处不校验 col 是否越界。
+ */
 void ttable_colseps(struct ttable *tt, unsigned int col,
 		    enum ttable_align align, bool on, char sep)
 {
@@ -276,6 +359,10 @@ void ttable_colseps(struct ttable *tt, unsigned int col,
 	}
 }
 
+/*
+ * ttable_rowseps — 开关第 row 行每个单元格的上 / 下边框。
+ * align 为 TOP 设置上边框，否则设置下边框；sep 为字符。
+ */
 void ttable_rowseps(struct ttable *tt, unsigned int row,
 		    enum ttable_align align, bool on, char sep)
 {
@@ -290,6 +377,13 @@ void ttable_rowseps(struct ttable *tt, unsigned int row,
 	}
 }
 
+/*
+ * ttable_dump — 把表格渲染成堆分配字符串，newline 为要使用的换行序列。
+ * 返回文本；调用方须用 XFREE(MTYPE_TMP_TTABLE, buf) 释放。
+ * 流程：先按列统计最大宽度（含内边距与边框），算出总行数与行宽，再逐行拼接
+ * left 前缀、各单元格、right 后缀；带边框的行在交叉处填入角字符。
+ * 注意：以每行第 0 列的上下边框开关作为整行的边框开关；越界会 assert。
+ */
 char *ttable_dump(struct ttable *tt, const char *newline)
 {
 	/* clang-format off */
@@ -487,6 +581,13 @@ char *ttable_dump(struct ttable *tt, const char *newline)
 	return buf;
 }
 
+/*
+ * ttable_json_internal — 表格转 json 数组的内部实现。
+ * tt：目标表；formats：每列类型标识（d 或 l 为整数，f 为浮点，其余按字符串）；
+ * row_text：可选的键名数组（NULL 则用表首行文本作键名）。
+ * 返回 json 数组（由对象组成，每个对象是一条数据行）。
+ * 注意：从第 1 行开始（第 0 行按表头处理）。
+ */
 /* Crude conversion from ttable to json array.
  * Assume that the first row has column headings.
  *
@@ -536,11 +637,19 @@ static json_object *ttable_json_internal(struct ttable *tt,
 	return json;
 }
 
+/*
+ * ttable_json — 对外接口：把表格转 json 数组，键名取自表首行。
+ */
 json_object *ttable_json(struct ttable *tt, const char *const formats)
 {
 	return ttable_json_internal(tt, formats, NULL);
 }
 
+/*
+ * ttable_json_with_json_text — 用 json_override_text 覆盖键名后再转 json。
+ * 若未提供覆盖串或列数不匹配，则退回到默认（以表首行文本作键名）。
+ * 内部用竖线切分覆盖串，临时分配的键名数组用完后释放。
+ */
 json_object *ttable_json_with_json_text(struct ttable *tt,
 					const char *const formats,
 					const char *json_override_text)

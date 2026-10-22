@@ -3,6 +3,43 @@
  * Copyright (c) 2019  David Lamparter, for NetDEF, Inc.
  */
 
+/*
+ * ============================================================
+ * 【文件导读】strformat.c —— FRR 自研格式化(printfrr)扩展实现
+ * ============================================================
+ *
+ * 一、职责
+ *   实现并注册一批 printfrr 格式化扩展(%pXXX)，让 FRR 的日志 /
+ *   show 输出能直接打印十六进制转储、需转义的字符串、字符串数组
+ *   以及各种时间格式，而不必到处手写临时代码。
+ *
+ * 二、核心概念
+ *   - printfrr_ext_autoreg_p：注册“指针型”扩展的宏，第二个参数是
+ *     格式化函数，首个参数 match 决定 %p 后匹配的串，如 "HX"。
+ *   - struct fbuf 与 bputch / bputs / bputhex：输出缓冲与写原语。
+ *   - struct printfrr_eargs(ea)：本次格式化的精度 / 宽度 / 当前
+ *     fmt 指针；扩展可继续消费 ea->fmt 中的子说明符。
+ *   - printfrr_ext_len(ea)：把精度或宽度解释为“输入字节长度”。
+ *
+ * 三、本文件注册的扩展
+ *   - HX 十六进制转储(c 用冒号分隔 / n 无分隔)；
+ *   - HS 十六进制转储的 ASCII 旁列；
+ *   - SE 转义字符串(ESC_ALL)；SQ 引号化 / 转义(n / q / s)；
+ *   - SA 字符串数组(d 表示动态数组 darr)；
+ *   - TS / TV / TT 分别格式化 timespec / timeval / time_t。
+ *
+ * 四、阅读顺序
+ *   先读 HX / HS(最简逐字节示例)，再读 escape_flags 与 bquote、
+ *   SE、SQ，然后 SA，最后是 printfrr_time 及其派生函数。
+ *
+ * 五、易踩的坑
+ *   - 所有回调返回“本应写入的长度”，与 buf 是否够长无关。
+ *   - 扩展通过 ea->fmt++ 消费子说明符，读取顺序敏感。
+ *   - 时间分绝对(日历)与相对(时长)两类，由 TIMEFMT_ABSOLUTE 与
+ *     TIMEFMT_ANCHORS 的异或决定走 abstime 还是 reltime。
+ *   - 负数相对时间要拆成 tv_sec 与 tv_nsec 规范化，易算错。
+ * ============================================================
+ */
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
@@ -13,11 +50,15 @@
 #include <ctype.h>
 #include <time.h>
 
+/* darr.h 动态数组；printfrr.h 扩展框架；monotime.h 时间与 TIMEFMT_* 标志 */
 #include "darr.h"
 #include "printfrr.h"
 #include "monotime.h"
 
+/* 注册指针型扩展 "HX"：用户写 %p HX 时调用 printfrr_hexdump */
 printfrr_ext_autoreg_p("HX", printfrr_hexdump);
+/* 十六进制转储实现：把 ptr 指向的 input_len 字节逐字节以两位十六进
+ * 制输出；默认空格分隔，fmt 为 'c' 用冒号、为 'n' 不用分隔符 */
 static ssize_t printfrr_hexdump(struct fbuf *buf, struct printfrr_eargs *ea,
 				const void *ptr)
 {
@@ -48,7 +89,9 @@ static ssize_t printfrr_hexdump(struct fbuf *buf, struct printfrr_eargs *ea,
 
 /* string analog for hexdumps / the "this." in ("74 68 69 73 0a  |this.|") */
 
+/* 注册指针型扩展 "HS"：hexdump 的字符串旁列 */
 printfrr_ext_autoreg_p("HS", printfrr_hexdstr);
+/* 字符串旁列实现：可打印 ASCII(0x20~0x7e)原样输出，其余以 '.' 代替 */
 static ssize_t printfrr_hexdstr(struct fbuf *buf, struct printfrr_eargs *ea,
 				const void *ptr)
 {
@@ -69,6 +112,7 @@ static ssize_t printfrr_hexdstr(struct fbuf *buf, struct printfrr_eargs *ea,
 	return ret;
 }
 
+/* 转义标志位：控制 bquote 对哪类字符加反斜杠或改用转义序列 */
 enum escape_flags {
 	ESC_N_R_T	= (1 << 0),	/* use \n \r \t instead of \x0a ...*/
 	ESC_SPACE	= (1 << 1),	/* \  */
@@ -86,6 +130,11 @@ enum escape_flags {
 	/* if needed: ESC_SHELL = ... */
 };
 
+/*
+ * 转义核心：按 flags 决定对哪类字符加反斜杠；字母数字与一批安全
+ * 符号直接输出，\r\n\t 可转成 \r\n\t 序列，其余不可打印字节输出
+ * 为 \xHH 形式。返回应写入长度。
+ */
 static ssize_t bquote(struct fbuf *buf, const uint8_t *pos, size_t len,
 		      unsigned int flags)
 {
@@ -191,7 +240,10 @@ static ssize_t bquote(struct fbuf *buf, const uint8_t *pos, size_t len,
 	return ret;
 }
 
+/* 注册指针型扩展 "SE"(escape)：以 ESC_ALL 规则转义字符串 */
 printfrr_ext_autoreg_p("SE", printfrr_escape);
+/* 转义实现：fmt 为 'n' 时空指针输出空串，否则 NULL 输出 "(null)"；
+ * len<0 时用 strlen 求长，最终交给 bquote */
 static ssize_t printfrr_escape(struct fbuf *buf, struct printfrr_eargs *ea,
 			       const void *vptr)
 {
@@ -216,7 +268,10 @@ static ssize_t printfrr_escape(struct fbuf *buf, struct printfrr_eargs *ea,
 	return bquote(buf, ptr, len, ESC_ALL);
 }
 
+/* 注册指针型扩展 "SQ"(quote)：引号化 / 转义字符串 */
 printfrr_ext_autoreg_p("SQ", printfrr_quote);
+/* 引号化实现：先解析子修饰 n(空指针视为空串)、q(两侧加双引号)、
+ * s(采用 syslog RFC5424 风格转义)，再按选定标志调用 bquote */
 static ssize_t printfrr_quote(struct fbuf *buf, struct printfrr_eargs *ea,
 			      const void *vptr)
 {
@@ -263,7 +318,10 @@ static ssize_t printfrr_quote(struct fbuf *buf, struct printfrr_eargs *ea,
 	return ret;
 }
 
+/* 注册指针型扩展 "SA"(string array)：把字符串数组用逗号逐个连接 */
 printfrr_ext_autoreg_p("SA", printfrr_str_array);
+/* 数组实现：fmt 为 'd' 表示动态数组(darr)，长度由 darr_len 求得；
+ * 固定数组在首个 NULL 处停止，darr 里的 NULL 则输出 "(null)" */
 static ssize_t printfrr_str_array(struct fbuf *buf, struct printfrr_eargs *ea, const void *vptr)
 {
 	ssize_t len = printfrr_ext_len(ea);
@@ -298,11 +356,17 @@ static ssize_t printfrr_str_array(struct fbuf *buf, struct printfrr_eargs *ea, c
 	return olen;
 }
 
+/* 时间格式化的两条实现路径：绝对(日历)与相对(时长)，见下方定义 */
 static ssize_t printfrr_abstime(struct fbuf *buf, struct printfrr_eargs *ea,
 				const struct timespec *ts, unsigned int flags);
 static ssize_t printfrr_reltime(struct fbuf *buf, struct printfrr_eargs *ea,
 				const struct timespec *ts, unsigned int flags);
 
+/*
+ * 时间格式化入口：先(若非 PRESELECT)解析输入类型 I / M / R 与锚点
+ * 方向 s / u，再按“绝对 XOR 锚点”选择走 abstime 还是 reltime 路径，
+ * 使结果语义一致。返回应写入长度。
+ */
 ssize_t printfrr_time(struct fbuf *buf, struct printfrr_eargs *ea,
 		      const struct timespec *ts, unsigned int flags)
 {
@@ -343,6 +407,10 @@ ssize_t printfrr_time(struct fbuf *buf, struct printfrr_eargs *ea,
 		return printfrr_reltime(buf, ea, ts, flags);
 }
 
+/*
+ * 输出小数秒：按 precision 取 tv_nsec 的高位数字(如 .123)；精度
+ * <=0 或要求整秒(TIMEFMT_SECONDS)时不输出；精度上限截到 9 位。
+ */
 static ssize_t do_subsec(struct fbuf *buf, const struct timespec *ts,
 			 int precision, unsigned int flags)
 {
@@ -359,6 +427,11 @@ static ssize_t do_subsec(struct fbuf *buf, const struct timespec *ts,
 	return bprintfrr(buf, ".%0*llu", precision, frac);
 }
 
+/*
+ * 绝对时间(日历)格式化：解析子修饰 p(用空格分隔日期与时间)与
+ * i(ISO8601 的 T 分隔)，把输入统一换算成 realtime 时间点后输出；
+ * 支持 realtime / monotonic / since / until 四种输入解释。
+ */
 static ssize_t printfrr_abstime(struct fbuf *buf, struct printfrr_eargs *ea,
 				const struct timespec *ts, unsigned int flags)
 {
@@ -437,6 +510,11 @@ static ssize_t printfrr_abstime(struct fbuf *buf, struct printfrr_eargs *ea,
 	return ret;
 }
 
+/*
+ * 相对时间(时长)格式化：解析子修饰 p(空格) t(basic) d(十进制秒)
+ * m(MM:SS) h(HH:MM:SS) x(负值 / 零显示占位横线)，按需换算成
+ * 周 / 天 / 时 / 分 / 秒并选择输出样式。
+ */
 static ssize_t printfrr_reltime(struct fbuf *buf, struct printfrr_eargs *ea,
 				const struct timespec *ts, unsigned int flags)
 {
@@ -584,7 +662,9 @@ static ssize_t printfrr_reltime(struct fbuf *buf, struct printfrr_eargs *ea,
 	return ret;
 }
 
+/* 注册指针型扩展 "TS"(timespec)：直接格式化 struct timespec */
 printfrr_ext_autoreg_p("TS", printfrr_ts);
+/* timespec 扩展实现：vptr 即 struct timespec 指针，交给 printfrr_time */
 static ssize_t printfrr_ts(struct fbuf *buf, struct printfrr_eargs *ea,
 			   const void *vptr)
 {
@@ -593,7 +673,10 @@ static ssize_t printfrr_ts(struct fbuf *buf, struct printfrr_eargs *ea,
 	return printfrr_time(buf, ea, ts, 0);
 }
 
+/* 注册指针型扩展 "TV"(timeval)：先转成 timespec 再格式化 */
 printfrr_ext_autoreg_p("TV", printfrr_tv);
+/* timeval 扩展实现：NULL 直接交给 printfrr_time 处理(输出 '-')，
+ * 否则 tv_usec*1000 得到 nsec */
 static ssize_t printfrr_tv(struct fbuf *buf, struct printfrr_eargs *ea,
 			   const void *vptr)
 {
@@ -608,7 +691,10 @@ static ssize_t printfrr_tv(struct fbuf *buf, struct printfrr_eargs *ea,
 	return printfrr_time(buf, ea, &ts, 0);
 }
 
+/* 注册指针型扩展 "TT"(time_t)：以 TIMEFMT_SECONDS 输出整秒 */
 printfrr_ext_autoreg_p("TT", printfrr_tt);
+/* time_t 扩展实现：无论 NULL 与否都带 TIMEFMT_SECONDS 调用
+ * printfrr_time，只显示秒精度 */
 static ssize_t printfrr_tt(struct fbuf *buf, struct printfrr_eargs *ea,
 			   const void *vptr)
 {

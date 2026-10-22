@@ -5,6 +5,37 @@
  *		       Pushpasis Sarkar <spushpasis@vmware.com>
  */
 
+/*
+ * 文件导读：mgmt_be_client.c —— backend 客户端实现
+ *
+ * 各功能 daemon（zebra、bgpd 等）通过本文件把自己注册成 mgmtd 的“后端客户端”，
+ * 从而参与 mgmtd 的配置事务与运行状态查询。它建立在 mgmt_msg 的消息骨架和
+ * mgmt_msg_native 的原生消息格式之上。
+ *
+ * 一、连接建立
+ *   mgmt_be_client_create() 创建一个 mgmt_be_client（内含 struct msg_client），
+ *   通过 msg_client_init() 按指定 sopath 连接 mgmtd 的 backend 服务端，并在
+ *   连接 / 断开时收到 client_connect_notify 回调。连上后立即发送订阅消息，把
+ *   cbs 里声明的 config / oper / notify / rpc xpath 注册给 mgmtd。
+ *
+ * 二、消息处理
+ *   收到的原生消息进入 handle_msg，按 code 分派：
+ *     - TXN_REQ / CFG_REQ / CFG_APPLY_REQ：配置事务的创建、下发、应用；
+ *     - GET_TREE：查询本 daemon 负责的运行状态数据并回 TREE_DATA；
+ *     - RPC / EDIT / LOCK / COMMIT：来自前端的请求（经 mgmtd 中转）。
+ *
+ * 三、配置提交 / 回滚调用链
+ *   mgmtd 决定提交候选配置时，向 backend 下发 CFG_REQ 携带变更；本端累计到事务
+ *   上下文（mgmt_be_txn_ctx，含 candidate_config / nb_txn），收到 CFG_APPLY_REQ
+ *   后调用 northbound 的候选提交（prepare / apply / abort）真正落地；失败则
+ *   abort 回滚。事务对象的创建 / 删除分别由 mgmt_be_txn_create /
+ *   mgmt_be_txn_delete 负责，mgmt_be_find_txn_by_id 按 txn_id 查找。
+ *
+ * 四、阅读建议
+ *   先读 mgmt_be_txn_ctx 与 mgmt_be_client 两个结构，再顺着
+ *   mgmt_be_client_create -> 订阅 -> 收 CFG_REQ -> 收 CFG_APPLY_REQ 的路径读，
+ *   最后看 GET_TREE 状态查询与通知发送。
+ */
 #include <zebra.h>
 #include "debug.h"
 #include "compiler.h"
@@ -22,17 +53,34 @@
 
 #include "lib/mgmt_be_client_clippy.c"
 
+/*
+ * 为 backend 客户端相关的对象注册内存类型（客户端、名称、事务批次、事务、
+ * get-tree 回调参数），便于内存统计与泄漏定位。
+ */
 DEFINE_MTYPE_STATIC(LIB, MGMTD_BE_CLIENT, "backend client");
 DEFINE_MTYPE_STATIC(LIB, MGMTD_BE_CLIENT_NAME, "backend client name");
 DEFINE_MTYPE_STATIC(LIB, MGMTD_BE_BATCH, "backend transaction batch data");
 DEFINE_MTYPE_STATIC(LIB, MGMTD_BE_TXN, "backend transaction data");
 DEFINE_MTYPE_STATIC(LIB, MGMTD_BE_GT_CB_ARGS, "backend get-tree cb args");
 
+/*
+ * 构建运行状态（oper）数据树时的迭代上下文：root 是正在构建的树根，hint 是
+ * 最后一次加入的节点（用于加速后续插入 / 定位）。
+ */
 struct be_oper_iter_arg {
 	struct lyd_node *root; /* the tree we are building */
 	struct lyd_node *hint; /* last node added */
 };
 
+/*
+ * backend 侧的一次配置事务上下文：
+ *   txn_id            mgmtd 分配的事务 id；
+ *   flags             事务标志（如 CFGPREP_FAILED 表示配置准备阶段失败）；
+ *   client_data       透传给上层的客户端事务私有数据；
+ *   client            所属的 backend 客户端；
+ *   candidate_config   候选配置（从 running_config 复制而来，逐步累积变更）；
+ *   nb_txn / nb_txn_id northbound 事务对象及其 id（提交阶段使用）。
+ */
 struct mgmt_be_txn_ctx {
 	/* Txn-Id as assigned by MGMTD */
 	uint64_t txn_id;
@@ -47,6 +95,16 @@ struct mgmt_be_txn_ctx {
 };
 #define MGMTD_BE_TXN_FLAGS_CFGPREP_FAILED (1U << 1)
 
+/*
+ * backend 客户端对象：内嵌一个 msg_client（连接层），再加业务字段。
+ *   client          底层消息客户端（含连接与收发状态）；
+ *   name            客户端名称；
+ *   running_config  当前生效配置的副本（作为创建候选配置的基线）；
+ *   num_/avg_ 系列   各类操作的计数与平均耗时统计（edit / prep / apply）；
+ *   config_txn      当前进行中的配置事务（同一时刻最多一个）；
+ *   cbs             上层提供的回调与 xpath 声明；
+ *   user_data       上层私有数据，随回调回传。
+ */
 struct mgmt_be_client {
 	struct msg_client client;
 
@@ -67,14 +125,25 @@ struct mgmt_be_client {
 	uintptr_t user_data;
 };
 
+/*
+ * backend 客户端调试开关（对应 “debug mgmt client backend”）。
+ */
 struct debug mgmt_dbg_be_client = {
 	.conf = "debug mgmt client backend",
 	.desc = "Management backend client operations",
 };
 
 /* NOTE: only one client per proc for now. */
+/*
+ * 进程内唯一的 backend 客户端指针。当前实现限制每个进程只能有一个 backend
+ * 客户端，故用全局变量保存。
+ */
 static struct mgmt_be_client *__be_client;
 
+/*
+ * 以原生消息版本向 mgmtd 发送一条消息的薄封装。short_circuit_ok 指示是否允许
+ * 短接发送。返回底层发送函数的返回值。
+ */
 static int be_client_send_native_msg(struct mgmt_be_client *client_ctx,
 				     void *msg, size_t len,
 				     bool short_circuit_ok)
@@ -84,6 +153,10 @@ static int be_client_send_native_msg(struct mgmt_be_client *client_ctx,
 				 short_circuit_ok);
 }
 
+/*
+ * 按 txn_id 查找当前配置事务。当前实现仅维护一个 config_txn，故只与它比较；
+ * warn 为真且未命中时打印错误日志。找到返回事务对象，否则返回 NULL。
+ */
 static struct mgmt_be_txn_ctx *
 mgmt_be_find_txn_by_id(struct mgmt_be_client *client_ctx, uint64_t txn_id,
 		       bool warn)
@@ -95,6 +168,11 @@ mgmt_be_find_txn_by_id(struct mgmt_be_client *client_ctx, uint64_t txn_id,
 	return NULL;
 }
 
+/*
+ * 为给定 txn_id 创建配置事务：若已存在同 id 事务则报错；否则分配事务对象、
+ * 从当前 running_config 复制出 candidate_config，并登记为当前 config_txn。
+ * 返回新事务对象，失败返回 NULL。
+ */
 static struct mgmt_be_txn_ctx *
 mgmt_be_txn_create(struct mgmt_be_client *client_ctx, uint64_t txn_id)
 {
@@ -128,6 +206,11 @@ mgmt_be_txn_create(struct mgmt_be_client *client_ctx, uint64_t txn_id)
 	return txn;
 }
 
+/*
+ * 删除一个配置事务：从客户端上取消登记，若仍有未结束的 northbound 事务则中止
+ * （nb_candidate_commit_abort），释放候选配置与事务对象。入参为 NULL 时直接
+ * 返回。
+ */
 static void mgmt_be_txn_delete(struct mgmt_be_txn_ctx *txn)
 {
 	struct mgmt_be_client *client_ctx;
@@ -154,6 +237,10 @@ static void mgmt_be_txn_delete(struct mgmt_be_txn_ctx *txn)
 	XFREE(MTYPE_MGMTD_BE_TXN, txn);
 }
 
+/*
+ * 清理客户端上所有事务（当前即删除 config_txn），并断言已清空。常用于断开连接
+ * 或销毁客户端前。
+ */
 static void mgmt_be_cleanup_all_txns(struct mgmt_be_client *client_ctx)
 {
 	mgmt_be_txn_delete(client_ctx->config_txn);
@@ -180,6 +267,16 @@ static int be_client_send_error(struct mgmt_be_client *client, uint64_t txn_id,
 				int16_t error, const char *errfmt, ...)
 	PRINTFRR(6, 7);
 
+/*
+ * 向 mgmtd 发送一条原生错误消息。
+ *   client  backend 客户端；
+ *   txn_id  该错误相关的事务 id；
+ *   req_id  该错误对应的请求 id；
+ *   short_circuit_ok 是否允许短接；
+ *   error   错误值；
+ *   errfmt / ... 变参错误描述。
+ * 返回底层发送函数的返回值。
+ */
 static int be_client_send_error(struct mgmt_be_client *client, uint64_t txn_id,
 				uint64_t req_id, bool short_circuit_ok,
 				int16_t error, const char *errfmt, ...)
@@ -195,6 +292,15 @@ static int be_client_send_error(struct mgmt_be_client *client, uint64_t txn_id,
 	return ret;
 }
 
+/*
+ * 构造并发送一条数据存储 / 普通通知：按 op 决定通知类型，用原生 xpath, data
+ * 格式编码 xpath，若带 tree 则追加其 JSON 序列化数据，最后发给 mgmtd。
+ *   xpath     通知路径（普通通知时可只给 tree）；
+ *   tree      相关数据树；
+ *   op        NOTIFY_OP_*；
+ *   refer_id  关联的请求 / 会话 id。
+ * 返回 0 成功，非 0 失败。
+ */
 static int __send_notification(struct mgmt_be_client *client, const char *xpath,
 			       const struct lyd_node *tree, uint8_t op, uint64_t refer_id)
 {
@@ -245,6 +351,9 @@ done:
 /**
  * mgmt_be_send_ds_delete_notification() - Send DS notification to mgmtd
  */
+/*
+ * 向 mgmtd 发送“数据存储删除”通知（删除 path 处的数据）。未连接时返回 1。
+ */
 int mgmt_be_send_ds_delete_notification(const char *path)
 {
 	if (!__be_client) {
@@ -258,6 +367,9 @@ int mgmt_be_send_ds_delete_notification(const char *path)
 /**
  * mgmt_be_send_ds_patch_notification() - Send a YANG patch DS notification to mgmtd
  */
+/*
+ * 向 mgmtd 发送“数据存储 patch”通知，patch 为增量数据树。未连接时返回 1。
+ */
 int mgmt_be_send_ds_patch_notification(const char *path, const struct lyd_node *patch)
 {
 	if (!__be_client) {
@@ -270,6 +382,10 @@ int mgmt_be_send_ds_patch_notification(const char *path, const struct lyd_node *
 
 /**
  * mgmt_be_send_ds_replace_notification() - Send a replace DS notification to mgmtd
+ */
+/*
+ * 向 mgmtd 发送“数据存储替换 / 获取同步”通知：refer_id 非 0 时以 GET_SYNC
+ * 语义发送（用于状态同步），否则为 REPLACE。未连接时返回 1。
  */
 int mgmt_be_send_ds_replace_notification(const char *path, const struct lyd_node *tree,
 					 uint64_t refer_id)
@@ -290,6 +406,9 @@ int mgmt_be_send_ds_replace_notification(const char *path, const struct lyd_node
  *
  * This function is attached to the northbound notification hook.
  */
+/*
+ * 北向通知钩子：把一条普通通知（NOTIFY_OP_NOTIFICATION）转发给 mgmtd，恒返回 0。
+ */
 static int mgmt_be_send_notification(void *__client, const char *path, const struct lyd_node *tree)
 {
 	__send_notification(__client, path, tree, NOTIFY_OP_NOTIFICATION, 0);
@@ -304,6 +423,10 @@ static int mgmt_be_send_notification(void *__client, const char *path, const str
 /* Receive Config from MgmtD */
 /* ------------------------- */
 
+/*
+ * 向 mgmtd 应答一条配置下发（CFG_REQ / apply）结果：成功时发送 CFG_REPLY，
+ * 失败时改发错误消息（带 error_if_any 描述）。返回 0 成功，非 0 失败。
+ */
 static int mgmt_be_send_cfg_reply(struct mgmt_be_client *client_ctx, uint64_t txn_id, bool success,
 				  const char *error_if_any)
 {
@@ -327,6 +450,10 @@ static int mgmt_be_send_cfg_reply(struct mgmt_be_client *client_ctx, uint64_t tx
 	return ret;
 }
 
+/*
+ * 中止事务的配置准备：若已有未结束的 northbound 事务则回滚（nb_candidate_commit_abort）
+ * 并清空 nb_txn。通常在校验 / 准备失败时调用。
+ */
 static void mgmt_be_txn_cfg_abort(struct mgmt_be_txn_ctx *txn)
 {
 	char errmsg[BUFSIZ] = {0};
@@ -344,6 +471,12 @@ static void mgmt_be_txn_cfg_abort(struct mgmt_be_txn_ctx *txn)
 /* Received All Configuration, Prepare and Validate */
 /* ------------------------------------------------ */
 
+/*
+ * 把一串配置变更应用到候选配置（candidate_config）。changes 为字符串数组，
+ * 最后一个元素是“动作串”：'m' 表示修改（消耗 1 个 xpath 和 1 个值），'d' 表示
+ * 删除（消耗 1 个 xpath）。逐条调用 nb_candidate_edit_config_change 落地；
+ * 出错时把错误信息写入 err_buf。返回 true 表示有错。
+ */
 static bool be_client_change_edit_config(struct nb_config *candidate_config, const char **changes,
 					 char *err_buf, int err_bufsize)
 {
@@ -409,6 +542,14 @@ static bool be_client_change_edit_config(struct nb_config *candidate_config, con
  * change TXN at a time.
  *
  * Return: true if the connection should be dropped.
+ */
+/*
+ * 为给定 txn_id 的配置做“准备”（prepare）：创建事务，把 config 变更应用到
+ * 候选配置，再用 nb_candidate_commit_prepare 生成 northbound 事务并做校验；
+ * 随后把结果用 CFG_REPLY 或错误消息回给 mgmtd。若出错则中止并删除事务。
+ * 返回 true 表示连接应被丢弃（致命错误，或应答发送失败）。
+ * 注意：当前假设同一时刻只有一个变更事务；校验失败属可回复错误，其它错误才
+ * 断开连接。
  */
 static bool mgmt_be_txn_cfg_prepare(struct mgmt_be_client *client_ctx, uint64_t txn_id,
 				    const char **config)
@@ -541,6 +682,10 @@ done:
 	return disconnect;
 }
 
+/*
+ * 处理 CFG_REQ：把消息里的配置字符串区解码成字符串数组，交给
+ * mgmt_be_txn_cfg_prepare 准备；任何失败都断开连接。
+ */
 static void be_client_handle_cfg(struct mgmt_be_client *client, uint64_t txn_id, void *msgbuf,
 				 size_t msg_len)
 {
@@ -573,6 +718,10 @@ failed:
 /* Apply Config Message Handling */
 /* ----------------------------- */
 
+/*
+ * 向 mgmtd 发送配置应用（CFG_APPLY_REQ）的应答 CFG_APPLY_REPLY。返回底层发送
+ * 返回值（当前实现未使用 success / error_if_any 参数）。
+ */
 static int mgmt_be_send_apply_reply(struct mgmt_be_client *client_ctx,
 				    uint64_t txn_id, bool success,
 				    const char *error_if_any)
@@ -592,6 +741,10 @@ static int mgmt_be_send_apply_reply(struct mgmt_be_client *client_ctx,
 	return ret;
 }
 
+/*
+ * 真正应用事务中准备好的配置：调用 nb_candidate_commit_apply 一次性提交，
+ * 更新耗时统计，回 CFG_APPLY_REPLY，然后删除事务。返回 true 表示连接应被丢弃。
+ */
 static bool mgmt_be_txn_proc_cfgapply(struct mgmt_be_txn_ctx *txn)
 {
 	struct mgmt_be_client *client_ctx;
@@ -631,6 +784,10 @@ static bool mgmt_be_txn_proc_cfgapply(struct mgmt_be_txn_ctx *txn)
 	return disconnect;
 }
 
+/*
+ * 处理 CFG_APPLY_REQ：按 txn_id 找到当前事务并执行应用；找不到或应用失败则
+ * 断开连接。
+ */
 static void be_client_handle_cfg_apply(struct mgmt_be_client *client, uint64_t txn_id)
 {
 	struct mgmt_be_txn_ctx *txn = NULL;
@@ -648,6 +805,10 @@ static void be_client_handle_cfg_apply(struct mgmt_be_client *client, uint64_t t
 
 /*
  * This currently serves as the CFG_ABORT
+ */
+/*
+ * 处理 TXN_REQ 消息。当前实现里它承担“CFG_ABORT”语义：中止并删除对应的事务
+ * （详见函数体的分派逻辑）。
  */
 static void be_client_handle_txn_req(struct mgmt_be_client *client, uint64_t txn_id, void *msgbuf,
 				     size_t msg_len)
@@ -671,6 +832,10 @@ failed:
 }
 
 
+/*
+ * 处理 get-tree 请求时分批回送状态数据所用的参数：记录发起请求的客户端、
+ * 事务 id、请求 id 以及结果的格式。
+ */
 struct be_client_tree_data_batch_args {
 	struct mgmt_be_client *client;
 	uint64_t txn_id;
@@ -680,6 +845,12 @@ struct be_client_tree_data_batch_args {
 
 /*
  * Process the get-tree request on our local oper state
+ */
+/*
+ * nb_oper_walk 的回调，用于把遍历得到的状态数据分批（batch）回送给 mgmtd。
+ * ret 为 NB_YIELD 时表示还有后续数据（more 置真）；出错时回送错误消息；
+ * 否则把 tree 序列化进 TREE_DATA 消息发回。返回 NB_OK / NB_ERR，并据是否
+ * 还有后续来决定是否释放 args。
  */
 static enum nb_error be_client_send_tree_data_batch(const struct lyd_node *tree,
 						    void *arg, enum nb_error ret)
@@ -735,6 +906,10 @@ done:
 /*
  * Process the get-tree request on our local oper state
  */
+/*
+ * 处理 GET_TREE（后端 oper 状态查询）：准备回调参数，调用 nb_oper_walk 遍历
+ * 本 daemon 的 oper 数据，由 be_client_send_tree_data_batch 分批回送结果。
+ */
 static void be_client_handle_get_tree(struct mgmt_be_client *client,
 				      uint64_t txn_id, void *msgbuf,
 				      size_t msg_len)
@@ -759,6 +934,10 @@ static void be_client_handle_get_tree(struct mgmt_be_client *client,
 		   be_client_send_tree_data_batch, args);
 }
 
+/*
+ * 发送 RPC 应答：把 output 数据树按 result_type 序列化进 RPC_REPLY 消息发回，
+ * 并释放 output；序列化失败则改发错误消息。
+ */
 static void be_client_send_rpc_reply(struct mgmt_be_client *client,
 				     uint64_t txn_id, uint64_t req_id,
 				     uint8_t result_type,
@@ -800,6 +979,11 @@ done:
 
 /*
  * Process the RPC request.
+ */
+/*
+ * 处理来自前端的 RPC / action 请求：解码 xpath 与数据，查找对应 schema 节点与
+ * rpc 回调，按 RESTCONF 或普通方式解析输入（无输入则建空容器），构造输出节点，
+ * 调用 nb_callback_rpc 执行，最后回送 RPC_REPLY。任一环节出错都回送错误消息。
  */
 static void be_client_handle_rpc(struct mgmt_be_client *client, uint64_t txn_id,
 				 void *msgbuf, size_t msg_len)
@@ -889,6 +1073,11 @@ static void be_client_handle_rpc(struct mgmt_be_client *client, uint64_t txn_id,
 /*
  * Process the notification.
  */
+/*
+ * 处理通知：解码 xpath（与可选数据），查找 schema 节点；若是 YANG 通知且该节点
+ * 有 notify 回调则解析通知数据，否则向上查找父节点上的数据存储级回调。命中后
+ * 调用 nb_callback_notify 分发，最后释放临时的数据树。
+ */
 static void be_client_handle_notify(struct mgmt_be_client *client, void *msgbuf,
 				    size_t msg_len)
 {
@@ -962,6 +1151,10 @@ static void be_client_handle_notify(struct mgmt_be_client *client, void *msgbuf,
 /*
  * Process a notify select msg
  */
+/*
+ * 处理通知选择器（notify-select）：解码选择器数组；get_only 为假时更新通知
+ * 过滤器（replace 决定是否替换），为真时按选择器做一次状态获取（用于初始快照）。
+ */
 static void be_client_handle_notify_select(struct mgmt_be_client *client, void *msgbuf,
 					   size_t msg_len)
 {
@@ -982,6 +1175,11 @@ static void be_client_handle_notify_select(struct mgmt_be_client *client, void *
  * Handle a native encoded message
  *
  * We don't create transactions with native messaging.
+ */
+/*
+ * 原生消息总入口：按 msg->code 分派到各处理函数（TXN_REQ / CFG_REQ /
+ * CFG_APPLY_REQ / GET_TREE / RPC / NOTIFY / NOTIFY_SELECT）；未知类型回送错误
+ * 消息。txn_id 取自消息头部的 refer_id。
  */
 static void be_client_handle_native_msg(struct mgmt_be_client *client,
 					struct mgmt_msg_header *msg,
@@ -1024,6 +1222,11 @@ static void be_client_handle_native_msg(struct mgmt_be_client *client,
 	}
 }
 
+/*
+ * 连接层的消息处理回调（注册给 msg_client）：把收到的数据反解为原生消息并交给
+ * be_client_handle_native_msg；长度不足则报错。protobuf 版本已不再支持，收到即
+ * 断开连接。
+ */
 static void mgmt_be_client_process_msg(uint8_t version, uint8_t *data,
 				       size_t len, struct msg_conn *conn)
 {
@@ -1053,6 +1256,11 @@ static void mgmt_be_client_process_msg(uint8_t version, uint8_t *data,
  * @client: the client.
  *
  * Return: 0 on success, negative value on error.
+ */
+/*
+ * 向 mgmtd 发送订阅请求：把客户端名以及 cbs 里声明的 config / oper / notify /
+ * rpc xpath 依次写入 SUBSCRIBE 消息（用原生字符串序列编码）并发送。
+ * 返回 0 成功，负值失败。
  */
 static int mgmt_be_send_subscribe(struct mgmt_be_client *client)
 {
@@ -1092,6 +1300,11 @@ static int mgmt_be_send_subscribe(struct mgmt_be_client *client)
 	return ret;
 }
 
+/*
+ * 连接建立 / 断开的统一处理（函数名沿用源码中的拼写）：连接建立时先发送订阅请求，
+ * 之后无论连 / 断都回调上层的 client_connect_notify；断开时额外清理所有进行中的
+ * 事务。返回 0 成功，非 0 表示订阅发送失败。
+ */
 static int _notify_conenct_disconnect(struct msg_client *msg_client,
 				      bool connected)
 {
@@ -1123,11 +1336,17 @@ static int _notify_conenct_disconnect(struct msg_client *msg_client,
 	return 0;
 }
 
+/*
+ * msg_client 的连接建立回调，转调 _notify_conenct_disconnect(connected=true)。
+ */
 static int mgmt_be_client_notify_conenct(struct msg_client *client)
 {
 	return _notify_conenct_disconnect(client, true);
 }
 
+/*
+ * msg_client 的连接断开回调，转调 _notify_conenct_disconnect(connected=false)。
+ */
 static int mgmt_be_client_notify_disconenct(struct msg_conn *conn)
 {
 	struct msg_client *client = container_of(conn, struct msg_client, conn);
@@ -1139,6 +1358,10 @@ static int mgmt_be_client_notify_disconenct(struct msg_conn *conn)
  * Debug Flags
  */
 
+/*
+ * 设置 / 清除 backend 客户端调试标志：更新 mgmt_dbg_be_client，并同步当前客户端
+ * 连接的 debug 开关。
+ */
 static void mgmt_debug_client_be_set(uint32_t flags, bool set)
 {
 	DEBUG_FLAGS_SET(&mgmt_dbg_be_client, flags, set);
@@ -1150,6 +1373,9 @@ static void mgmt_debug_client_be_set(uint32_t flags, bool set)
 							  DEBUG_MODE_ALL);
 }
 
+/*
+ * vty 命令 “debug mgmt client backend”：开启 / 关闭 backend 客户端的调试输出。
+ */
 DEFPY(debug_mgmt_client_be, debug_mgmt_client_be_cmd,
       "[no] debug mgmt client backend",
       NO_STR DEBUG_STR MGMTD_STR "client\n"
@@ -1166,6 +1392,10 @@ DEFPY(debug_mgmt_client_be, debug_mgmt_client_be_cmd,
  * We only implement a list of one entry (for the this backend client) the
  * results will be merged inside mgmtd.
  */
+/*
+ * YANG 列表 /frr-backend:clients/client 的 get_next 回调：该列表只暴露一个条目
+ * （即本进程的 backend 客户端），首次调用返回 __be_client，其后返回 NULL 结束。
+ */
 static const void *clients_client_get_next(struct nb_cb_get_next_args *args)
 {
 	if (args->list_entry == NULL)
@@ -1173,6 +1403,9 @@ static const void *clients_client_get_next(struct nb_cb_get_next_args *args)
 	return NULL;
 }
 
+/*
+ * 返回列表条目的键：唯一键 name，取自客户端名称。
+ */
 static int clients_client_get_keys(struct nb_cb_get_keys_args *args)
 {
 	args->keys->num = 1;
@@ -1181,6 +1414,9 @@ static int clients_client_get_keys(struct nb_cb_get_keys_args *args)
 	return NB_OK;
 }
 
+/*
+ * 按键 name 查找列表条目：与当前客户端名相符时返回 __be_client，否则 NULL。
+ */
 static const void *clients_client_lookup_entry(struct nb_cb_lookup_entry_args *args)
 {
 	const char *name = args->keys->key[0];
@@ -1193,6 +1429,9 @@ static const void *clients_client_lookup_entry(struct nb_cb_lookup_entry_args *a
 
 /*
  * XPath: /frr-backend:clients/client/name
+ */
+/*
+ * 返回 /frr-backend:clients/client/name 叶子的值（客户端名称）。
  */
 static enum nb_error clients_client_name_get(const struct nb_node *nb_node,
 					     const void *parent_list_entry, struct lyd_node *parent)
@@ -1209,6 +1448,10 @@ static enum nb_error clients_client_name_get(const struct nb_node *nb_node,
 
 /*
  * XPath: /frr-backend:clients/client/state/candidate-config-version
+ */
+/*
+ * 返回候选配置版本号：有进行中的事务时取事务候选配置的 version，否则取
+ * running_config 的 version。
  */
 static enum nb_error clients_client_state_candidate_config_version_get(
 	const struct nb_node *nb_node, const void *parent_list_entry, struct lyd_node *parent)
@@ -1231,6 +1474,9 @@ static enum nb_error clients_client_state_candidate_config_version_get(
 /*
  * XPath: /frr-backend:clients/client/state/running-config-version
  */
+/*
+ * 返回当前生效配置（running_config）的版本号。
+ */
 static enum nb_error clients_client_state_running_config_version_get(const struct nb_node *nb_node,
 								     const void *parent_list_entry,
 								     struct lyd_node *parent)
@@ -1251,6 +1497,9 @@ static enum nb_error clients_client_state_running_config_version_get(const struc
  * Is this better in northbound_notif.c? Let's decide when we add more to this module.
  */
 
+/*
+ * 返回当前的通知选择器集合：遍历全局通知过滤器 nb_notif_filters，逐个生成叶子。
+ */
 static enum nb_error clients_client_state_notify_selectors_get(const struct nb_node *nb_node,
 							       const void *parent_list_entry,
 							       struct lyd_node *parent)
@@ -1269,6 +1518,11 @@ static enum nb_error clients_client_state_notify_selectors_get(const struct nb_n
 }
 
 /* clang-format off */
+/*
+ * backend 客户端自身功能的 YANG 模块信息：定义 frr-backend 模块下
+ * clients/client（含 name 及各 state 字段）的数据回调，供 mgmtd 回读本客户端
+ * 信息（列表只呈现一个条目，多个 backend 的结果由 mgmtd 汇总）。
+ */
 const struct frr_yang_module_info frr_backend_info = {
 	.name = "frr-backend",
 	.nodes = {
@@ -1349,6 +1603,13 @@ const struct frr_yang_module_info frr_backend_info = {
 };
 /* clang-format on */
 
+/*
+ * 创建 backend 客户端并连接到 mgmtd（详见头文件中的声明）。仅允许一个客户端实例
+ * （__be_client 非空则返回 NULL）；分配客户端、保存名称与 running_config 基线、
+ * 拷贝 cbs，然后以 MGMTD_BE_SOCK_NAME 拼出服务端路径并初始化底层 msg_client
+ * （连接建立 / 断开回调为上面的 notify 包装，short_circuit_ok 为 false）。
+ * 返回客户端对象，失败返回 NULL。
+ */
 struct mgmt_be_client *mgmt_be_client_create(const char *client_name,
 					     struct mgmt_be_client_cbs *cbs,
 					     uintptr_t user_data,
@@ -1391,6 +1652,10 @@ struct mgmt_be_client *mgmt_be_client_create(const char *client_name,
 }
 
 
+/*
+ * 安装本库的 vty 调试命令：注册 mgmt_dbg_be_client 及 “debug mgmt client backend”
+ * 命令到 enable / config 节点。
+ */
 void mgmt_be_client_lib_vty_init(void)
 {
 	debug_install(&mgmt_dbg_be_client);
@@ -1399,6 +1664,10 @@ void mgmt_be_client_lib_vty_init(void)
 	install_element(CONFIG_NODE, &debug_mgmt_client_be_cmd);
 }
 
+/*
+ * 销毁 backend 客户端：断言是当前唯一实例，取消所有 oper 遍历、清理底层连接与
+ * 全部事务，释放名称与客户端对象，并把全局 __be_client 置空。
+ */
 void mgmt_be_client_destroy(struct mgmt_be_client *client)
 {
 	assert(client == __be_client);

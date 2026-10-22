@@ -10,6 +10,44 @@
  * @author Rajesh Varadarajan <rajesh@sproute.net>
  * @author Pradosh Mohapatra <pradosh@sproute.net>
  */
+/* ============================================================================
+ * 【文件导读】bgp_updgrp_adv.c —— 出向通告状态机：把“选路结果”变成“待发内容”
+ * ============================================================================
+ * 职责与定位：
+ *   本文件处于 update-group 主线的“内容生产”环节。它维护每个 update_subgroup 上
+ *   “已经通告给成员的前缀快照”(bgp_adj_out / adj) 和“待发送的通告/撤销队列”
+ *   (bgp_advertise / adv)，并实现“根据 RIB 变化决定向某子组通告(advertise)还是撤销
+ *   (withdraw)”的核心逻辑。它不负责编码字节流（那是 bgp_updgrp_packet.c），而是把
+ *   该发什么、该撤什么组织进子组的 sync->update / sync->withdraw 两个 FIFO，供编码器取用。
+ *
+ * 两个关键数据结构（务必先理解）：
+ *   bgp_adj_out (adj) —— 某前缀在某子组的“已通告快照”：记录该前缀本子组上次发出去的属性
+ *       (adj->attr)、关联的待发通告(adj->adv)、标签(adj->labels)、addpath_tx_id。
+ *       它挂在两层索引里：dest->adj_out 的红黑树(RB, 按 subgroup+addpath_id 排序) 与
+ *       subgrp->adjq 的尾队列。用于判断“同一条路由是否重复／是否需要撤销”。
+ *   bgp_advertise (adv) —— 一条“待编码发送”的通告或撤销请求，挂在 baa 的 fifo 或
+ *       sync->withdraw 上；编码后由 packet.c 消费并回填 adj->attr。
+ *
+ * 关键路径：
+ *   上游：bgp_route.c（选路变化 → group_announce_route → group_announce_route_walkcb）；
+ *        bgp_fsm.c / peer_af_announce_route（同组重通告 → subgroup_announce_route）；
+ *        bgp_route.c default-originate 相关（subgroup_default_originate）。
+ *   下游：bgp_updgrp_packet.c 的 subgroup_update_packet / subgroup_withdraw_packet 从
+ *        sync FIFO 取 adv 编码成 bpacket。
+ *
+ * 关键函数清单（建议阅读顺序）：
+ *   1) bgp_adj_out_alloc / adj_free / adj_lookup —— adj 的分配、释放、按 (子组,addpath) 查找。
+ *   2) bgp_adj_out_set_subgroup —— 决定并排队一次“通告”（含重复抑制）。
+ *   3) bgp_adj_out_unset_subgroup —— 决定并排队一次“撤销”。
+ *   4) subgroup_announce_table / subgroup_announce_route —— 遍历 RIB 重通告。
+ *   5) subgroup_default_originate —— default-originate 的特殊处理（含 route-map）。
+ *   6) group_announce_route / group_announce_route_walkcb —— 单条路由变化的入口与分发。
+ *   7) subgroup_coalesce_timer / subgroup_announce_all —— 合并延迟定时器与首次通告。
+ *
+ * 建议阅读顺序：先 1（adj 模型），再 2、3（增/撤），再 4、5（整表重通告与默认路由），
+ *   最后 6、7（事件入口与定时器）。
+ * ============================================================================
+ */
 
 #include <zebra.h>
 
@@ -42,6 +80,13 @@
 /********************
  * PRIVATE FUNCTIONS
  ********************/
+/* ========== 1. adj 模型：比较、红黑树生成、查找、释放 ========== */
+/* 【bgp_adj_out_compare】红黑树 dest->adj_out 的节点排序比较函数：先按所属子组指针、
+ *   再按 addpath_tx_id 排序。
+ * 参数 o1/o2：两个 bgp_adj_out。
+ * 返回：<0 / 0 / >0。
+ * 关键点：同一目的前缀下，每个子组、每个 addpath_tx_id 组合至多一个 adj。
+ *   不支持 addpath 的子组 addpath_tx_id 恒为 0。 */
 static int bgp_adj_out_compare(const struct bgp_adj_out *o1,
 			       const struct bgp_adj_out *o2)
 {
@@ -59,8 +104,13 @@ static int bgp_adj_out_compare(const struct bgp_adj_out *o1,
 
 	return 0;
 }
+/* 用上面的比较函数实例化名为 bgp_adj_out_rb 的红黑树类型（成员是 adj_entry 字段）。 */
 RB_GENERATE(bgp_adj_out_rb, bgp_adj_out, adj_entry, bgp_adj_out_compare);
 
+/* 【adj_lookup】在某目的前缀 dest 的 adj_out 红黑树里查找指定 (子组, addpath_tx_id) 的 adj。
+ * 参数 dest：目的前缀节点；subgrp：子组；addpath_tx_id：Add-Path 出向 ID（非 addpath 传 0）。
+ * 返回：命中的 bgp_adj_out，或 NULL。
+ * 调用时机：set/unset/remove 通告前判断该前缀是否已在本子组有快照。 */
 static inline struct bgp_adj_out *adj_lookup(struct bgp_dest *dest,
 					     struct update_subgroup *subgrp,
 					     uint32_t addpath_tx_id)
@@ -78,6 +128,14 @@ static inline struct bgp_adj_out *adj_lookup(struct bgp_dest *dest,
 	return RB_FIND(bgp_adj_out_rb, &dest->adj_out, &lookup);
 }
 
+/* 【adj_free】释放一个 adj 及其全部挂接关系。
+ * 参数 adj：待释放对象。
+ * 返回：无。
+ * 关键点（三处解链 + 一次 unlock，顺序敏感）：
+ *   - 先释放标签(labels 解引用计数)；
+ *   - 从子组 adjq 尾队列移除并减 adj_count；
+ *   - 从 dest 红黑树移除；
+ *   - bgp_dest_unlock_node 解除分配时对 dest 的引用计数（配对 bgp_adj_out_alloc 里的 lock）。 */
 static void adj_free(struct bgp_adj_out *adj)
 {
 	bgp_labels_unintern(&adj->labels);
@@ -91,6 +149,17 @@ static void adj_free(struct bgp_adj_out *adj)
 	XFREE(MTYPE_BGP_ADJ_OUT, adj);
 }
 
+/* 【subgrp_announce_addpath_best_selected】当子组启用 Add-Path 且配置为
+ *   BGP_ADDPATH_BEST_SELECTED 时，为同一前缀挑出“最佳 N 条”(N=addpath_best_selected
+ *   与 paths-limit 取小)非 Selected 路径，作为额外通告对象（RFC7911 的 send best N）。
+ * 参数 dest：目的前缀；subgrp：目标子组。
+ * 返回：无。
+ * 调用时机：subgroup_announce_table 遍历到 dest 且 addpath_capable 时。
+ * 关键点：
+ *   - 第一段循环用 bgp_path_info_cmp 反复挑出“次优”路径，凑够 paths_limit 条放入 list。
+ *   - 第二段循环遍历全部 path_info：被选中的走 subgroup_process_announce_selected，
+ *     未选中且非 Selected 的用 NULL(表示撤销/不选)处理；Selected 路径跳过交给后面主流程。
+ *   - 非 BEST_SELECTED 模式则按 paths_limit 顺序通告（超出上限的用 NULL 处理）。 */
 static void
 subgrp_announce_addpath_best_selected(struct bgp_dest *dest,
 				      struct update_subgroup *subgrp)
@@ -180,6 +249,12 @@ subgrp_announce_addpath_best_selected(struct bgp_dest *dest,
 		list_delete(&list);
 }
 
+/* 【subgrp_withdraw_stale_addpath】Add-Path 场景下，撤销本子组里“已不再存在对应路径”的
+ *   陈旧通告：遍历 dest 下本子组的所有 adj，若其 addpath_tx_id 已不对应任何现存 path，
+ *   就对该 id 发一次撤销（NULL 表示撤销）。
+ * 参数 ctx：遍历上下文（含 dest）；subgrp：目标子组。
+ * 返回：无。
+ * 调用时机：group_announce_route_walkcb 处理 addpath 能力子组、或 coalesce 定时器在跑时。 */
 static void subgrp_withdraw_stale_addpath(struct updwalk_context *ctx,
 					  struct update_subgroup *subgrp)
 {
@@ -214,6 +289,17 @@ static void subgrp_withdraw_stale_addpath(struct updwalk_context *ctx,
 	}
 }
 
+/* 【group_announce_route_walkcb】单条路由变化的核心分发回调：对某 update_group 的每个子组，
+ *   决定是通告新路径(ctx->pi)、撤销(ctx->pi==NULL)、还是处理 addpath 的多路径变化。
+ * 参数 updgrp：当前组；arg：updwalk_context（ctx->dest=目的前缀，ctx->pi=新选中路径或 NULL）。
+ * 返回：UPDWALK_CONTINUE。
+ * 调用时机：group_announce_route → update_group_af_walk 遍历时（有路由变化）。
+ * 关键点：
+ *   - addpath_capable 分支：先处理陈旧 addpath 撤销，再发 best-selected，最后才处理
+ *     最佳路径(ctx->pi)——顺序保证“advertised”输出里展示的是最佳路径属性。
+ *   - 非 addpath 分支：若子组 coalesce 定时器在跑，通常只做撤销(避免过早通告触发额外报文)，
+ *     除非有新路径；否则按 ctx->pi 有/无决定通告或对已有 adj 撤销。
+ *   - 无论哪支，最后都调用 bgp_notify_conditional_adv_scanner 通知条件通告模块。 */
 static int group_announce_route_walkcb(struct update_group *updgrp, void *arg)
 {
 	struct updwalk_context *ctx = arg;
@@ -302,6 +388,13 @@ done:
 	return UPDWALK_CONTINUE;
 }
 
+/* 【subgrp_show_adjq_vty】把一个子组的 adj 快照打印成表（用于
+ *   `show bgp ... update-group ... adj-queue / advertised`）。
+ * 参数 subgrp：子组；vty：输出；flags：UPDWALK_FLAGS_ADVQUEUE 显示待发队列内容、
+ *     UPDWALK_FLAGS_ADVERTISED 显示已通告内容。
+ * 返回：无。
+ * 关键点：遍历 RIB，对每个 dest 的 adj_out 红黑树里属于本子组的 adj，分别打印其待发属性
+ *   (adj->adv->baa->attr) 或已通告属性(adj->attr)，并统计条数。表头只打印一次。 */
 static void subgrp_show_adjq_vty(struct update_subgroup *subgrp,
 				 struct vty *vty, uint8_t flags)
 {
@@ -361,6 +454,8 @@ static void subgrp_show_adjq_vty(struct update_subgroup *subgrp,
 		vty_out(vty, "\nTotal number of prefixes %ld\n", output_count);
 }
 
+/* 【updgrp_show_adj_walkcb】遍历组的每个子组，逐个调用 subgrp_show_adjq_vty 打印 adj 表。
+ * 返回：UPDWALK_CONTINUE。调用时机：updgrp_show_adj 遍历时。 */
 static int updgrp_show_adj_walkcb(struct update_group *updgrp, void *arg)
 {
 	struct updwalk_context *ctx = arg;
@@ -378,6 +473,7 @@ static int updgrp_show_adj_walkcb(struct update_group *updgrp, void *arg)
 	return UPDWALK_CONTINUE;
 }
 
+/* 【updgrp_show_adj】show adj 表的骨架：填 ctx 后 af-walk 遍历（flags 决定显示队列/已通告）。 */
 static void updgrp_show_adj(struct bgp *bgp, afi_t afi, safi_t safi,
 			    struct vty *vty, uint64_t id, uint8_t flags)
 {
@@ -390,6 +486,16 @@ static void updgrp_show_adj(struct bgp *bgp, afi_t afi, safi_t safi,
 	update_group_af_walk(bgp, afi, safi, updgrp_show_adj_walkcb, &ctx);
 }
 
+/* 【subgroup_coalesce_timer】合并延迟(coalesce)定时器到期回调：真正执行一次全表通告。
+ * 参数 event：其 arg 为 update_subgroup。
+ * 返回：无。
+ * 调用时机：subgroup_announce_all 排定的合并延迟到期（见 bgp_updgrp.h 的 coalesce 公式）。
+ * 关键点：
+ *   - 清 t_coalesce、v_coalesce=0（此后按常规逻辑不再延迟）。
+ *   - subgroup_announce_route 执行通告，这会启动成员的 route-adv 定时器(MRAI)。
+ *   - 但初始更新希望“比 MRAI 更快”，且无路由可发时这里也是触发 EOR 的手段：若未处于
+ *     update-delay、且未启用 suppress-fib，则对每个成员取消旧 t_routeadv 并用 0 时延重启
+ *     bgp_routeadv_timer，促成立即写出（含 EOR）。 */
 static void subgroup_coalesce_timer(struct event *event)
 {
 	struct update_subgroup *subgrp;
@@ -436,6 +542,10 @@ static void subgroup_coalesce_timer(struct event *event)
 	}
 }
 
+/* 【update_group_announce_walkcb】对所有子组强制全量重通告（用于 `clear bgp ... soft` /
+ *   全局重通告）：先置 FORCE_UPDATES（避免 subgroup_announce_table 里的重复抑制吞掉更新），
+ *   再 subgroup_announce_all。
+ * 返回：UPDWALK_CONTINUE。调用时机：update_group_announce 遍历时。 */
 static int update_group_announce_walkcb(struct update_group *updgrp, void *arg)
 {
 	struct update_subgroup *subgrp;
@@ -452,6 +562,9 @@ static int update_group_announce_walkcb(struct update_group *updgrp, void *arg)
 	return UPDWALK_CONTINUE;
 }
 
+/* 【update_group_announce_rrc_walkcb】仅对“路由反射器客户端”子组重通告（RR 场景）：
+ *   只有代表 peer 配了 PEER_FLAG_REFLECTOR_CLIENT 的组才 subgroup_announce_all。
+ * 返回：UPDWALK_CONTINUE。调用时机：update_group_announce_rrclients 遍历时。 */
 static int update_group_announce_rrc_walkcb(struct update_group *updgrp,
 					    void *arg)
 {
@@ -477,11 +590,19 @@ static int update_group_announce_rrc_walkcb(struct update_group *updgrp,
 /********************
  * PUBLIC FUNCTIONS
  ********************/
+/* ========== 2. adj 的分配/释放/增删通告 ========== */
 
 /**
  * Allocate an adj-out object. Do proper initialization of its fields,
  * primarily its association with the subgroup and the prefix.
  */
+/* 【bgp_adj_out_alloc】分配一个 adj 并把它挂进两处索引，建立与子组、前缀的关联。
+ * 参数 subgrp：所属子组；dest：目的前缀；addpath_tx_id：Add-Path 出向 ID。
+ * 返回：新 adj。
+ * 调用时机：bgp_adj_out_set_subgroup（首次向某前缀发通告）、
+ *   update_subgroup_copy_adj_out（分裂时克隆）。
+ * 关键点：bgp_dest_lock_node(dest) 增加对前缀节点的引用，配对释放见 adj_free；
+ *   adj 同时入 dest 的红黑树与 subgrp->adjq 尾队列，并增 adj_count。 */
 struct bgp_adj_out *bgp_adj_out_alloc(struct update_subgroup *subgrp,
 				      struct bgp_dest *dest,
 				      uint32_t addpath_tx_id)
@@ -502,6 +623,16 @@ struct bgp_adj_out *bgp_adj_out_alloc(struct update_subgroup *subgrp,
 }
 
 
+/* 【bgp_advertise_clean_subgroup】清理 adj 当前关联的待发通告 adv，并返回“同属性 baa 队列里
+ *   的下一个候选 adv”（供编码器接着处理同属性的其它前缀）。
+ * 参数 subgrp：子组；adj：其 adj->adv 将被清理。
+ * 返回：该属性桶 fifo 中的下一个 adv，或 NULL。
+ * 调用时机：见下方 bgp_adj_out_set/unset —— 替换旧通告、重复抑制、撤销后清理时。
+ * 关键点：
+ *   - adv->baa 非空（通告类）时：从 baa 的 fifo 删除本 adv，取下一候选，并把 baa 反引用
+ *     计数减一(bgp_advertise_attr_unintern)——共享同一属性的多条前缀共用一个 baa。
+ *   - adv->baa 为空（撤销类）时：fhead 指向 sync->withdraw。
+ *   - 最后从对应 FIFO 删除 adv 并释放它，adj->adv 置 NULL。 */
 struct bgp_advertise *
 bgp_advertise_clean_subgroup(struct update_subgroup *subgrp,
 			     struct bgp_adj_out *adj)
@@ -540,6 +671,21 @@ bgp_advertise_clean_subgroup(struct update_subgroup *subgrp,
 	return next;
 }
 
+/* 【bgp_adj_out_set_subgroup】决定并排队一次“向本子组通告某前缀”的操作（核心函数）。
+ * 参数 dest：目的前缀；subgrp：目标子组；attr：出向属性；path：被通告的路径(bgp_path_info)。
+ * 返回：true=已入队待发；false=被抑制/失败。
+ * 调用时机：group_announce_route_walkcb / subgroup_announce_table / subgroup_default_originate
+ *   在确定要通告某前缀时。
+ * 关键点（重复抑制与版本语义）：
+ *   - 若 dest/subgrp/addpath_id 已有 adj 则复用，否则 bgp_adj_out_alloc 新建；两种情况都
+ *     在“表重解析期”累加 pscount(已发前缀计数)。
+ *   - 重复抑制：在 BGP_FLAG_SUPPRESS_DUPLICATES 开启、且未强制更新、且新属性与“上次已发或
+ *     已排队”的属性完全相同（含标签相同）时，判定为重复 UPDATE 而不重发；但为了最终能让
+ *     子组合并，仍需把 subgrp->version 提升到 dest->version（否则版本对不齐永远不能合并）。
+ *   - 否则清理旧通告，新建 adv，`bgp_path_info_lock(path)` 引用被通告路径，把属性 bgp_attr_intern
+ *     进 baa(广告属性)，记标签，挂入 baa 的 fifo 与 sync->update FIFO。
+ *   - 若 update FIFO 原本为空，则触发成员 peer 的 MRAI 调整(bgp_adjust_routeadv)——第一个
+ *     更新入队意味着需要尽快让 socket 写出。 */
 bool bgp_adj_out_set_subgroup(struct bgp_dest *dest,
 			      struct update_subgroup *subgrp, struct attr *attr,
 			      struct bgp_path_info *path)
@@ -701,6 +847,17 @@ bool bgp_adj_out_set_subgroup(struct bgp_dest *dest,
 	return true;
 }
 
+/* 【bgp_adj_out_unset_subgroup】决定并排队一次“从本子组撤销某前缀”的操作（核心函数）。
+ * 参数 dest：目的前缀；subgrp：目标子组；addpath_tx_id：Add-Path 出向 ID。
+ * 返回：无。
+ * 调用时机：某前缀对某子组不再可通告（路由撤销/变为不可用/策略变为拒绝）时。
+ * 关键点：
+ *   - 找不到 adj 说明本就没通告过，直接按版本更新收尾。
+ *   - 若已启 default-originate 且该前缀就是默认前缀，则不撤销（避免把 default-originate
+ *     产生的默认路由删掉）——直接 return。
+ *   - adj->attr 非空（确实发过）时：新建一个撤销类 adv 挂入 sync->withdraw；若 withdraw
+ *     FIFO 原本为空则触发成员 MRAI 调整。adj->attr 为空则说明尚无真实通告，直接 adj_free。
+ *   - 版本推进与 set 同理，保证最终可合并。 */
 void bgp_adj_out_unset_subgroup(struct bgp_dest *dest, struct update_subgroup *subgrp,
 				uint32_t addpath_tx_id)
 {
@@ -768,6 +925,10 @@ void bgp_adj_out_unset_subgroup(struct bgp_dest *dest, struct update_subgroup *s
 	subgrp->version = MAX(subgrp->version, dest->version);
 }
 
+/* 【bgp_adj_out_remove_subgroup】彻底移除某 adj：释放属性引用、清理待发通告、释放 adj 本体。
+ * 参数 dest：目的前缀；adj：待移除；subgrp：所属子组。
+ * 返回：无。
+ * 调用时机：撤销通告并编码完成后（withdraw_packet）、销毁子组时（subgroup_clear_table）。 */
 void bgp_adj_out_remove_subgroup(struct bgp_dest *dest, struct bgp_adj_out *adj,
 				 struct update_subgroup *subgrp)
 {
@@ -784,6 +945,11 @@ void bgp_adj_out_remove_subgroup(struct bgp_dest *dest, struct bgp_adj_out *adj,
  * Go through all the routes and clean up the adj/adv structures corresponding
  * to the subgroup.
  */
+/* 【subgroup_clear_table】清空子组所有 adj/adv（遍历 adjq 尾队列，逐个移除）。
+ * 参数 subgrp：目标子组。
+ * 返回：无。
+ * 调用时机：update_subgroup_delete 销毁子组时；需整体重置出向状态时。
+ * 关键点：用 _SAFE 版本遍历，因为每条移除都会从队列摘下当前节点。 */
 void subgroup_clear_table(struct update_subgroup *subgrp)
 {
 	struct bgp_adj_out *aout, *taout;
@@ -795,6 +961,19 @@ void subgroup_clear_table(struct update_subgroup *subgrp)
 /*
  * subgroup_announce_table
  */
+/* 【subgroup_announce_table】遍历一张 RIB 表，向本子组通告其中所有应通告的前缀（全量/首次通告）。
+ * 参数 subgrp：目标子组；table：待遍历表（NULL 则用该子组实例的 rib[afi][safi_rib]）。
+ * 返回：无。
+ * 调用时机：subgroup_announce_route 对普通 AF 直接调用；对 VPN/ENCAP/EVPN 逐“路由表”
+ *   对每个下层表调用。
+ * 关键点：
+ *   - safi==LABELED_UNICAST 时实际取 UNICAST 的 RIB。
+ *   - 非 VPN/ENCAP/EVPN 且配了 default-originate 时，先 subgroup_default_originate。
+ *   - 处理每个 dest：addpath 时先 best-selected；再用 bgp_check_selected 过滤应通告路径
+ *     （最佳路径或 addpath 需额外通告者），对配了 default-originate 的默认前缀不显式通告。
+ *   - 全程置 SUBGRP_STATUS_TABLE_REPARSING 标志（用于 set/unset 里区分“表重解析计数”）。
+ *   - 结束后把 subgrp->version 推进到 table->version（保证即使无路由也能与表版本对齐、
+ *     便于合并），并触发一次合并检查。 */
 void subgroup_announce_table(struct update_subgroup *subgrp,
 			     struct bgp_table *table)
 {
@@ -880,6 +1059,17 @@ void subgroup_announce_table(struct update_subgroup *subgrp,
  *
  * Refresh all routes out to a subgroup.
  */
+/* 【subgroup_announce_route】向本子组重通告全部路由（“刷新”语义的总入口）。
+ * 参数 subgrp：目标子组。
+ * 返回：无。
+ * 调用时机：coalesce 定时器到期、peer_af_announce_route、策略变更后等。
+ * 关键点：
+ *   - 清 needs-refresh 标志（本次即为刷新）。
+ *   - 若子组只有一个 peer 且该 peer 处于 ORF_WAIT_REFRESH（等对端 ROUTE-REFRESH），则暂缓通告
+ *     （首次通告要等 ORF/Route-Refresh，RFC2918）。
+ *   - 普通 AF 直接 subgroup_announce_table；VPN/ENCAP/EVPN 需逐下层表遍历，无 RIB 则仅清
+ *     FORCE_UPDATES 后返回。
+ *   - 结束时清 FORCE_UPDATES 标志。 */
 void subgroup_announce_route(struct update_subgroup *subgrp)
 {
 	struct bgp_dest *dest;
@@ -928,6 +1118,21 @@ void subgroup_announce_route(struct update_subgroup *subgrp)
 		UNSET_FLAG(subgrp->sflags, SUBGRP_STATUS_FORCE_UPDATES);
 }
 
+/* 【subgroup_default_originate】处理 `neighbor ... default-originate`：向本子组通告或撤销
+ *   默认路由(0.0.0.0/0 或 ::/0)。
+ * 参数 subgrp：目标子组；withdraw：true=撤销默认路由，false=通告（可能因 route-map deny 转为撤销）。
+ * 返回：无。
+ * 调用时机：配置 default-originate 或其 route-map 变化（update_group_policy_update 等）、
+ *   subgroup_announce_table 发现配了 default-originate。
+ * 关键点：
+ *   - 仅 IPv4/IPv6 单播处理；update-delay 期间直接返回。
+ *   - 有 default route-map 时，遍历 RIB 用 route_map_apply_ext 找出“匹配且优先级最高”的一条，
+ *     用其属性作为默认路由属性(new_attr)；若全部 deny 则退化为撤销。
+ *   - 与本地已有默认路由(通过 redistribute/network 学到)的交互：撤销分支里若本地 RIB 还有
+ *     默认路由，则改为通告该路由；通告分支里先清掉旧的 default-originate adj 避免重复。
+ *   - 置/清 SUBGRP_STATUS_DEFAULT_ORIGINATE 标志，最终调用 subgroup_default_update_packet /
+ *     subgroup_default_withdraw_packet 生成报文。
+ *   - graceful-shutdown 场景给默认路由附加 GSHUT community。 */
 void subgroup_default_originate(struct update_subgroup *subgrp, bool withdraw)
 {
 	struct bgp *bgp;
@@ -1143,6 +1348,12 @@ void subgroup_default_originate(struct update_subgroup *subgrp, bool withdraw)
  * subgrp->v_coalesce will be set to zero and the normal logic
  * prevails.
  */
+/* 【subgroup_announce_all】向子组通告 BGP 全表；带“启动优化”的合并延迟。
+ * 参数 subgrp：目标子组。
+ * 返回：无。
+ * 调用时机：bootstrap/peer 首次建立、bgp_announce 系列。
+ * 关键点：v_coalesce 非 0（首次）时先 arm coalesce 定时器等一会儿（把更多 peer 聚进来共享
+ *   通告计算）；v_coalesce 为 0（后续）则立即 subgroup_announce_route。 */
 void subgroup_announce_all(struct update_subgroup *subgrp)
 {
 	if (!subgrp)
@@ -1176,6 +1387,12 @@ void subgroup_announce_all(struct update_subgroup *subgrp)
  * Go through all update subgroups and set up the adv queue for the
  * input route.
  */
+/* 【group_announce_route】单条路由变化的对外入口：把 (dest, pi) 打包进 ctx，遍历该
+ *   (afi,safi) 的所有 update_group 分发（触发通告或撤销）。
+ * 参数 bgp：实例；afi/safi：地址族；dest：目的前缀；pi：新的最佳路径(或 NULL 表示撤销)。
+ * 返回：无。
+ * 调用时机：bgp_route.c 选路完成后（bgp_process 的 update 阶段）。
+ * 关键点：若启用了 suppress-fib，则要等 FIB 状态确认后才通告，此时先返回。 */
 void group_announce_route(struct bgp *bgp, afi_t afi, safi_t safi,
 			  struct bgp_dest *dest, struct bgp_path_info *pi)
 {
@@ -1192,23 +1409,27 @@ void group_announce_route(struct bgp *bgp, afi_t afi, safi_t safi,
 	update_group_af_walk(bgp, afi, safi, group_announce_route_walkcb, &ctx);
 }
 
+/* 【update_group_show_adj_queue】show 待发队列(adv-queue)：以 UPDWALK_FLAGS_ADVQUEUE 调 updgrp_show_adj。 */
 void update_group_show_adj_queue(struct bgp *bgp, afi_t afi, safi_t safi,
 				 struct vty *vty, uint64_t id)
 {
 	updgrp_show_adj(bgp, afi, safi, vty, id, UPDWALK_FLAGS_ADVQUEUE);
 }
 
+/* 【update_group_show_advertised】show 已通告内容(advertised)：以 UPDWALK_FLAGS_ADVERTISED 调 updgrp_show_adj。 */
 void update_group_show_advertised(struct bgp *bgp, afi_t afi, safi_t safi,
 				  struct vty *vty, uint64_t id)
 {
 	updgrp_show_adj(bgp, afi, safi, vty, id, UPDWALK_FLAGS_ADVERTISED);
 }
 
+/* 【update_group_announce】对所有组强制重通告（遍历调 update_group_announce_walkcb）。 */
 void update_group_announce(struct bgp *bgp)
 {
 	update_group_walk(bgp, update_group_announce_walkcb, NULL);
 }
 
+/* 【update_group_announce_rrclients】仅对 RR 客户端组重通告（遍历调 update_group_announce_rrc_walkcb）。 */
 void update_group_announce_rrclients(struct bgp *bgp)
 {
 	update_group_walk(bgp, update_group_announce_rrc_walkcb, NULL);

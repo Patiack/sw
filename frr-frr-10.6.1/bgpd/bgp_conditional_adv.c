@@ -5,11 +5,46 @@
  *			Madhurilatha Kuruganti
  */
 
+/* ============================================================================
+ * 【文件导读】bgp_conditional_adv.c —— 条件通告（conditional advertisement）
+ * ============================================================================
+ * 【它是什么】bgp_conditional_adv.h 里接口的实现：让“是否把某组路由通告给邻居”
+ * 取决于“本机 BGP 表里是否存在另一组路由”。术语、配置形态与“为何必须轮询”见
+ * 头文件导读（advertise-map / exist-map / non-exist-map、轮询周期宏）。
+ *
+ * 【两个关键判断函数】
+ *   bgp_check_rmap_prefixes_in_bgp_table : 在整张 BGP 表上跑 condition-map，只要能
+ *       命中一条即返回 RMAP_PERMITMATCH，用来回答“条件成立没有”。
+ *   bgp_conditional_adv_routes          : 按 advertise-map 决定发/撤哪些路由，并
+ *       真正调用子组通告接口把更新推给邻居。
+ *
+ * 【核心状态机（timer 回调里体现）】每个 (neighbor, afi, safi) 维护 advmap.update_type，
+ *   取值 UPDATE_TYPE_ADVERTISE 或 UPDATE_TYPE_WITHDRAW。exist 与 non-exist 两种语义
+ *   对“condition-map 是否命中”的映射是**相反**的，改动这段务必对照 condition 标志。
+ *
+ * 【两个变更标志】peer->advmap_table_change 表示“入方向 BGP 表变了”（按 peer 维护）；
+ *   peer->advmap_config_change[afi][safi] 表示“该邻居的 map 配置变了”。定时器只在
+ *   这两个标志有变化时才真正重算并发送，避免空转。
+ *
+ * 【计数与生命周期】bgp->condition_filter_count 统计全进程有多少个 advertise-map 在用，
+ *   从 0 变 1 时启动轮询定时器，从 1 变 0 时取消——因此 enable/disable 必须成对。
+ *
+ * 【阅读顺序】bgp_check_rmap_prefixes_in_bgp_table → bgp_conditional_adv_routes →
+ *   bgp_conditional_adv_timer（主逻辑）→ enable/disable → filter_update →
+ *   peer_advertise_map_set/unset。
+ * ============================================================================
+ */
+
 #include <zebra.h>
 
 #include "bgpd/bgp_conditional_adv.h"
 #include "bgpd/bgp_vty.h"
 
+/* 【函数】在整张 BGP 表上评估 condition-map（route-map）：遍历每个目的前缀的每条
+ * path，构造临时 path_info 后 route_map_apply，只要有一条命中 RMAP_PERMITMATCH 就
+ * 立即返回（并 bgp_dest_unlock_node 释放当前节点）——用来回答“条件是否成立”。
+ * 返回 RMAP_DENYMATCH 表示一条都没命中。副作用：往返遍历会加/解锁 dest 引用，
+ * 提前 return 前必须解锁配对；每次循环后 bgp_attr_flush 释放临时属性。 */
 static route_map_result_t
 bgp_check_rmap_prefixes_in_bgp_table(struct bgp_table *table,
 				     struct route_map *rmap)
@@ -55,6 +90,15 @@ bgp_check_rmap_prefixes_in_bgp_table(struct bgp_table *table,
 	return ret;
 }
 
+/* 【函数】核心发送逻辑：按 advertise-map（rmap）向 peer 通告或撤回路由。流程：找
+ * peer_af 与子组（AF 未协商则直接返回）→ 置子组重解析标志并清零 pscount → 遍历整表，
+ * 对每条 path 跑 advertise-map，命中且被 bgp_check_selected 选中才处理 → 依据
+ * update_type 决定发还是撤：
+ *   UPDATE_TYPE_ADVERTISE：subgroup_announce_check 通过后用 bgp_adj_out_set_subgroup
+ *       发出；失败需 bgp_attr_flush 释放临时 attr。
+ *   UPDATE_TYPE_WITHDRAW：用 bgp_adj_out_unset_subgroup 撤回；但对开启 default-originate
+ *       的 peer 遇默认路由不显式撤回，以免撤掉 default-originate 产生的默认路由。
+ * 收尾清子组重解析标志。遍历中重置 rmap_change_flags，避免上次的修改痕迹影响判定。 */
 static void bgp_conditional_adv_routes(struct peer *peer, afi_t afi,
 				       safi_t safi, struct bgp_table *table,
 				       struct route_map *rmap,
@@ -149,6 +193,18 @@ static void bgp_conditional_adv_routes(struct peer *peer, afi_t afi,
 	UNSET_FLAG(subgrp->sflags, SUBGRP_STATUS_TABLE_REPARSING);
 }
 
+/* 【函数】条件通告的定时器回调（周期性执行，周期为 bgp->condition_check_period）。
+ * 先把自己重挂到 master 以保持周期触发，随后：
+ *   1) 扫所有 peer，只要任一 peer 的 advmap_table_change 置位，就把 advmap_table_changed
+ *      记真（用于决定本轮是否值得重算）；
+ *   2) 遍历每个已建立、配置了 advertise-map 的 peer 的每个 (afi, safi)：
+ *      - 用 condition-map 跑 bgp_check_rmap_prefixes_in_bgp_table 得条件结果 ret；
+ *      - 依 condition(EXIST / NON-EXIST) 与 ret 推导 update_type（两种语义映射相反）；
+ *      - 若 update_type 相比子组记录有变，则 update_group_adjust_peer 调整更新组；
+ *      - 若此邻居 map 配置变了，先发一次常规更新（split + subgroup_announce_table）；
+ *      - 最后调 bgp_conditional_adv_routes 按条件发/撤路由。
+ *   3) 清 peer->advmap_table_change。
+ * 注意 table 用 pfx_rcd_safi 取：labeled-unicast 的路由实际装在 unicast 表里，需换算。 */
 /* Handler of conditional advertisement timer event.
  * Each route in the condition-map is evaluated.
  */
@@ -307,6 +363,9 @@ static void bgp_conditional_adv_timer(struct event *t)
 	}
 }
 
+/* 【函数】为 (peer, afi, safi) 激活条件通告：置 advmap_config_change 标志以触发首次
+ * 重算；condition_filter_count 自增，**从 0 变 1**（首个使用者）时用 0 延迟立即启动
+ * 轮询定时器。已有其他邻居在用则只计数、不重复建定时器。 */
 void bgp_conditional_adv_enable(struct peer *peer, afi_t afi, safi_t safi)
 {
 	struct bgp *bgp = peer->bgp;
@@ -335,6 +394,9 @@ void bgp_conditional_adv_enable(struct peer *peer, afi_t afi, safi_t safi)
 				&bgp->t_condition_check);
 }
 
+/* 【函数】关闭 (peer, afi, safi) 的条件通告：condition_filter_count 自减，**减到 0**
+ * （最后一个使用者）时取消轮询定时器。仍有其他使用者则只计数。必须与 enable 成对
+ * 调用，否则会残留定时器。 */
 void bgp_conditional_adv_disable(struct peer *peer, afi_t afi, safi_t safi)
 {
 	struct bgp *bgp = peer->bgp;
@@ -356,6 +418,14 @@ void bgp_conditional_adv_disable(struct peer *peer, afi_t afi, safi_t safi)
 	event_cancel(&bgp->t_condition_check);
 }
 
+/* 【函数】set/unset 的公共底层：把 advertise-map / condition-map 真正写进或从
+ * peer->filter[afi][safi].advmap 中清除。filter_exists 记录原本是否已配置。
+ *   set=false（删除）：释放旧名字、递减旧 amap 引用计数；若原本存在，则调
+ *       bgp_conditional_adv_disable，再把 advmap 结构整体清零。
+ *   set=true（写入）：复制新名字、保存 amap/cmap 对象与 condition 标志，amap 引用
+ *       计数加一，置 advmap_config_change；若原本不存在则置初始 update_type 为
+ *       ADVERTISE 并调 bgp_conditional_adv_enable。
+ * 两种路径最后都调 peer_on_policy_change，让邻居按新策略重算并重发路由。 */
 static void peer_advertise_map_filter_update(struct peer *peer, afi_t afi,
 					     safi_t safi, const char *amap_name,
 					     struct route_map *amap,
@@ -412,6 +482,10 @@ static void peer_advertise_map_filter_update(struct peer *peer, afi_t afi,
 	peer_on_policy_change(peer, afi, safi, 1);
 }
 
+/* 【函数】配置入口：`neighbor ... advertise-map A <exist-map|non-exist-map> C`。
+ * 先对本 peer 调 filter_update(..., true) 落配置；若是普通 peer（非 peer-group）则置
+ * override 标志（PEER_FT_ADVERTISE_MAP）后返回，跳过组成员处理；若 peer 是
+ * peer-group，则对组内**未显式覆盖**该配置的每个成员同样落配置。恒返回 0。 */
 /* Set advertise-map to the peer. */
 int peer_advertise_map_set(struct peer *peer, afi_t afi, safi_t safi,
 			   const char *advertise_name,
@@ -454,6 +528,10 @@ int peer_advertise_map_set(struct peer *peer, afi_t afi, safi_t safi,
 	return 0;
 }
 
+/* 【函数】删除配置入口：`no neighbor ... advertise-map ...`。若本 peer 未配置过则直接
+ * 返回 0；否则先**无条件**清 override 标志；若 peer 是组成员则改为从 peer-group 继承
+ * 配置（回退到组配置），否则对本 peer 调 filter_update(..., false) 真正删除；最后对
+ * peer-group 内未覆盖该配置的成员逐一执行删除。恒返回 0。 */
 /* Unset advertise-map from the peer. */
 int peer_advertise_map_unset(struct peer *peer, afi_t afi, safi_t safi,
 			     const char *advertise_name,

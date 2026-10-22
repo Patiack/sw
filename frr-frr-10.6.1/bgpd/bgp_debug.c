@@ -3,6 +3,42 @@
  * Copyright (C) 1996, 97, 99 Kunihiro Ishiguro
  */
 
+/* ============================================================================
+ * 【文件导读】bgp_debug.c —— BGP 调试 / 日志开关的落地实现
+ * ============================================================================
+ * 【这个文件解决什么问题】
+ *   把 bgp_debug.h 声明的那套“可分类、可细化”的调试开关真正实现出来：
+ *     1) 定义各 debug 命令(debug bgp ... 与 no debug bgp ...)，用于配置 / 查看开关；
+ *     2) 定义运行期判定函数(bgp_debug_per_peer / per_prefix 及各封装)，
+ *        供报文收发、状态机、路由处理在打印前判断“该不该打印”；
+ *     3) 提供文本化与打印工具(NOTIFICATION 文本、属性 dump、RD/前缀拼接等)；
+ *     4) 在 show debugging 中展示、在写配置时落盘。
+ *
+ * 【为什么这样设计(与头文件呼应)】
+ *   - 两套状态：conf_bgp_debug_*(配置态，落盘) 与 term_bgp_debug_*(终端态，仅当前
+ *     运行期)。命令处理里有规律：在 CONFIG_NODE 下走 DEBUG_ON/OFF 同时改两套；
+ *     在 enable 提示符下只走 TERM_DEBUG_ON/OFF。运行期判定 BGP_DEBUG() 只读 term。
+ *   - 位掩码：每个大类一份掩码，子位独立(如 update 的 IN/OUT/PREFIX/DETAIL)。
+ *   - 三种过滤粒度：大类位 + 邻居表(bgp_debug_*_peers) + 前缀表(bgp_debug_*_prefixes),
+ *     三者相与决定是否打印。
+ *
+ * 【关键数据结构】
+ *   struct bgp_debug_filter : 过滤条目(邻居 host / 前缀 p / prefix-list)。
+ *   bgp_status_msg / bgp_type_str / bgp_notify_*_msg : 展示用字符串表。
+ *   update_group 的调试位(UPDGRP_DBG_ON 等)：按更新组整体开关出方向更新调试。
+ *
+ * 【推荐阅读顺序】
+ *   字符串表 → bgp_find_peer 与 bgp_debug_list_* 系列(过滤表管理)
+ *   → bgp_notify_* 与 bgp_dump_attr(文本化) → DEFUN 命令族(配置入口)
+ *   → show_debugging_bgp / bgp_config_write_debug(展示与落盘)
+ *   → bgp_debug_per_peer / per_prefix 与各 bgp_debug_* 判定函数 → rdpfxpath2str。
+ * ============================================================================
+ */
+/*
+ * 依赖说明：本文件用到报文流(stream)、链表(list)、内存类型、sockunion，以及
+ * bgp_route / bgp_attr / bgp_updgrp 等模块接口；末行包含的 bgp_debug_clippy.c
+ * 是由 clippy 从 DEFPY 自动生成命令部分的产物。
+ */
 #include <zebra.h>
 
 #include "lib/bfd.h"
@@ -39,9 +75,18 @@
 
 #include "bgpd/bgp_debug_clippy.c"
 
+/*
+ * 定义(而非声明)配置写入钩子，与头文件的 DECLARE_HOOK 配对；其它模块可挂接，
+ * 使它们的 debug 配置也能出现在 running-config 与 show debugging 输出里。
+ */
 DEFINE_HOOK(bgp_hook_config_write_debug, (struct vty *vty, bool running),
 	    (vty, running));
 
+/*
+ * ===== 调试状态定义(两套) =====
+ * conf_bgp_debug_* 为配置态，被 bgp_config_write_debug 写入配置持久化；
+ * 每个变量是一份位掩码，对应一个大类。下面的顺序与头文件 extern 声明一一对应。
+ */
 unsigned long conf_bgp_debug_as4;
 unsigned long conf_bgp_debug_neighbor_events;
 unsigned long conf_bgp_debug_events;
@@ -63,6 +108,10 @@ unsigned long conf_bgp_debug_bfd;
 unsigned long conf_bgp_debug_cond_adv;
 unsigned long conf_bgp_debug_aggregate;
 
+/*
+ * term_bgp_debug_* 为终端态(仅运行期有效、不落盘)，是运行期判定 BGP_DEBUG()
+ * 实际读取的状态。DEBUG_ON 会同时写 conf 与 term。
+ */
 unsigned long term_bgp_debug_as4;
 unsigned long term_bgp_debug_neighbor_events;
 unsigned long term_bgp_debug_events;
@@ -84,6 +133,10 @@ unsigned long term_bgp_debug_bfd;
 unsigned long term_bgp_debug_cond_adv;
 unsigned long term_bgp_debug_aggregate;
 
+/*
+ * 按对象细化的过滤表(元素为 struct bgp_debug_filter)：
+ * bgp_debug_*_peers 按邻居，bgp_debug_*_prefixes 按前缀。空表 = 该大类全量生效。
+ */
 struct list *bgp_debug_neighbor_events_peers = NULL;
 struct list *bgp_debug_keepalive_peers = NULL;
 struct list *bgp_debug_update_out_peers = NULL;
@@ -93,6 +146,9 @@ struct list *bgp_debug_bestpath_prefixes = NULL;
 struct list *bgp_debug_zebra_prefixes = NULL;
 struct list *bgp_debug_aggregate_prefixes;
 
+/*
+ * FSM 状态号到名称的映射表，供 lookup_msg 把状态翻译成 "Established" 等文本。
+ */
 /* messages for BGP-4 status */
 const struct message bgp_status_msg[] = {{Idle, "Idle"},
 					 {Connect, "Connect"},
@@ -104,11 +160,20 @@ const struct message bgp_status_msg[] = {{Idle, "Idle"},
 					 {Deleted, "Deleted"},
 					 {0}};
 
+/*
+ * BGP 报文类型号到名称的映射(数组下标即类型号)；第 0 项为 NULL，
+ * 因为类型号从 1 开始(OPEN=1, UPDATE=2, ...)。
+ */
 /* BGP message type string. */
 const char *const bgp_type_str[] = {NULL,	   "OPEN",      "UPDATE",
 			      "NOTIFICATION", "KEEPALIVE", "ROUTE-REFRESH",
 			      "CAPABILITY"};
 
+/*
+ * NOTIFICATION 的多张映射表：主错误码表，以及按错误码(头部 / OPEN / UPDATE /
+ * CEASE / ROUTE-REFRESH / FSM)分组的子码表。带前导 "/" 的字符串是子码文本，
+ * 拼接后形如 "Cease/Administrative Shutdown"。
+ */
 /* message for BGP-4 Notify */
 static const struct message bgp_notify_msg[] = {
 	{BGP_NOTIFY_HEADER_ERR, "Message Header Error"},
@@ -182,15 +247,26 @@ static const struct message bgp_notify_fsm_msg[] = {
 	 "/Receive Unexpected Message in Established State"},
 	{0}};
 
+/*
+ * ORIGIN 属性的简写与全称字符串(IGP / EGP / incomplete)，以及 GR 模式字符串。
+ */
 /* Origin strings. */
 const char *const bgp_origin_str[] = {"i", "e", "?"};
 const char *const bgp_origin_long_str[] = {"IGP", "EGP", "incomplete"};
 
 const char *const bgp_global_gr_mode_str[] = { "Helper", "Restarter", "Disabled", "Invalid" };
 
+/*
+ * 前置声明：EVPN 前缀的格式化打印(定义见后面)，供列表打印函数提前引用。
+ */
 static void bgp_debug_print_evpn_prefix(struct vty *vty, const char *desc,
 					struct prefix *p);
 /* Given a string return a pointer the corresponding peer structure */
+/*
+ * bgp_find_peer —— 把命令里输入的邻居字符串解析为 struct peer。
+ * 先尝试当 IP / sockunion 解析；失败则按接口名(如 swpX)或主机名查找。
+ * 返回 NULL 表示该名字在当前 BGP 实例下没有对应的邻居。
+ */
 static struct peer *bgp_find_peer(struct vty *vty, const char *peer_str)
 {
 	struct bgp *bgp = VTY_GET_CONTEXT(bgp);
@@ -215,6 +291,10 @@ static struct peer *bgp_find_peer(struct vty *vty, const char *peer_str)
 		return peer_lookup(bgp, &su);
 }
 
+/*
+ * 释放一张过滤表里的全部条目(前缀对象、host / plist_name 字符串、条目本身)，
+ * 但保留 list 容器本身(只删元素，不销毁 list)。
+ */
 static void bgp_debug_list_free(struct list *list)
 {
 	struct bgp_debug_filter *filter;
@@ -233,6 +313,10 @@ static void bgp_debug_list_free(struct list *list)
 /*
  * Print the desc along with a list of peers/prefixes this debug is
  * enabled for
+ */
+/*
+ * 在 vty 上打印“某调试已对哪些邻居 / 前缀开启”(用于 show debugging)。
+ * 表为空时只输出描述行；否则逐条打印 host 与 prefix-list / 前缀。
  */
 static void bgp_debug_list_print(struct vty *vty, const char *desc,
 				 struct list *list)
@@ -267,6 +351,11 @@ static void bgp_debug_list_print(struct vty *vty, const char *desc,
 /*
  * Print the command to enable the debug for each peer/prefix this debug is
  * enabled for
+ */
+/*
+ * 生成写进 running-config 的 debug 命令行(每个条目一行)。
+ * 返回值 write 为本函数输出的行数，供调用方累加“写了多少行配置”。
+ * 若表为空，至少输出一行纯 desc，保证配置能被 recall。
  */
 static int bgp_debug_list_conf_print(struct vty *vty, const char *desc,
 				     struct list *list)
@@ -305,6 +394,11 @@ static int bgp_debug_list_conf_print(struct vty *vty, const char *desc,
 	return write;
 }
 
+/*
+ * 新建一条 bgp_debug_filter 并追加到过滤表。
+ * host 与 p 互斥：给 host 则记为按邻居；给 p 则拷贝一份前缀记为按前缀；
+ * 另可带 plist_name，此时解析出 v4 / v6 两个 prefix-list 备用。
+ */
 static void bgp_debug_list_add_entry(struct list *list, const char *host,
 				     const struct prefix *p,
 				     const char *plist_name)
@@ -340,6 +434,10 @@ static void bgp_debug_list_add_entry(struct list *list, const char *host,
 	listnode_add(list, filter);
 }
 
+/*
+ * 从过滤表删除匹配 host 或前缀 p 的条目并释放，返回是否删到。
+ * 按 host 与按前缀两条路径互斥(host 优先判断)。
+ */
 static bool bgp_debug_list_remove_entry(struct list *list, const char *host,
 					const struct prefix *p)
 {
@@ -365,6 +463,10 @@ static bool bgp_debug_list_remove_entry(struct list *list, const char *host,
 	return false;
 }
 
+/*
+ * 判断过滤表里是否已存在同样的条目(host / host+plist / 前缀)，
+ * 供命令处理做“重复配置”的友好提示。
+ */
 static bool bgp_debug_list_has_entry(struct list *list, const char *host,
 				     const struct prefix *p,
 				     const char *plist_name)
@@ -391,6 +493,10 @@ static bool bgp_debug_list_has_entry(struct list *list, const char *host,
 	return false;
 }
 
+/*
+ * 判定“对邻居 host 是否开启了出方向更新调试”，本质是查
+ * bgp_debug_update_out_peers 过滤表里有没有该 host。供更新组发送路径查询。
+ */
 bool bgp_debug_peer_updout_enabled(char *host)
 {
 	return (bgp_debug_list_has_entry(bgp_debug_update_out_peers, host, NULL,
@@ -398,6 +504,11 @@ bool bgp_debug_peer_updout_enabled(char *host)
 }
 
 /* Dump attribute. */
+/*
+ * 把一条路由属性的要点拼成一行文本(nexthop / origin / metric / community ...)，
+ * 供 UPDATE 报文调试打印使用。逐项检查属性是否存在，存在才追加。
+ * 返回值：buf 里是否有内容(有则 true)；全空时返回 false。
+ */
 bool bgp_dump_attr(struct attr *attr, char *buf, size_t size)
 {
 	if (!attr)
@@ -515,11 +626,18 @@ bool bgp_dump_attr(struct attr *attr, char *buf, size_t size)
 		return false;
 }
 
+/*
+ * 由错误码返回其文本(查 bgp_notify_msg 表)，未知码给兜底串。
+ */
 const char *bgp_notify_code_str(char code)
 {
 	return lookup_msg(bgp_notify_msg, code, "Unrecognized Error Code");
 }
 
+/*
+ * 由错误码 + 子码返回子码文本：按错误码选择对应的子码表再查。
+ * 对 Hold Timer / Send Hold Timer 这类无子码的错误直接返回空串。
+ */
 const char *bgp_notify_subcode_str(char code, char subcode)
 {
 
@@ -549,6 +667,11 @@ const char *bgp_notify_subcode_str(char code, char subcode)
 	return "";
 }
 
+/*
+ * 从 NOTIFICATION 数据里解析出“管理员原因(admin message)”。
+ * 数据格式：首字节为长度，其后为文本；长度非法则返回空串。
+ * 用 zlog_sanitize 清洗，避免把不可打印字符直接写进日志。
+ */
 /* extract notify admin reason if correctly present */
 const char *bgp_notify_admin_message(char *buf, size_t bufsz, uint8_t *data,
 				     size_t datalen)
@@ -564,6 +687,12 @@ const char *bgp_notify_admin_message(char *buf, size_t bufsz, uint8_t *data,
 	return zlog_sanitize(buf, bufsz, data + 1, len);
 }
 
+/*
+ * 打印 NOTIFICATION：在 neighbor-events 调试开启，或邻居变更日志打开时，
+ * 以 zlog_info 输出(如 "%%NOTIFICATION...: received from/sent to ...")。
+ * 对 CEASE 的管理员关停 / 复位子码还会额外把 admin message 打出来。
+ * 这是“报文类调试走日志(而非 vty)”的典型例子。
+ */
 /* dump notify packet */
 void bgp_notify_print(const struct peer *peer, const struct bgp_notify *bgp_notify,
 		      const char *direct, bool hard_reset)
@@ -613,6 +742,10 @@ void bgp_notify_print(const struct peer *peer, const struct bgp_notify *bgp_noti
 	}
 }
 
+/*
+ * 清除所有更新组上的“出方向更新调试”位：遍历每个 BGP 实例，对每个更新组
+ * 调用 update_group_clear_update_dbg。用于 no debug bgp updates 时统一关闭。
+ */
 static void bgp_debug_clear_updgrp_update_dbg(struct bgp *bgp)
 {
 	if (!bgp)
@@ -620,6 +753,10 @@ static void bgp_debug_clear_updgrp_update_dbg(struct bgp *bgp)
 	update_group_walk(bgp, update_group_clear_update_dbg, NULL);
 }
 
+/*
+ * 把一个 EVPN 前缀(按 route-type)格式化成命令行式的可读文本并输出到 vty。
+ * 支持 type-2(macip)、type-3(multicast/IMET)、type-5(prefix)。
+ */
 static void bgp_debug_print_evpn_prefix(struct vty *vty, const char *desc,
 					struct prefix *p)
 {
@@ -668,6 +805,11 @@ static void bgp_debug_print_evpn_prefix(struct vty *vty, const char *desc,
 	vty_out(vty, "%s %s\n", desc, evpn_desc);
 }
 
+/*
+ * 解析 debug bgp updates prefix ... 里用户输入的 EVPN 前缀(type-2/3/5)。
+ * 借助 bgp_evpn_cli_parse_type 取类型，再解析 mac / ip / 前缀，最后构造
+ * struct prefix_evpn。返回 CMD_SUCCESS / CMD_WARNING。
+ */
 static int bgp_debug_parse_evpn_prefix(struct vty *vty, struct cmd_token **argv,
 				       int argc, struct prefix *argv_p)
 {
@@ -724,14 +866,26 @@ static int bgp_debug_parse_evpn_prefix(struct vty *vty, struct cmd_token **argv,
 	return CMD_SUCCESS;
 }
 
+/*
+ * 旧的通用调试开关 debug(option)：读全局位掩码 bgp_debug_option。
+ * 与上面按大类的 BGP_DEBUG 机制并列，属于历史接口。
+ */
 /* Debug option setting interface. */
 unsigned long bgp_debug_option = 0;
 
+/*
+ * debug(option) —— 返回给定 option 位在全局 bgp_debug_option 中是否置位。
+ * 属于与 BGP_DEBUG 平行的旧式接口。
+ */
 int debug(unsigned int option)
 {
 	return bgp_debug_option & option;
 }
 
+/*
+ * debug bgp as4 —— 打开 AS4(4 字节 AS 号)相关的调试。
+ * 在 config 节点用 DEBUG_ON(同时改配置态+终端态)；在 enable 节点只改终端态。
+ */
 DEFUN (debug_bgp_as4,
        debug_bgp_as4_cmd,
        "debug bgp as4",
@@ -748,6 +902,9 @@ DEFUN (debug_bgp_as4,
 	return CMD_SUCCESS;
 }
 
+/*
+ * no debug bgp as4 —— 关闭 AS4 调试(与上面成对)。
+ */
 DEFUN (no_debug_bgp_as4,
        no_debug_bgp_as4_cmd,
        "no debug bgp as4",
@@ -765,6 +922,10 @@ DEFUN (no_debug_bgp_as4,
 	return CMD_SUCCESS;
 }
 
+/*
+ * debug bgp as4 segment —— 打开 AS4 AS_PATH 段处理相关的调试。
+ * 同一个 as4 大类下的另一个子位(BGP_DEBUG_AS4_SEGMENT)。
+ */
 DEFUN (debug_bgp_as4_segment,
        debug_bgp_as4_segment_cmd,
        "debug bgp as4 segment",
@@ -782,6 +943,9 @@ DEFUN (debug_bgp_as4_segment,
 	return CMD_SUCCESS;
 }
 
+/*
+ * no debug bgp as4 segment —— 关闭 AS4 段调试。
+ */
 DEFUN (no_debug_bgp_as4_segment,
        no_debug_bgp_as4_segment_cmd,
        "no debug bgp as4 segment",
@@ -801,6 +965,10 @@ DEFUN (no_debug_bgp_as4_segment,
 }
 
 /* debug bgp neighbor_events */
+/*
+ * debug bgp neighbor-events —— 打开邻居事件调试(全局)。
+ * 注意会先清空按邻居的过滤表(bgp_debug_list_free)，即回到“对所有邻居生效”。
+ */
 DEFUN (debug_bgp_neighbor_events,
        debug_bgp_neighbor_events_cmd,
        "debug bgp neighbor-events",
@@ -819,6 +987,10 @@ DEFUN (debug_bgp_neighbor_events,
 	return CMD_SUCCESS;
 }
 
+/*
+ * [no] debug bgp neighbor-events detail —— 邻居事件调试的“详细”子位。
+ * 用 DEFPY 的 no 变量区分开关，只设置 NEIGHBOR_EVENTS_DETAIL 位。
+ */
 DEFPY(debug_bgp_neighbor_events_detail,
       debug_bgp_neighbor_events_detail_cmd,
       "[no] debug bgp neighbor-events detail",
@@ -844,6 +1016,11 @@ DEFPY(debug_bgp_neighbor_events_detail,
 	return CMD_SUCCESS;
 }
 
+/*
+ * debug bgp neighbor-events <peer> —— 只对指定邻居打开邻居事件调试。
+ * 把 peer 加入 bgp_debug_neighbor_events_peers 过滤表，再置位。
+ * 这就是“按邻居”这一过滤粒度的入口。
+ */
 DEFUN (debug_bgp_neighbor_events_peer,
        debug_bgp_neighbor_events_peer_cmd,
        "debug bgp neighbor-events <A.B.C.D|X:X::X:X|WORD>",
@@ -881,6 +1058,10 @@ DEFUN (debug_bgp_neighbor_events_peer,
 	return CMD_SUCCESS;
 }
 
+/*
+ * no debug bgp neighbor-events —— 关闭邻居事件调试(含 detail 位)，
+ * 并清空按邻居过滤表。
+ */
 DEFUN (no_debug_bgp_neighbor_events,
        no_debug_bgp_neighbor_events_cmd,
        "no debug bgp neighbor-events",
@@ -902,6 +1083,10 @@ DEFUN (no_debug_bgp_neighbor_events,
 	return CMD_SUCCESS;
 }
 
+/*
+ * no debug bgp neighbor-events <peer> —— 从过滤表移除指定邻居。
+ * 若移除后表变空，说明没有其它邻居需要该调试，则把该大类位也关掉。
+ */
 DEFUN (no_debug_bgp_neighbor_events_peer,
        no_debug_bgp_neighbor_events_peer_cmd,
        "no debug bgp neighbor-events <A.B.C.D|X:X::X:X|WORD>",
@@ -943,6 +1128,9 @@ DEFUN (no_debug_bgp_neighbor_events_peer,
 }
 
 /* debug bgp nht */
+/*
+ * debug bgp nht —— 打开下一跳跟踪(nexthop tracking)调试。
+ */
 DEFUN (debug_bgp_nht,
        debug_bgp_nht_cmd,
        "debug bgp nht",
@@ -959,6 +1147,9 @@ DEFUN (debug_bgp_nht,
 	return CMD_SUCCESS;
 }
 
+/*
+ * no debug bgp nht —— 关闭 NHT 调试。
+ */
 DEFUN (no_debug_bgp_nht,
        no_debug_bgp_nht_cmd,
        "no debug bgp nht",
@@ -977,6 +1168,10 @@ DEFUN (no_debug_bgp_nht,
 }
 
 /* debug bgp keepalives */
+/*
+ * debug bgp keepalives —— 打开 keepalive 报文调试(全局)，
+ * 同样先清空按邻居的 keepalive 过滤表。
+ */
 DEFUN (debug_bgp_keepalive,
        debug_bgp_keepalive_cmd,
        "debug bgp keepalives",
@@ -995,6 +1190,9 @@ DEFUN (debug_bgp_keepalive,
 	return CMD_SUCCESS;
 }
 
+/*
+ * debug bgp keepalives <peer> —— 只对指定邻居打开 keepalive 调试。
+ */
 DEFUN (debug_bgp_keepalive_peer,
        debug_bgp_keepalive_peer_cmd,
        "debug bgp keepalives <A.B.C.D|X:X::X:X|WORD>",
@@ -1030,6 +1228,9 @@ DEFUN (debug_bgp_keepalive_peer,
 	return CMD_SUCCESS;
 }
 
+/*
+ * no debug bgp keepalives —— 关闭 keepalive 调试并清空过滤表。
+ */
 DEFUN (no_debug_bgp_keepalive,
        no_debug_bgp_keepalive_cmd,
        "no debug bgp keepalives",
@@ -1049,6 +1250,9 @@ DEFUN (no_debug_bgp_keepalive,
 	return CMD_SUCCESS;
 }
 
+/*
+ * no debug bgp keepalives <peer> —— 从 keepalive 过滤表移除指定邻居。
+ */
 DEFUN (no_debug_bgp_keepalive_peer,
        no_debug_bgp_keepalive_peer_cmd,
        "no debug bgp keepalives <A.B.C.D|X:X::X:X|WORD>",
@@ -1088,6 +1292,10 @@ DEFUN (no_debug_bgp_keepalive_peer,
 }
 
 /* debug bgp bestpath */
+/*
+ * debug bgp bestpath <prefix> —— 只对指定前缀打开 bestpath(选路)调试。
+ * 这是“按前缀”粒度的入口：前缀加入 bgp_debug_bestpath_prefixes。
+ */
 DEFPY (debug_bgp_bestpath_prefix,
        debug_bgp_bestpath_prefix_cmd,
        "debug bgp bestpath <A.B.C.D/M|X:X::X:X/M>$prefix",
@@ -1122,6 +1330,10 @@ DEFPY (debug_bgp_bestpath_prefix,
 	return CMD_SUCCESS;
 }
 
+/*
+ * no debug bgp bestpath <prefix> —— 从前缀过滤表移除该前缀；
+ * 表空则关闭 bestpath 位。
+ */
 DEFPY (no_debug_bgp_bestpath_prefix,
        no_debug_bgp_bestpath_prefix_cmd,
        "no debug bgp bestpath <A.B.C.D/M|X:X::X:X/M>$prefix",
@@ -1160,6 +1372,9 @@ DEFPY (no_debug_bgp_bestpath_prefix,
 	return CMD_SUCCESS;
 }
 
+/*
+ * no debug bgp bestpath —— 关闭 bestpath 调试并清空前缀过滤表。
+ */
 DEFUN (no_debug_bgp_bestpath,
        no_debug_bgp_bestpath_cmd,
        "no debug bgp bestpath",
@@ -1180,6 +1395,10 @@ DEFUN (no_debug_bgp_bestpath,
 }
 
 /* debug bgp updates */
+/*
+ * debug bgp updates —— 打开更新调试(同时置 IN 与 OUT 两个子位)，全局生效；
+ * 先清空 in / out / prefix 三张过滤表。
+ */
 DEFUN (debug_bgp_update,
        debug_bgp_update_cmd,
        "debug bgp updates",
@@ -1202,6 +1421,9 @@ DEFUN (debug_bgp_update,
 	return CMD_SUCCESS;
 }
 
+/*
+ * [no] debug bgp updates detail —— 更新调试的“详细打印”子位(UPDATE_DETAIL)。
+ */
 DEFPY (debug_bgp_update_detail,
        debug_bgp_update_detail_cmd,
        "[no] debug bgp updates detail",
@@ -1227,6 +1449,10 @@ DEFPY (debug_bgp_update_detail,
 	return CMD_SUCCESS;
 }
 
+/*
+ * debug bgp updates <in|out> —— 只打开入方向或出方向更新调试(全局)。
+ * 按参数首字母 i / o 区分，并清空对应方向的过滤表。
+ */
 DEFUN (debug_bgp_update_direct,
        debug_bgp_update_direct_cmd,
        "debug bgp updates <in|out>",
@@ -1261,6 +1487,11 @@ DEFUN (debug_bgp_update_direct,
 	return CMD_SUCCESS;
 }
 
+/*
+ * debug bgp updates <in|out> <peer> [prefix-list P] —— 对指定邻居(可选带
+ * prefix-list)打开某方向更新调试。加入过滤表后置位；
+ * 出方向还会遍历该 peer 的各 peer_af，打开相应更新组的调试(UPDGRP_PEER_DBG_EN)。
+ */
 DEFPY (debug_bgp_update_direct_peer,
        debug_bgp_update_direct_peer_cmd,
        "debug bgp updates <in|out> <A.B.C.D|X:X::X:X|WORD> [prefix-list PREFIXLIST_NAME$plist]",
@@ -1359,6 +1590,9 @@ DEFPY (debug_bgp_update_direct_peer,
 	return CMD_SUCCESS;
 }
 
+/*
+ * no debug bgp updates <in|out> —— 关闭某方向更新调试(全局)并清空该方向过滤表。
+ */
 DEFUN (no_debug_bgp_update_direct,
        no_debug_bgp_update_direct_cmd,
        "no debug bgp updates <in|out>",
@@ -1395,6 +1629,10 @@ DEFUN (no_debug_bgp_update_direct,
 	return CMD_SUCCESS;
 }
 
+/*
+ * no debug bgp updates <in|out> <peer> [prefix-list P] —— 从某方向过滤表移除
+ * 指定邻居；出方向还会关闭其更新组调试位(UPDGRP_PEER_DBG_DIS)。
+ */
 DEFUN (no_debug_bgp_update_direct_peer,
        no_debug_bgp_update_direct_peer_cmd,
        "no debug bgp updates <in|out> <A.B.C.D|X:X::X:X|WORD> [prefix-list PREFIXLIST_NAME]",
@@ -1493,6 +1731,11 @@ DEFUN (no_debug_bgp_update_direct_peer,
 	return CMD_SUCCESS;
 }
 
+/*
+ * debug bgp updates prefix l2vpn evpn type ... —— 对指定的 EVPN 前缀
+ * (type-2 macip, type-3 multicast, type-5 prefix)打开更新调试。
+ * 先由 bgp_debug_parse_evpn_prefix 把参数解析成待调试前缀。
+ */
 DEFPY (debug_bgp_update_prefix_afi_safi,
        debug_bgp_update_prefix_afi_safi_cmd,
        "debug bgp updates prefix l2vpn$afi evpn$safi type <<macip|2> mac <X:X:X:X:X:X|X:X:X:X:X:X/M> [ip <A.B.C.D|X:X::X:X>]|<multicast|3> ip <A.B.C.D|X:X::X:X>|<prefix|5> ip <A.B.C.D/M|X:X::X:X/M>>",
@@ -1550,6 +1793,9 @@ DEFPY (debug_bgp_update_prefix_afi_safi,
 	return CMD_SUCCESS;
 }
 
+/*
+ * no debug bgp updates prefix l2vpn evpn type ... —— 移除该 EVPN 前缀。
+ */
 DEFPY (no_debug_bgp_update_prefix_afi_safi,
        no_debug_bgp_update_prefix_afi_safi_cmd,
        "no debug bgp updates prefix l2vpn$afi evpn$safi type <<macip|2> mac <X:X:X:X:X:X|X:X:X:X:X:X/M> [ip <A.B.C.D|X:X::X:X>]|<multicast|3> ip <A.B.C.D|X:X::X:X>|<prefix|5> ip <A.B.C.D/M|X:X::X:X/M>>",
@@ -1613,6 +1859,9 @@ DEFPY (no_debug_bgp_update_prefix_afi_safi,
 }
 
 
+/*
+ * debug bgp updates prefix <prefix> —— 对指定的 IPv4 / IPv6 前缀打开更新调试。
+ */
 DEFPY (debug_bgp_update_prefix,
        debug_bgp_update_prefix_cmd,
        "debug bgp updates prefix <A.B.C.D/M|X:X::X:X/M>$prefix",
@@ -1647,6 +1896,9 @@ DEFPY (debug_bgp_update_prefix,
 	return CMD_SUCCESS;
 }
 
+/*
+ * no debug bgp updates prefix <prefix> —— 移除该前缀。
+ */
 DEFPY (no_debug_bgp_update_prefix,
        no_debug_bgp_update_prefix_cmd,
        "no debug bgp updates prefix <A.B.C.D/M|X:X::X:X/M>$prefix",
@@ -1686,6 +1938,10 @@ DEFPY (no_debug_bgp_update_prefix,
 	return CMD_SUCCESS;
 }
 
+/*
+ * no debug bgp updates —— 关闭更新调试的全部子位(IN/OUT/PREFIX)，
+ * 清空三张过滤表，并清除所有更新组上的调试位。
+ */
 DEFUN (no_debug_bgp_update,
        no_debug_bgp_update_cmd,
        "no debug bgp updates",
@@ -1718,6 +1974,9 @@ DEFUN (no_debug_bgp_update,
 }
 
 /* debug bgp zebra */
+/*
+ * debug bgp zebra —— 打开与 zebra 之间消息交互的调试。
+ */
 DEFUN (debug_bgp_zebra,
        debug_bgp_zebra_cmd,
        "debug bgp zebra",
@@ -1734,6 +1993,9 @@ DEFUN (debug_bgp_zebra,
 	return CMD_SUCCESS;
 }
 
+/*
+ * debug bgp graceful-restart —— 打开优雅重启(GR)调试。
+ */
 DEFUN (debug_bgp_graceful_restart,
        debug_bgp_graceful_restart_cmd,
        "debug bgp graceful-restart",
@@ -1751,6 +2013,9 @@ DEFUN (debug_bgp_graceful_restart,
 }
 
 
+/*
+ * debug bgp zebra prefix <prefix> —— 只对指定前缀打开 zebra 调试。
+ */
 DEFPY (debug_bgp_zebra_prefix,
        debug_bgp_zebra_prefix_cmd,
        "debug bgp zebra prefix <A.B.C.D/M|X:X::X:X/M>$prefix",
@@ -1783,6 +2048,9 @@ DEFPY (debug_bgp_zebra_prefix,
 	return CMD_SUCCESS;
 }
 
+/*
+ * no debug bgp zebra —— 关闭 zebra 调试并清空前缀过滤表。
+ */
 DEFUN (no_debug_bgp_zebra,
        no_debug_bgp_zebra_cmd,
        "no debug bgp zebra",
@@ -1802,6 +2070,10 @@ DEFUN (no_debug_bgp_zebra,
 	return CMD_SUCCESS;
 }
 
+/*
+ * no debug bgp graceful-restart —— 关闭 GR 调试。
+ * 对比其它命令：本命令的 help 串把 NO_STR 排在最后，属历史写法。
+ */
 DEFUN (no_debug_bgp_graceful_restart,
 	no_debug_bgp_graceful_restart_cmd,
 	"no debug bgp graceful-restart",
@@ -1819,6 +2091,9 @@ DEFUN (no_debug_bgp_graceful_restart,
 	return CMD_SUCCESS;
 }
 
+/*
+ * no debug bgp zebra prefix <prefix> —— 移除指定前缀。
+ */
 DEFPY (no_debug_bgp_zebra_prefix,
        no_debug_bgp_zebra_prefix_cmd,
        "no debug bgp zebra prefix <A.B.C.D/M|X:X::X:X/M>$prefix",
@@ -1857,6 +2132,9 @@ DEFPY (no_debug_bgp_zebra_prefix,
 }
 
 /* debug bgp aggregate */
+/*
+ * debug bgp aggregate —— 打开聚合路由调试(全局)。
+ */
 DEFPY (debug_bgp_aggregate,
        debug_bgp_aggregate_cmd,
        "debug bgp aggregate",
@@ -1873,6 +2151,9 @@ DEFPY (debug_bgp_aggregate,
 	return CMD_SUCCESS;
 }
 
+/*
+ * no debug bgp aggregate —— 关闭聚合调试并清空前缀过滤表。
+ */
 DEFPY (no_debug_bgp_aggregate,
        no_debug_bgp_aggregate_cmd,
        "no debug bgp aggregate",
@@ -1892,6 +2173,9 @@ DEFPY (no_debug_bgp_aggregate,
 	return CMD_SUCCESS;
 }
 
+/*
+ * debug bgp aggregate prefix <prefix> —— 只对指定前缀打开聚合调试。
+ */
 DEFPY (debug_bgp_aggregate_prefix,
        debug_bgp_aggregate_prefix_cmd,
        "debug bgp aggregate prefix <A.B.C.D/M|X:X::X:X/M>$prefix",
@@ -1922,6 +2206,9 @@ DEFPY (debug_bgp_aggregate_prefix,
 	return CMD_SUCCESS;
 }
 
+/*
+ * no debug bgp aggregate prefix <prefix> —— 移除该前缀。
+ */
 DEFPY (no_debug_bgp_aggregate_prefix,
        no_debug_bgp_aggregate_prefix_cmd,
        "no debug bgp aggregate prefix <A.B.C.D/M|X:X::X:X/M>$prefix",
@@ -1958,6 +2245,9 @@ DEFPY (no_debug_bgp_aggregate_prefix,
 }
 
 /* debug bgp update-groups */
+/*
+ * debug bgp update-groups —— 打开更新组调试。
+ */
 DEFUN (debug_bgp_update_groups,
        debug_bgp_update_groups_cmd,
        "debug bgp update-groups",
@@ -1974,6 +2264,9 @@ DEFUN (debug_bgp_update_groups,
 	return CMD_SUCCESS;
 }
 
+/*
+ * no debug bgp update-groups —— 关闭更新组调试。
+ */
 DEFUN (no_debug_bgp_update_groups,
        no_debug_bgp_update_groups_cmd,
        "no debug bgp update-groups",
@@ -1991,6 +2284,10 @@ DEFUN (no_debug_bgp_update_groups,
 	return CMD_SUCCESS;
 }
 
+/*
+ * debug bgp vpn <leak-from-vrf|leak-to-vrf|rmap-event|label> ——
+ * 用一个命令带多个关键字，分别打开 VPN 路由泄漏的四个子位(VPN_LEAK_*)。
+ */
 DEFUN (debug_bgp_vpn,
        debug_bgp_vpn_cmd,
        "debug bgp vpn <leak-from-vrf|leak-to-vrf|rmap-event|label>",
@@ -2035,6 +2332,9 @@ DEFUN (debug_bgp_vpn,
 	return CMD_SUCCESS;
 }
 
+/*
+ * no debug bgp vpn <keyword> —— 关闭对应的 VPN 泄漏子位。
+ */
 DEFUN (no_debug_bgp_vpn,
        no_debug_bgp_vpn_cmd,
        "no debug bgp vpn <leak-from-vrf|leak-to-vrf|rmap-event|label>",
@@ -2081,6 +2381,9 @@ DEFUN (no_debug_bgp_vpn,
 }
 
 /* debug bgp pbr */
+/*
+ * debug bgp pbr [error] —— 打开 PBR(策略路由)调试；带 error 只开错误子位。
+ */
 DEFUN (debug_bgp_pbr,
        debug_bgp_pbr_cmd,
        "debug bgp pbr [error]",
@@ -2109,6 +2412,9 @@ DEFUN (debug_bgp_pbr,
 	return CMD_SUCCESS;
 }
 
+/*
+ * no debug bgp pbr [error] —— 关闭 PBR 调试(或仅错误子位)。
+ */
 DEFUN (no_debug_bgp_pbr,
        no_debug_bgp_pbr_cmd,
        "no debug bgp pbr [error]",
@@ -2138,6 +2444,10 @@ DEFUN (no_debug_bgp_pbr,
 	return CMD_SUCCESS;
 }
 
+/*
+ * [no] debug bgp evpn mh <es|route> —— 打开 / 关闭 EVPN 多归(multihoming)调试：
+ * es 对应 EVPN_MH_ES，route 对应 EVPN_MH_RT，两个子位可分别设置。
+ */
 DEFPY (debug_bgp_evpn_mh,
        debug_bgp_evpn_mh_cmd,
        "[no$no] debug bgp evpn mh <es$es|route$rt>",
@@ -2189,6 +2499,9 @@ DEFPY (debug_bgp_evpn_mh,
 	return CMD_SUCCESS;
 }
 
+/*
+ * debug bgp labelpool —— 打开标签池调试。
+ */
 DEFUN (debug_bgp_labelpool,
        debug_bgp_labelpool_cmd,
        "debug bgp labelpool",
@@ -2207,6 +2520,9 @@ DEFUN (debug_bgp_labelpool,
 	return CMD_SUCCESS;
 }
 
+/*
+ * no debug bgp labelpool —— 关闭标签池调试。
+ */
 DEFUN (no_debug_bgp_labelpool,
        no_debug_bgp_labelpool_cmd,
        "no debug bgp labelpool",
@@ -2227,6 +2543,11 @@ DEFUN (no_debug_bgp_labelpool,
 	return CMD_SUCCESS;
 }
 
+/*
+ * [no] debug bgp bfd —— 打开 / 关闭 BFD 调试。
+ * 除置位外还调用 bfd_protocol_integration_set_debug()，把 lib 侧的 BFD 调试
+ * 也一并打开 / 关闭(因为 BFD 实现位于 lib)。
+ */
 DEFPY(debug_bgp_bfd, debug_bgp_bfd_cmd,
       "[no] debug bgp bfd",
       NO_STR
@@ -2257,6 +2578,9 @@ DEFPY(debug_bgp_bfd, debug_bgp_bfd_cmd,
 	return CMD_SUCCESS;
 }
 
+/*
+ * [no] debug bgp conditional-advertisement —— 打开 / 关闭条件通告调试。
+ */
 DEFPY (debug_bgp_cond_adv,
        debug_bgp_cond_adv_cmd,
        "[no$no] debug bgp conditional-advertisement",
@@ -2284,6 +2608,12 @@ DEFPY (debug_bgp_cond_adv,
 	return CMD_SUCCESS;
 }
 
+/*
+ * no debug bgp —— 一键关闭所有 BGP 调试(总开关)。
+ * 它清空所有过滤表、清除所有更新组的调试位，再把各大类的每个子位逐一用
+ * TERM_DEBUG_OFF 清零。注意：本命令只装在 ENABLE 节点、且只清终端态，
+ * 不会改动写入配置的 conf 配置态。
+ */
 DEFUN (no_debug_bgp,
        no_debug_bgp_cmd,
        "no debug bgp",
@@ -2335,6 +2665,12 @@ DEFUN (no_debug_bgp,
 	return CMD_SUCCESS;
 }
 
+/*
+ * show debugging [bgp] —— 汇总显示所有已开启的 BGP 调试。
+ * 逐个 BGP_DEBUG(...) 判断：开了就打印对应说明；若该大类还有过滤表，
+ * 则由 bgp_debug_list_print 列出具体的邻居 / 前缀。最后再调用 lib 的
+ * cmd_show_lib_debugs() 与配置写入钩子，兼顾通用与扩展的调试开关。
+ */
 DEFUN_NOSH (show_debugging_bgp,
 	    show_debugging_bgp_cmd,
 	    "show debugging [bgp]",
@@ -2436,6 +2772,12 @@ DEFUN_NOSH (show_debugging_bgp,
 	return CMD_SUCCESS;
 }
 
+/*
+ * bgp_config_write_debug —— 把当前“配置态”调试开关写成配置命令。
+ * 每个 CONF_BGP_DEBUG(...) 判断：开了就输出对应 debug 命令行；对带过滤表的
+ * 大类用 bgp_debug_list_conf_print 逐条输出，从而 recall 后能还原。
+ * 返回累计写入的行数。
+ */
 static int bgp_config_write_debug(struct vty *vty)
 {
 	int write = 0;
@@ -2589,6 +2931,10 @@ static int bgp_config_write_debug(struct vty *vty)
 }
 
 static int bgp_config_write_debug(struct vty *vty);
+/*
+ * debug 配置节点(DEBUG_NODE)：把本文件的写配置函数挂上去，
+ * 使 write 时能输出 debug bgp ... 系列命令。
+ */
 static struct cmd_node debug_node = {
 	.name = "debug",
 	.node = DEBUG_NODE,
@@ -2596,6 +2942,11 @@ static struct cmd_node debug_node = {
 	.config_write = bgp_config_write_debug,
 };
 
+/*
+ * bgp_debug_init —— 模块初始化：注册 debug 节点，并把所有 debug 相关命令
+ * 安装到 ENABLE / CONFIG 节点。绝大多数命令同时装在两个节点上，
+ * 于是“临时(enable)”与“持久(config)”两种用法都能走同一个回调。
+ */
 void bgp_debug_init(void)
 {
 	install_node(&debug_node);
@@ -2736,6 +3087,12 @@ void bgp_debug_init(void)
 /* Return true if this prefix is on the per_prefix_list of prefixes to debug
  * for BGP_DEBUG_TYPE
  */
+/*
+ * bgp_debug_per_prefix —— 前缀粒度的判定核心。
+ * 先看大类子位是否开(未开直接返回 0)；开着且前缀表为空表示“全量调试”，
+ * 返回 1；否则要求 p 命中表内某前缀(prefixlen 相等且 prefix_match)才返回 1。
+ * 返回 int(而非 bool)，与其它历史判定代码保持一致。
+ */
 static int bgp_debug_per_prefix(const struct prefix *p,
 				unsigned long term_bgp_debug_type,
 				unsigned int BGP_DEBUG_TYPE,
@@ -2768,6 +3125,12 @@ static int bgp_debug_per_prefix(const struct prefix *p,
 
 /* Return true if this peer is on the per_peer_list of peers to debug
  * for BGP_DEBUG_TYPE
+ */
+/*
+ * bgp_debug_per_peer —— 邻居粒度的判定核心。
+ * 大类子位开且邻居表为空 → 全量，返回 true；否则要求 host 命中表内条目。
+ * 若该条目还带了 prefix-list 且调用方给了前缀 p，则进一步要求 p 命中该
+ * prefix-list(PREFIX_PERMIT)才返回 true，实现“只对某邻居的某些前缀调试”。
  */
 static bool bgp_debug_per_peer(char *host, const struct prefix *p,
 			       unsigned long term_bgp_debug_type,
@@ -2809,6 +3172,9 @@ static bool bgp_debug_per_peer(char *host, const struct prefix *p,
 	return false;
 }
 
+/*
+ * 判定某邻居是否要打印 neighbor-events 调试：委托给 bgp_debug_per_peer。
+ */
 bool bgp_debug_neighbor_events(const struct peer *peer)
 {
 	char *host = NULL;
@@ -2821,6 +3187,9 @@ bool bgp_debug_neighbor_events(const struct peer *peer)
 				  bgp_debug_neighbor_events_peers);
 }
 
+/*
+ * 判定某邻居是否要打印 keepalive 调试：委托给 bgp_debug_per_peer。
+ */
 bool bgp_debug_keepalive(const struct peer *peer)
 {
 	char *host = NULL;
@@ -2833,6 +3202,11 @@ bool bgp_debug_keepalive(const struct peer *peer)
 				  bgp_debug_keepalive_peers);
 }
 
+/*
+ * 判定一条更新是否要打印：入方向查 in 表、出方向查 out 表；
+ * 出方向还会检查更新组整体调试位(UPDGRP_DBG_ON)，命中即视为要打印；
+ * 最后统一再查一次“按前缀(UPDATE_PREFIX)”的过滤。任一命中即返回 true。
+ */
 bool bgp_debug_update(const struct peer *peer, const struct prefix *p,
 		      struct update_group *updgrp, unsigned int inbound)
 {
@@ -2872,6 +3246,9 @@ bool bgp_debug_update(const struct peer *peer, const struct prefix *p,
 	return false;
 }
 
+/*
+ * 判定某 bestpath 目标是否要打印：先看 BESTPATH 位，再按前缀过滤。
+ */
 bool bgp_debug_bestpath(struct bgp_dest *dest)
 {
 	if (BGP_DEBUG(bestpath, BESTPATH)) {
@@ -2884,6 +3261,9 @@ bool bgp_debug_bestpath(struct bgp_dest *dest)
 	return false;
 }
 
+/*
+ * 判定某前缀是否要打印 zebra 调试：先看 ZEBRA 位，再按前缀过滤。
+ */
 bool bgp_debug_zebra(const struct prefix *p)
 {
 	if (BGP_DEBUG(zebra, ZEBRA)) {
@@ -2896,6 +3276,9 @@ bool bgp_debug_zebra(const struct prefix *p)
 	return false;
 }
 
+/*
+ * 判定某前缀是否要打印聚合调试：先看 AGGREGATE 位，再按前缀过滤。
+ */
 bool bgp_debug_aggregate(const struct prefix *p)
 {
 	if (BGP_DEBUG(aggregate, AGGREGATE)) {
@@ -2907,6 +3290,12 @@ bool bgp_debug_aggregate(const struct prefix *p)
 	return false;
 }
 
+/*
+ * bgp_debug_rdpfxpath2str —— 把一条路由的关键信息拼成一行调试字符串，供
+ * UPDATE 打印：依次拼上 RD、前缀、网关 IP(overlay)、标签、addpath ID、afi / safi；
+ * 对 flowspec(SAFI_FLOWSPEC)走另一分支，输出 "FS ... Match{...}"。
+ * 要求 size 至少为 BGP_PRD_PATH_STRLEN(见头文件)，否则返回 NULL。
+ */
 const char *bgp_debug_rdpfxpath2str(afi_t afi, safi_t safi,
 				    const struct prefix_rd *prd,
 				    union prefixconstptr pu,

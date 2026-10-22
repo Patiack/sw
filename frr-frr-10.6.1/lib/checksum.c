@@ -8,9 +8,36 @@
  * pp. 86-101, for additional details on computing this checksum.
  */
 
+/*
+ * 文件导读: checksum.c
+ * ----------------------------------------------------------------------------
+ * 本文件实现 Internet 协议族首部的校验和计算, 以及 Fletcher 校验和.
+ * 作用: 提供 in_cksumv 对任意多段数据做 16 位反码求和, 供 IPv4 / IPv6 与
+ *   TCP / UDP 报文构造与校验使用; 另提供 fletcher_checksum 用于 ISO 8473.
+ *
+ * 核心数据结构: union wordbuf 把两个字节按一个 16 位字处理, 用于跨数据段拼接
+ *   最后可能剩下的奇数字节; struct iovec 描述输入数据段.
+ *
+ * 算法要点: 用 32 位累加器 sum 逐 16 位求和, 进位通过 add_carry 宏即时回卷,
+ *   最后把高 16 位折回低 16 位并取反得到结果.
+ *
+ * 与其他模块关系: 实现 checksum.h 声明的接口; 被 zebra 及各协议模块调用.
+ *
+ * 阅读顺序: 先看 add_carry 宏, 再读 in_cksumv 的分段处理, 最后看
+ *   fletcher_checksum 的取模与回写.
+ *
+ * 易踩的坑: 输入段长度任意, 奇数字节需借缓存跨段拼接; 计算校验和前校验和字段
+ *   通常要先清零; 返回值的字节序处理由调用方负责.
+ */
+
 #include <zebra.h>
 #include "checksum.h"
 
+/*
+ * 端回卷加法: 把 add 加到 dst, 并把产生的进位立刻回卷加到最低位.
+ * dst: 累加器(16 / 32 位); add: 被加数.
+ * 若 dst 加完后小于 _add, 说明发生了溢出(即产生了进位), 于是 dst 再自增 1.
+ */
 #define add_carry(dst, add)                                                    \
 	do {                                                                   \
 		typeof(dst) _add = (add);                                      \
@@ -19,6 +46,14 @@
 			dst++;                                                 \
 	} while (0)
 
+/*
+ * 对多段数据计算 Internet 反码求和校验和.
+ * iov / iov_len: 数据段数组及段数.
+ * 返回: 16 位反码校验和.
+ * 实现: 用 32 位 sum 逐段累加, 段内先按 8 字节(两个 32 位字)快进, 再补 16 位,
+ *   末尾奇数字节借 wordbuf 保留并与下一段的字节拼成一个字; 最后折叠进位取反.
+ * 注意: 段之间长度互不影响, 奇偶由 have_oddbyte 跨段衔接.
+ */
 uint16_t in_cksumv(const struct iovec *iov, size_t iov_len)
 {
 	const struct iovec *iov_end;
@@ -84,8 +119,20 @@ uint16_t in_cksumv(const struct iovec *iov, size_t iov_len)
 }
 
 /* Fletcher Checksum -- Refer to RFC1008. */
+/*
+ * Fletcher 校验和的分块模数. 每处理 MODX 字节做一次取模, 防止累加器溢出;
+ * 注释中提到的 5802 也是常用取值.
+ */
 #define MODX                 4102U   /* 5802 should be fine */
 
+/*
+ * 计算或校验 Fletcher 校验和(RFC 1008).
+ * buffer: 报文起始; len: 报文长度; offset: 校验和字段的 0 基偏移.
+ * 返回: 计算模式返回校验和; 校验模式(offset 为 FLETCHER_CHECKSUM_VALIDATE)
+ *       合法时返回 0.
+ * 副作用: 计算模式会先清零校验和字段再写回结果.
+ * 要点: 用 c0 / c1 两个累加器按 MODX 分块取模 255, 再按公式求 x / y 两个校验字节.
+ */
 /* To be consistent, offset is 0-based index, rather than the 1-based
    index required in the specification ISO 8473, Annex C.1 */
 /* calling with offset == FLETCHER_CHECKSUM_VALIDATE will validate the checksum

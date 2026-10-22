@@ -8,6 +8,40 @@
  *
  */
 
+/*
+ * ============================================================================
+ * 文件导读：northbound_oper.c —— YANG 操作数据（operational data）获取引擎
+ * ============================================================================
+ *
+ * 1) 本文件做什么
+ *    实现 nb_oper_data_iterate() 这条"读取运行态数据"的主链路。上层（各守护
+ *    进程的 show 命令、northbound 的 state 读取）给出一个 XPath 查询串，本
+ *    文件沿 YANG schema 走树，调用各模块注册的回调，把结果填充成 libyang
+ *    数据树，并逐条交给用户的 nb_oper_data_cb 回调。
+ *
+ * 2) 关键概念：yield（让步）与 lookup_next（续查）
+ *    - yield：为避免一次性构造巨大数据树阻塞主线程，走树过程每
+ *      NB_OP_WALK_INTERVAL_MS 微秒级时间片就"让步"一次，把控制权交还事件循环，
+ *      下次再恢复。
+ *    - lookup_next：对实现该回调的 list 节点，yield 之后可从"上一条的位置"
+ *      继续取下一个元素，而无需重建整棵子树。这是本文件最复杂的部分（见
+ *      nb_op_list_get_next 与 nb_op_resume_data_tree）。
+ *
+ * 3) 主要数据结构
+ *    - struct nb_op_node_info：从根到当前节点这条分支上每一层的状态快照。
+ *    - struct nb_op_yield_state：一次查询的全局状态（xpath、node_infos 栈、
+ *      顶层模块遍历状态、回调、yield 计时器等）。
+ *    - nb_op_walks：所有进行中的 walk 组成的链表。
+ *
+ * 4) 走过的路径
+ *    nb_oper_data_iterate() -> nb_op_init() -> 事件循环 -> nb_op_walk()
+ *    -> nb_op_yield() -> 遍历 schema 并调用模块回调 -> 收尾 finish。
+ *
+ * 5) 阅读顺序建议
+ *    先看数据结构与 yield 状态相关的小工具函数（前 800 行），再看 list 的
+ *    get_next / lookup_next 细节，最后看顶层遍历与事件调度。
+ */
+
 #include <zebra.h>
 #include "darr.h"
 #include "debug.h"
@@ -39,20 +73,49 @@ DEFINE_MTYPE_STATIC(LIB, NB_STATE, "Northbound State");
 DEFINE_MTYPE_STATIC(LIB, NB_YIELD_STATE, "NB Yield State");
 DEFINE_MTYPE_STATIC(LIB, NB_NODE_INFOS, "NB Node Infos");
 
+/*
+ * NB_OP_WALK_INTERVAL_MS / NB_OP_WALK_INTERVAL_US
+ *   构造 oper-state 时允许连续占用主线程的时间上限，超过即 yield 让出事件
+ *   循环。默认 50ms；US 为等价的微秒值，供 monotime 计时比较使用。
+ */
 /* Amount of time allowed to spend constructing oper-state prior to yielding */
 #define NB_OP_WALK_INTERVAL_MS 50
 #define NB_OP_WALK_INTERVAL_US (NB_OP_WALK_INTERVAL_MS * 1000)
 
+/*
+ * 本文件自定义的数据类型，核心是走树分支每一层的 nb_op_node_info，以及贯穿
+ * 一次查询的 nb_op_yield_state 状态机对象。
+ */
 /* ---------- */
 /* Data Types */
 /* ---------- */
+/*
+ * PREDECL_LIST(nb_op_walks)
+ *   前向声明一个链表类型 nb_op_walks，其元素类型稍后由 DECLARE_LIST 补全。
+ *   全局变量 nb_op_walks 即该链表的表头，串起所有进行中的 walk。
+ */
 PREDECL_LIST(nb_op_walks);
 
+/*
+ * 两个函数指针类型：
+ *   get_tree_locked_cb —— 按 xpath 取出用户数据树（可能对其加锁）。
+ *   unlock_tree_cb     —— 释放上一步对应的树锁。
+ *   二者配合用于在走树期间临时引用调用方已有的状态树。
+ */
 typedef const struct lyd_node *(*get_tree_locked_cb)(const char *xpath, void **user_tree_lock);
 typedef void (*unlock_tree_cb)(const struct lyd_node *tree, void *user_tree_lock);
 
 /*
  * This is our information about a node on the branch we are looking at
+ */
+/*
+ * struct nb_op_node_info
+ *   走树"分支"上每一层的状态快照（自根向下逐层对应 node_infos 数组元素）。
+ *   inner —— 该层的 libyang 节点；schema —— 对应 schema（删除 inner 后仍保留）。
+ *   keys / position —— 定位片段，分别用于有 key 与无 key 的 list。
+ *   list_entry —— 模块侧的不透明条目指针；xpath_len —— 该层在 xpath 中的长度。
+ *   niters / nents —— 本轮及累计生成的 list 元素个数。
+ *   三个位域的含义见各自英文行注释（本节点是否具体条目、是否支持续查、续查是否可行）。
  */
 struct nb_op_node_info {
 	struct lyd_node *inner;
@@ -85,6 +148,17 @@ struct nb_op_node_info {
  * @query_base_level: the level the query string stops at and full walks
  *                    commence below that.
  * @user_tree: the user's existing state tree to copy state from or NULL.
+ */
+/*
+ * struct nb_op_yield_state
+ *   一次 operational-data 查询的完整状态机对象，贯穿走到 yield 再到恢复。
+ *   Walking 状态：xpath / xpath_orig、node_infos 分支栈、schema_path、
+ *     query_tokens 与 non_specific_predicate、以及 walk_root_level /
+ *     walk_start_level / query_base_level 等层级标线。
+ *   顶层模块遍历：module / node / top_level_tree。
+ *   用户树：user_tree 及其锁与解锁回调（单次使用）。
+ *   Yield 状态：query_did_entry、should_batch、start_time、translator、flags、
+ *     数据回调 cb / cb_arg、收尾回调 finish / finish_arg、定时事件 walk_ev。
  */
 struct nb_op_yield_state {
 	/* Walking state */
@@ -126,13 +200,25 @@ struct nb_op_yield_state {
 
 DECLARE_LIST(nb_op_walks, struct nb_op_yield_state, link);
 
+/*
+ * 本文件的少量文件级（静态）全局变量：事件循环与在途 walk 链表。
+ */
 /* ---------------- */
 /* Global Variables */
 /* ---------------- */
 
+/*
+ * 全局状态：
+ *   event_loop —— 本文件在 yield 时挂靠的事件循环。
+ *   nb_op_walks —— 所有进行中的 walk 组成的链表头。
+ */
 static struct event_loop *event_loop;
 static struct nb_op_walks_head nb_op_walks;
 
+/*
+ * 下面列出本文件内部使用、但定义在后文的静态函数的前向声明，使前面的辅助
+ * 函数可以互相调用而不必关心定义顺序。
+ */
 /* --------------------- */
 /* Function Declarations */
 /* --------------------- */
@@ -149,10 +235,22 @@ static void nb_op_list_list_entry_done(struct nb_op_yield_state *ys, struct nb_n
 static void *nb_op_root_walk_branch_finished(struct nb_op_yield_state *ys, enum nb_error ret);
 static void ys_pop_inner(struct nb_op_yield_state *ys);
 
+/*
+ * 以下按"yield 状态小工具 -> 走树主循环 _walk -> 事件调度与收尾 -> 对外
+ * 接口"的顺序给出各函数的实现。
+ */
 /* -------------------- */
 /* Function Definitions */
 /* -------------------- */
 
+/*
+ * nb_op_create_yield_state
+ *   分配并初始化一次走树所需的 yield 状态对象。
+ *   参数：xpath 查询串；translator 可选 YANG 转换器；flags / should_batch 控制
+ *   行为；cb / cb_arg 为每条数据回调；finish / finish_arg 为收尾回调。
+ *   返回：新分配的 struct nb_op_yield_state，并已挂入全局 nb_op_walks 链表。
+ *   坑：会去掉 xpath 末尾多余的斜杠；释放由 nb_op_free_yield_state 负责。
+ */
 static inline struct nb_op_yield_state *
 nb_op_create_yield_state(const char *xpath, struct yang_translator *translator,
 			 uint32_t flags, bool should_batch, nb_oper_data_cb cb,
@@ -183,6 +281,12 @@ nb_op_create_yield_state(const char *xpath, struct yang_translator *translator,
 	return ys;
 }
 
+/*
+ * nb_op_reset_yield_state
+ *   清空一次查询累积的临时数组（query_tokens / schema_path 等），并逐个弹出
+ *   node_infos 栈，使状态对象可被复用。
+ *   副作用：弹出时执行各层收尾逻辑，可能释放 libyang 子树；不释放对象本身。
+ */
 static void nb_op_reset_yield_state(struct nb_op_yield_state *ys)
 {
 	darr_reset(ys->query_tokens);
@@ -194,6 +298,13 @@ static void nb_op_reset_yield_state(struct nb_op_yield_state *ys)
 		ys_pop_inner(ys);
 }
 
+/*
+ * nb_op_free_yield_state
+ *   彻底释放 yield 状态：解锁并释放 user_tree、取消事件、从 nb_op_walks 摘除、
+ *   释放根 libyang 树与各动态数组，最后 XFREE 状态对象。
+ *   参数：nofree_tree 为 true 时保留根树（所有权已转移给调用方）。
+ *   坑：ys 为 NULL 时安全返回；nofree_tree 与树所有权必须由调用方保证一致。
+ */
 static inline void nb_op_free_yield_state(struct nb_op_yield_state *ys,
 					  bool nofree_tree)
 {
@@ -221,6 +332,11 @@ static inline void nb_op_free_yield_state(struct nb_op_yield_state *ys,
 	}
 }
 
+/*
+ * ys_get_walk_stem_tip
+ *   返回"实际开始遍历"那一层的 schema 节点。
+ *   返回：walk_start_level <= 0 时返回 NULL，否则返回该层 node_info 的 schema。
+ */
 static const struct lysc_node *ys_get_walk_stem_tip(struct nb_op_yield_state *ys)
 {
 	if (ys->walk_start_level <= 0)
@@ -228,6 +344,11 @@ static const struct lysc_node *ys_get_walk_stem_tip(struct nb_op_yield_state *ys
 	return ys->node_infos[ys->walk_start_level - 1].schema;
 }
 
+/*
+ * ys_root_node
+ *   返回当前分支的根 libyang 节点（即 node_infos 栈底元素的 inner）。
+ *   返回：栈为空时返回 NULL。
+ */
 static struct lyd_node *ys_root_node(struct nb_op_yield_state *ys)
 {
 	if (!darr_len(ys->node_infos))
@@ -235,6 +356,11 @@ static struct lyd_node *ys_root_node(struct nb_op_yield_state *ys)
 	return ys->node_infos[0].inner;
 }
 
+/*
+ * ys_trim_xpath
+ *   把 ys->xpath 截断到"当前栈顶节点"的长度，保持 xpath 与 node_infos 同步。
+ *   坑：栈为空时把 xpath 长度归 1（保留开头的根斜杠）。
+ */
 static void ys_trim_xpath(struct nb_op_yield_state *ys)
 {
 	uint len = darr_len(ys->node_infos);
@@ -246,6 +372,12 @@ static void ys_trim_xpath(struct nb_op_yield_state *ys)
 	ys->xpath[darr_len(ys->xpath) - 1] = 0;
 }
 
+/*
+ * ys_pop_inner
+ *   弹出 node_infos 栈顶一层：若该层的 list_entry 是"首次出现"，则通知用户
+ *   该列表项结束（nb_op_list_list_entry_done），随后缩短栈并同步 xpath。
+ *   坑：list_entry 会向下传播，故只在最外层出现时释放一次。
+ */
 static void ys_pop_inner(struct nb_op_yield_state *ys)
 {
 	struct nb_op_node_info *ni, *pni;
@@ -265,6 +397,11 @@ static void ys_pop_inner(struct nb_op_yield_state *ys)
 	ys_trim_xpath(ys);
 }
 
+/*
+ * ys_free_inner
+ *   释放某个 node_info 对应的 libyang 内层节点，并置 inner 为 NULL。
+ *   坑：choice / case 节点不拥有独立数据，跳过释放以免误删。
+ */
 static void ys_free_inner(struct nb_op_yield_state *ys,
 			  struct nb_op_node_info *ni)
 {
@@ -273,6 +410,12 @@ static void ys_free_inner(struct nb_op_yield_state *ys,
 	ni->inner = NULL;
 }
 
+/*
+ * nb_op_get_keys
+ *   从 libyang 的 list 节点按序提取所有 key 值，填入 yang_list_keys。
+ *   返回：无（结果写在 keys 中），keys->num 为实际取到的 key 个数。
+ *   坑：只取连续位于最前面的 key 子节点，遇到第一个非 key 子节点即停止。
+ */
 static void nb_op_get_keys(const struct lyd_node *list_node, struct yang_list_keys *keys)
 {
 	struct lyd_node *child;
@@ -290,6 +433,12 @@ static void nb_op_get_keys(const struct lyd_node *list_node, struct yang_list_ke
 	keys->num = n;
 }
 
+/*
+ * nb_op_get_position_predicate
+ *   解析 xpath 中形如 [N] 的位置谓词，用于无 key 的 list。
+ *   返回：解析到的整数位置；没有位置谓词时返回 0。
+ *   坑：靠手动向前回退扫描数字实现，仅识别紧邻右方括号的纯数字谓词。
+ */
 static uint nb_op_get_position_predicate(struct nb_op_yield_state *ys, struct nb_op_node_info *ni)
 {
 	const char *cursor = ys->xpath + ni->xpath_len - 1;
@@ -306,6 +455,14 @@ static uint nb_op_get_position_predicate(struct nb_op_yield_state *ys, struct nb
 	return atoi(&cursor[1]);
 }
 
+/*
+ * _move_back_to_next
+ *   当列表中某条目在 yield 期间消失时，把分支回退到"最近的、支持 lookup_next
+ *   的那一层"，以便用残留的 keys 继续 next 查询。
+ *   参数：i 为出问题的 node_info 下标。
+ *   返回：true 表示已定位到可续查节点；false 表示整条 walk 已无可续之处。
+ *   坑：回退时会释放被裁剪掉的子树内存，并清空该层 list_entry。
+ */
 /**
  * _move_back_to_next() - move back to the next lookup-next schema
  */
@@ -349,6 +506,13 @@ static bool _move_back_to_next(struct nb_op_yield_state *ys, int i)
 	return true;
 }
 
+/*
+ * nb_op_resume_data_tree
+ *   yield 恢复后做一致性校验：从栈底到栈顶逐层确认每个 list 条目仍然存在。
+ *   若某条目已被删除，则回退到最近的 lookup_next 节点准备续查（见上一函数）；
+ *   若无可续之处，则记录调试日志并结束本次 walk。
+ *   坑：假定 yield 一定发生在 list 迭代过程中，因此栈顶必为 list 节点。
+ */
 static void nb_op_resume_data_tree(struct nb_op_yield_state *ys)
 {
 	struct nb_op_node_info *pni, *ni;
@@ -403,6 +567,12 @@ static void nb_op_resume_data_tree(struct nb_op_yield_state *ys)
 }
 
 /*
+ * 只有当"从根到该 list 的所有节点"都实现了 lookup_next 回调时才允许 yield；
+ * 并且支持 lookup_next 的 list，其 get_next 回调必须返回有序（已排序）的结果。
+ * 下面这段英文即描述该约束，以及为何本文件要求每个父 list 只允许有一个
+ * 支持续查的兄弟子节点。
+ */
+/*
  * Can only yield if all list nodes to root have lookup_next() callbacks
  *
  * In order to support lookup_next() the list_node get_next() callback
@@ -413,6 +583,13 @@ static void nb_op_resume_data_tree(struct nb_op_yield_state *ys)
 /* Start of walk init code */
 /* ======================= */
 
+/*
+ * nb_op_xpath_to_trunk
+ *   用 xpath 的"最长可解析前缀"构造出 libyang 的树干（trunk）子树。
+ *   参数：xpath_in 输入查询串；xpath_out 输出实际使用的前缀；trunk 输出树。
+ *   返回：NB_OK，或错误码。
+ *   坑：会逐步截短路径重试，期间临时关闭 libyang 日志以免刷屏。
+ */
 /**
  * nb_op_xpath_to_trunk() - generate a lyd_node tree (trunk) using an xpath.
  * @xpath_in: xpath query string to build trunk from.
@@ -460,6 +637,16 @@ static enum nb_error nb_op_xpath_to_trunk(const char *xpath_in, char **xpath_out
 	return ret;
 }
 
+/*
+ * nb_op_ys_finalize_node_info
+ *   根据 xpath 与栈上已有信息，完成 node_infos[index] 这一层的收尾初始化：
+ *   标记是否支持 lookup_next、从父层继承 list_entry，并按容器 / list 分支
+ *   分别处理；对 list 再解析 key 或位置谓词并取出模块侧的 list_entry。
+ *   参数：index 为目标层在 node_infos 中的下标。
+ *   返回：NB_OK，或 NB_ERR_NOT_FOUND。
+ *   坑：要求当前走在树的最右分支；有 key 的 list 必须能查到 lookup_entry，
+ *   否则视为该数据路径不支持对 oper 数据遍历。
+ */
 /*
  * Finish initializing the node info based on the xpath string, and previous
  * node_infos on the stack. If this node is a list node, obtain the specific
@@ -555,6 +742,13 @@ static enum nb_error nb_op_ys_finalize_node_info(struct nb_op_yield_state *ys,
 	return NB_OK;
 }
 
+/*
+ * nb_op_ys_init_node_infos
+ *   走树开始时，依据 xpath 中"具体的"节点引用，尽可能深地初始化 node_infos
+ *   栈；遇到非具体引用（如不带 keys 谓词的 list 元素）即停止初始化。
+ *   返回：NB_OK 或错误码。
+ *   副作用：可能替换 ys->xpath，并逐层调用 nb_op_ys_finalize_node_info。
+ */
 /**
  * nb_op_ys_init_node_infos() - initialize the node info stack from the query.
  * @ys: the yield state for this tree walk.
@@ -692,11 +886,21 @@ static enum nb_error nb_op_ys_init_node_infos(struct nb_op_yield_state *ys)
 /* End of init code */
 /* ================ */
 
+/*
+ * _module_name
+ *   返回某个北向节点所属 YANG 模块的名字。
+ */
 static const char *_module_name(const struct nb_node *nb_node)
 {
 	return nb_node->snode->module->name;
 }
 
+/*
+ * _get_get_tree_funcs
+ *   查找模块注册的"取出用户数据树"回调 get_tree_locked 与对应的解锁回调。
+ *   参数：module_name 模块名；unlock_func_pp 输出解锁回调。
+ *   返回：取树回调指针；模块不存在或未注册时返回 NULL。
+ */
 static get_tree_locked_cb _get_get_tree_funcs(const char *module_name,
 					      unlock_tree_cb *unlock_func_pp)
 {
@@ -709,6 +913,12 @@ static get_tree_locked_cb _get_get_tree_funcs(const char *module_name,
 	return module->frr_info->get_tree_locked;
 }
 
+/*
+ * _get_tree
+ *   取得本次 walk 使用的"用户数据树"：若尚未取过则调用模块回调获取，并缓存
+ *   在 ys->user_tree（同时记录解锁回调）。
+ *   返回：用户数据树指针。
+ */
 static const struct lyd_node *_get_tree(struct nb_op_yield_state *ys, const struct nb_node *nb_node,
 					const char *xpath)
 {
@@ -724,6 +934,12 @@ static const struct lyd_node *_get_tree(struct nb_op_yield_state *ys, const stru
 	return ys->user_tree;
 }
 
+/*
+ * nb_op_libyang_cb_get
+ *   直接从用户提供的 libyang 数据树中按 xpath 取出单个叶子值，并复制到父节点
+ *   的上下文，从而无需模块实现 get 回调。
+ *   返回：NB_OK（找不到、或类型为空均视为正常）或 NB_ERR。
+ */
 /**
  * nb_op_libyang_cb_get() - get a leaf value from user supplied libyang tree.
  */
@@ -747,6 +963,11 @@ static enum nb_error nb_op_libyang_cb_get(struct nb_op_yield_state *ys,
 	return NB_OK;
 }
 
+/*
+ * nb_op_libyang_cb_get_leaflist
+ *   与上一个函数类似，但针对 leaf-list：按 xpath 找到一组节点并逐个复制。
+ *   返回：NB_OK 或 NB_ERR。
+ */
 static enum nb_error nb_op_libyang_cb_get_leaflist(struct nb_op_yield_state *ys,
 						   const struct nb_node *nb_node,
 						   struct lyd_node *parent, const char *xpath)
@@ -776,6 +997,13 @@ static enum nb_error nb_op_libyang_cb_get_leaflist(struct nb_op_yield_state *ys,
 	return ret;
 }
 
+/*
+ * _get_node_other_tree
+ *   在给定的 libyang 树中定位某个 schema 节点：未给父节点时用完整路径，给了
+ *   父节点则用其路径拼接子节点名，必要时再附加 key 谓词。
+ *   返回：命中的第一个节点，或 NULL。
+ *   坑：路径缓冲区固定为 XPATH_MAXLEN，超长直接返回 NULL。
+ */
 static const struct lyd_node *_get_node_other_tree(const struct lyd_node *tree,
 						   const struct lyd_node *parent_node,
 						   const struct lysc_node *schema,
@@ -815,6 +1043,13 @@ static const struct lyd_node *_get_node_other_tree(const struct lyd_node *tree,
 	return node;
 }
 
+/*
+ * nb_op_list_lookup_entry
+ *   取出 list 中某个具体条目：优先调用模块的 lookup_entry / lookup_node_entry
+ *   回调；对使用 get_tree 的模块则改从用户树里按 key 查找对应节点。
+ *   参数：node 与 keys 二者提供其一定位信息。
+ *   返回：模块侧的 list_entry，或 NULL。
+ */
 static const void *nb_op_list_lookup_entry(struct nb_op_yield_state *ys, struct nb_node *nb_node,
 					   const struct nb_op_node_info *pni, struct lyd_node *node,
 					   const struct yang_list_keys *keys)
@@ -847,6 +1082,11 @@ static const void *nb_op_list_lookup_entry(struct nb_op_yield_state *ys, struct 
 	return _get_node_other_tree(tree, parent_node, nb_node->snode, keys);
 }
 
+/*
+ * _get_next
+ *   在用户数据树中取 list 的下一个同级节点（get_tree 模式）。
+ *   返回：下一个匹配 schema 的节点；返回 NULL 表示已到末尾。
+ */
 static const void *_get_next(struct nb_op_yield_state *ys, struct nb_node *nb_node,
 			     const struct nb_op_node_info *pni, const void *list_entry)
 {
@@ -866,6 +1106,13 @@ static const void *_get_next(struct nb_op_yield_state *ys, struct nb_node *nb_no
 	return node;
 }
 
+/*
+ * nb_op_list_get_next
+ *   取 list 的下一个条目：非 get_tree 模式调用模块 get_next 回调，否则走
+ *   _get_next。list_entry 为 NULL 表示从第一个开始。
+ *   返回：下一个 list_entry，或 NULL。
+ *   注：这是 lookup_next 续查机制的基础，模块需返回有序结果。
+ */
 static const void *nb_op_list_get_next(struct nb_op_yield_state *ys, struct nb_node *nb_node,
 				       const struct nb_op_node_info *pni, const void *list_entry)
 {
@@ -874,6 +1121,12 @@ static const void *nb_op_list_get_next(struct nb_op_yield_state *ys, struct nb_n
 	return _get_next(ys, nb_node, pni, list_entry);
 }
 
+/*
+ * nb_op_list_get_keys
+ *   取某个 list 条目的 key 值：非 get_tree 模式调用模块回调，否则从 libyang
+ *   list 节点最前面连续的 key 子节点读取。
+ *   返回：0 表示成功，结果写入 keys。
+ */
 static enum nb_error nb_op_list_get_keys(struct nb_op_yield_state *ys, struct nb_node *nb_node,
 					 const void *list_entry, struct yang_list_keys *keys)
 {
@@ -906,6 +1159,10 @@ static enum nb_error nb_op_list_get_keys(struct nb_op_yield_state *ys, struct nb
 	return 0;
 }
 
+/*
+ * nb_op_list_list_entry_done
+ *   通知模块某个 list 条目已处理完毕（仅非 get_tree 模式才回调模块）。
+ */
 static void nb_op_list_list_entry_done(struct nb_op_yield_state *ys, struct nb_node *nb_node,
 				       const struct nb_op_node_info *pni, const void *list_entry)
 {
@@ -915,6 +1172,13 @@ static void nb_op_list_list_entry_done(struct nb_op_yield_state *ys, struct nb_n
 	nb_callback_list_entry_done(nb_node, pni ? pni->list_entry : NULL, list_entry);
 }
 
+/*
+ * nb_op_iter_leaf
+ *   处理一个叶子节点：跳过配置写节点与 key，然后按优先级从用户树直接取
+ *   (get_tree)、模块 get 回调、或旧式 nb_callback_get_elem 取值，写入 libyang
+ *   树并通过 ys->cb 回调交给调用方。
+ *   返回：NB_OK 或错误码。
+ */
 /**
  * nb_op_add_leaf() - Add leaf data to the get tree results
  * @ys: the yield state for this tree walk.
@@ -972,6 +1236,12 @@ static enum nb_error nb_op_iter_leaf(struct nb_op_yield_state *ys,
 	return ret;
 }
 
+/*
+ * nb_op_iter_leaflist
+ *   处理一个 leaf-list：同样跳过配置写节点；依次取各条目值写入 libyang 树并
+ *   回调 ys->cb，直到取完。
+ *   返回：NB_OK 或错误码。
+ */
 static enum nb_error nb_op_iter_leaflist(struct nb_op_yield_state *ys,
 					 const struct nb_node *nb_node,
 					 const char *xpath)
@@ -1028,6 +1298,11 @@ static enum nb_error nb_op_iter_leaflist(struct nb_op_yield_state *ys,
 }
 
 
+/*
+ * nb_op_schema_path_has_predicate
+ *   判断 schema 路径第 level 层对应的查询 token 里是否带谓词（即含左方括号）。
+ *   返回：true 表示该层带谓词（是一个具体条目）。
+ */
 static bool nb_op_schema_path_has_predicate(struct nb_op_yield_state *ys,
 					    int level)
 {
@@ -1036,6 +1311,12 @@ static bool nb_op_schema_path_has_predicate(struct nb_op_yield_state *ys,
 	return strchr(ys->query_tokens[level], '[') != NULL;
 }
 
+/*
+ * nb_op_empty_container_ok
+ *   决定是否保留一个已构造但仍为空的容器节点：仅当它是 presence 容器、模块
+ *   提供了 get_elem 回调、且该回调确实取到数据时才保留。
+ *   返回：true 表示应保留。
+ */
 /**
  * nb_op_empty_container_ok() - determine if should keep empty container node.
  *
@@ -1061,6 +1342,13 @@ static bool nb_op_empty_container_ok(const struct lysc_node *snode,
 	return false;
 }
 
+/*
+ * nb_op_get_child_path
+ *   在父节点的 xpath 后追加子节点名，生成子节点 xpath（跨模块时带模块名前缀）。
+ *   参数：xpath_parent 父路径；schild 子 schema；xpath_child 可复用的旧返回值。
+ *   返回：子节点 xpath（darr 字符串）。
+ *   坑：复用已有缓冲区时走 darr_ensure_cap，避免重复分配。
+ */
 /**
  * nb_op_get_child_path() - add child node name to the xpath.
  * @xpath_parent: a darr string for the parent node.
@@ -1097,6 +1385,10 @@ static char *nb_op_get_child_path(const char *xpath_parent,
 	return xpath_child;
 }
 
+/*
+ * _is_yielding_node
+ *   判断某个 schema 节点是否为"可 yield 节点"，即它实现了 lookup_next 回调。
+ */
 static bool _is_yielding_node(const struct lysc_node *snode)
 {
 	struct nb_node *nn = snode->priv;
@@ -1104,6 +1396,12 @@ static bool _is_yielding_node(const struct lysc_node *snode)
 	return nn->cbs.lookup_next != NULL;
 }
 
+/*
+ * _sib_next
+ *   从 sib 开始向后找下一个"与参数 yn 同类"的兄弟节点（yn 为 true 找可 yield
+ *   的，false 找不可 yield 的），并且总是跳过 key 节点。
+ *   返回：命中的兄弟节点，或 NULL。
+ */
 static const struct lysc_node *_sib_next(bool yn, const struct lysc_node *sib)
 {
 	for (; sib; sib = sib->next) {
@@ -1116,6 +1414,14 @@ static const struct lysc_node *_sib_next(bool yn, const struct lysc_node *sib)
 	return NULL;
 }
 
+/*
+ * nb_op_sib_next
+ *   返回遍历顺序中的下一个兄弟 schema 节点：先走不可 yield 的兄弟，再走可
+ *   yield 的那个（这样即使 yield 期间有元素被删，也能保持最完整的树）。
+ *   返回：下一个兄弟；NULL 表示走到头。
+ *   坑：若 node_infos 栈短于 schema_path，说明仍在沿具体查询路径下行，直接
+ *   返回 NULL（不处理兄弟节点）。
+ */
 /**
  * nb_op_sib_next() - Return the next sibling to walk to
  * @ys: the yield state for this tree walk.
@@ -1167,6 +1473,14 @@ static const struct lysc_node *nb_op_sib_next(struct nb_op_yield_state *ys,
  * sib_walk((struct lyd_node *)ni->inner->node.parent->parent->parent->parent->parent->parent->parent)
  */
 
+/*
+ * nb_op_sib_first
+ *   返回从某个父节点开始遍历时的第一个子节点，顺序同样是先不可 yield、后
+ *   可 yield。
+ *   返回：第一个子节点；NULL 表示没有子节点。
+ *   坑：若 node_infos 栈还没长到 query_base_level，则直接返回 schema_path 中
+ *   的下一个节点（沿用户查询路径继续下行）。
+ */
 /**
  * nb_op_sib_first() - obtain the first child to walk to
  * @ys: the yield state for this tree walk.
@@ -1219,6 +1533,15 @@ static const struct lysc_node *nb_op_sib_first(struct nb_op_yield_state *ys,
 	return first_sib;
 }
 
+/*
+ * _walk
+ *   走树主循环：从 walk base 出发，按"先不可 yield 兄弟、后可 yield 兄弟"的
+ *   顺序做先序遍历；遇 list 条目逐个生成、遇 leaf / leaf-list 取值、遇容器 /
+ *   case / choice 递归下钻，必要时调用 yield 让出主线程。
+ *   参数：is_resume 为 true 表示这是一次从 yield 恢复后的继续走。
+ *   返回：NB_OK 或错误码。
+ *   坑：函数体很大，统一靠 done 标签收尾；下面英文块是 3 维视角的遍历示意图。
+ */
 /*
  * "3-dimensional" walk from base of the tree to the tip in-order.
  *
@@ -1863,6 +2186,13 @@ done:
 	return ret;
 }
 
+/*
+ * nb_op_walk_continue
+ *   定时器回调：一次 yield 到期后恢复走树。先校验 / 恢复数据树
+ *   (nb_op_resume_data_tree)，若已退到 walk root 之上则直接收尾；否则从可续查
+ *   节点继续 _walk。
+ *   副作用：结束时调用用户 finish 回调并释放 yield 状态。
+ */
 static void nb_op_walk_continue(struct event *event)
 {
 	struct nb_op_yield_state *ys = EVENT_ARG(event);
@@ -1899,6 +2229,11 @@ finish:
 	nb_op_free_yield_state(ys, false);
 }
 
+/*
+ * _free_siblings
+ *   删除 this 的所有非 key 兄弟节点（this 自身保留不删）。
+ *   坑：与 this 同层、且不是 key 的兄弟都会被释放，用于 yield 后裁剪旧数据。
+ */
 static void _free_siblings(struct lyd_node *this)
 {
 	struct lyd_node *next, *sib;
@@ -1916,6 +2251,13 @@ static void _free_siblings(struct lyd_node *this)
 	DEBUGD(&nb_dbg_events, "NB oper-state: deleted %u siblings", count);
 }
 
+/*
+ * nb_op_trim_yield_state
+ *   裁剪算法：删除栈顶 lookup-next list 节点及其子树（保留带 keys 的栈槽），
+ *   再沿栈向上删除除"最右容器 / list 节点"与"支撑父 list 的 keys"以外的兄弟。
+ *   参数：ys 当前 yield 状态。
+ *   说明：因为只在 lookup-next list 节点上 yield，故栈顶必为这类节点。
+ */
 /*
  * Trim Algorithm:
  *
@@ -1954,6 +2296,13 @@ static void nb_op_trim_yield_state(struct nb_op_yield_state *ys)
 	       (int)darr_lasti(ys->node_infos));
 }
 
+/*
+ * nb_op_yield
+ *   执行一次 yield：batch 模式下先把当前结果交给 finish 回调，再裁剪已交付的
+ *   数据，最后挂定时器在短延时后回调 nb_op_walk_continue 以恢复走树。
+ *   返回：finish 回调返回的错误（用于终止 walk），否则 NB_OK。
+ *   坑：批处理模式下 finish 的返回值会直接决定后续行为。
+ */
 /**
  * nb_op_yield() - Yield during the walk.
  * @ys: the yield state tracking the walk.
@@ -1990,6 +2339,15 @@ static enum nb_error nb_op_yield(struct nb_op_yield_state *ys)
 	return NB_OK;
 }
 
+/*
+ * nb_op_ys_init_schema_path
+ *   依据查询 xpath，在 schema 上解析出一条从根到叶的路径，并把它拆成
+ *   schema_path 栈、query_tokens（NUL 分隔的 token 串）以及谓词标志数组，
+ *   同时算出 query_base_level。
+ *   参数：last 输出路径末端的 nb_node。
+ *   返回：NB_OK 或 NB_ERR。
+ *   坑：当前只支持单个 schema 末端的查询；分词靠手动扫描模块名前缀与斜杠边界。
+ */
 static enum nb_error nb_op_ys_init_schema_path(struct nb_op_yield_state *ys,
 					       struct nb_node **last)
 {
@@ -2113,6 +2471,12 @@ error:
 }
 
 
+/*
+ * nb_op_walk_start
+ *   走树入口：先建好 schema 路径栈（nb_op_ys_init_schema_path），再初始化
+ *   node_infos 栈（nb_op_ys_init_node_infos），最后进入 _walk。
+ *   返回：NB_OK / NB_YIELD / 错误码。
+ */
 /**
  * nb_op_walk_start() - Start walking oper-state directed by query string.
  * @ys: partially initialized yield state for this walk.
@@ -2142,6 +2506,12 @@ static enum nb_error nb_op_walk_start(struct nb_op_yield_state *ys)
 	return _walk(ys, false);
 }
 
+/*
+ * nb_oper_is_yang_lib_query
+ *   判断 xpath 是否是对 ietf-yang-library 模块的查询（以 "/ietf-yang-library:"
+ *   开头且其后仍有内容）。
+ *   返回：true 表示是。
+ */
 bool nb_oper_is_yang_lib_query(const char *xpath)
 {
 	const char *libstr = "/ietf-yang-library:";
@@ -2153,6 +2523,10 @@ bool nb_oper_is_yang_lib_query(const char *xpath)
 	return strlen(xpath) > liblen;
 }
 
+/*
+ * nb_oper_walk_finish_arg
+ *   从 walk 句柄中取出用户注册的 finish 回调参数。
+ */
 void *nb_oper_walk_finish_arg(void *walk)
 {
 	struct nb_op_yield_state *ys = walk;
@@ -2160,6 +2534,10 @@ void *nb_oper_walk_finish_arg(void *walk)
 	return ys->finish_arg;
 }
 
+/*
+ * nb_oper_walk_cb_arg
+ *   从 walk 句柄中取出用户注册的数据回调参数。
+ */
 void *nb_oper_walk_cb_arg(void *walk)
 {
 	struct nb_op_yield_state *ys = walk;
@@ -2167,6 +2545,13 @@ void *nb_oper_walk_cb_arg(void *walk)
 	return ys->cb_arg;
 }
 
+/*
+ * _next_top_level_node
+ *   在"根级遍历"模式下，按模块顺序、模块内 schema 顺序返回下一个可遍历的
+ *   顶层 schema 节点（仅接受 container / choice / leaf / leaf-list / list /
+ *   anyxml / anydata / case）。
+ *   返回：下一个顶层节点；所有模块遍历完后返回 NULL。
+ */
 static const struct lysc_node *_next_top_level_node(struct nb_op_yield_state *ys)
 
 {
@@ -2193,6 +2578,10 @@ static const struct lysc_node *_next_top_level_node(struct nb_op_yield_state *ys
 	return NULL;
 }
 
+/*
+ * nb_op_root_walk_continue
+ *   定时器回调：根级遍历让出后，回来继续处理下一个顶层分支。
+ */
 static void nb_op_root_walk_continue(struct event *event)
 {
 	struct nb_op_yield_state *ys = EVENT_ARG(event);
@@ -2201,6 +2590,14 @@ static void nb_op_root_walk_continue(struct event *event)
 }
 
 
+/*
+ * nb_op_root_walk_branch_finished
+ *   根级遍历的一个分支结束后调用：把该分支产出的数据树合并进累积的
+ *   top_level_tree，重置本次 walk 状态，必要时挂定时器让出，然后启动下一个
+ *   顶层节点的走树；全部分支完成后调用 finish 并释放状态。
+ *   返回：若还需继续则返回 ys（作为 walk 句柄），否则返回 NULL。
+ *   坑：合并使用 LYD_MERGE_DESTRUCT 会销毁源树；注意此处断言 ys_root_node 为 NULL。
+ */
 static void *nb_op_root_walk_branch_finished(struct nb_op_yield_state *ys, enum nb_error ret)
 {
 	unsigned long min_us = MAX(1, NB_OP_WALK_INTERVAL_US / 50000);
@@ -2269,6 +2666,15 @@ static void *nb_op_root_walk_branch_finished(struct nb_op_yield_state *ys, enum 
 	return NULL;
 }
 
+/*
+ * nb_oper_walk
+ *   公开入口：创建 yield 状态并开始一次（可 yield 的）operational-data 查询。
+ *   参数：xpath 查询串、translator、flags、should_batch、数据回调 cb 及其参数、
+ *   收尾回调 finish 及其参数。
+ *   返回：若查询需异步继续则返回 walk 句柄（非 NULL），否则返回 NULL。
+ *   坑：当 xpath 为根路径或根级通配串（斜杠后接星号）时，改走特殊的根级
+ *   遍历路径。
+ */
 void *nb_oper_walk(const char *xpath, struct yang_translator *translator,
 		   uint32_t flags, bool should_batch, nb_oper_data_cb cb,
 		   void *cb_arg, nb_oper_data_finish_cb finish, void *finish_arg)
@@ -2297,6 +2703,10 @@ void *nb_oper_walk(const char *xpath, struct yang_translator *translator,
 }
 
 
+/*
+ * nb_oper_cancel_walk
+ *   取消并释放一次进行中的 walk（walk 为 NULL 时安全返回）。
+ */
 void nb_oper_cancel_walk(void *walk)
 {
 	if (walk)
@@ -2304,6 +2714,10 @@ void nb_oper_cancel_walk(void *walk)
 }
 
 
+/*
+ * nb_oper_cancel_all_walks
+ *   取消并释放所有进行中的 walk（例如进程退出时的清理）。
+ */
 void nb_oper_cancel_all_walks(void)
 {
 	struct nb_op_yield_state *ys;
@@ -2313,6 +2727,14 @@ void nb_oper_cancel_all_walks(void)
 }
 
 
+/*
+ * nb_oper_iterate_legacy
+ *   旧版一次性遍历接口：同步走完整棵树，成功时把根树经 tree 参数交给调用方，
+ *   否则释放。
+ *   返回：NB_OK 或错误码。
+ *   坑：不使用 yield（should_batch=false、finish=NULL）；下面英文注释说明待
+ *   用户迁移到新接口后即可移除本函数。
+ */
 /*
  * The old API -- remove when we've update the users to yielding.
  */
@@ -2343,6 +2765,13 @@ enum nb_error nb_oper_iterate_legacy(const char *xpath,
 	return ret;
 }
 
+/*
+ * _adjust_ptr
+ *   按叶子类型的字节宽度返回合适的取值起始指针并输出 size，用于把定长整数
+ *   按网络字节序放入缓冲区（大端平台上需向前偏移）。
+ *   返回：调整后的指针；遇到非整型类型会 assert(0)。
+ *   坑：仅支持整数类型，其它类型视为编程错误。
+ */
 static const char *_adjust_ptr(struct lysc_node_leaf *lsnode, const char *valuep, size_t *size)
 {
 	switch (lsnode->type->basetype) {
@@ -2389,6 +2818,12 @@ static const char *_adjust_ptr(struct lysc_node_leaf *lsnode, const char *valuep
 	return valuep;
 }
 
+/*
+ * nb_oper_uint64_get
+ *   可直接用作 get_elem 回调的辅助函数：从 list_entry 结构体按 cbs.get_elem
+ *   给出的偏移取出 uint64 值，写入 libyang 叶子节点。
+ *   返回：NB_OK 或 NB_ERR_RESOURCE。
+ */
 enum nb_error nb_oper_uint64_get(const struct nb_node *nb_node, const void *parent_list_entry,
 				 struct lyd_node *parent)
 {
@@ -2407,6 +2842,11 @@ enum nb_error nb_oper_uint64_get(const struct nb_node *nb_node, const void *pare
 }
 
 
+/*
+ * nb_oper_uint32_get
+ *   与 nb_oper_uint64_get 类似，用于 uint32 叶子（按平台宽度裁剪后写入）。
+ *   返回：NB_OK 或 NB_ERR_RESOURCE。
+ */
 enum nb_error nb_oper_uint32_get(const struct nb_node *nb_node, const void *parent_list_entry,
 				 struct lyd_node *parent)
 {
@@ -2424,12 +2864,20 @@ enum nb_error nb_oper_uint32_get(const struct nb_node *nb_node, const void *pare
 	return NB_OK;
 }
 
+/*
+ * nb_oper_init
+ *   模块初始化：记录事件循环并初始化 nb_op_walks 链表。由库初始化流程调用。
+ */
 void nb_oper_init(struct event_loop *loop)
 {
 	event_loop = loop;
 	nb_op_walks_init(&nb_op_walks);
 }
 
+/*
+ * nb_oper_terminate
+ *   模块退出清理：取消所有进行中的 walk。
+ */
 void nb_oper_terminate(void)
 {
 	nb_oper_cancel_all_walks();

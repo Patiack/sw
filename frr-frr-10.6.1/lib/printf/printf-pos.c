@@ -32,6 +32,32 @@
  * SUCH DAMAGE.
  */
 
+/* ============================================================================
+ * 【文件导读】printf/printf-pos.c —— 位置参数（%m$ / %m$.n$）解析
+ * ============================================================================
+ * 【它在 FRR 里干什么】本文件处理 printf 的位置参数语法：%2$s 取第 2 个参数、
+ * %1$*2$d 用第 2 个参数作第 1 个的宽度等。vfprintf.c 在遇到形如 %n$ 的写法时调用
+ * 这里的 _frr_find_arguments，把散落在 va_list 里的实参“拉直”成一张按下标索引的参数
+ * 表，之后主循环即可按任意顺序取参。
+ *
+ * 【为什么需要它】标准 printf 只能顺序消费 va_list；位置参数要求可乱序、可重复引用，
+ * 因此必须先把所有实参的类型收集一遍，再逐个取出。
+ *
+ * 【核心数据结构】
+ *   enum typeid      : 每个实参的类型标记（值类型 T_*、指针类型 TP_* 等）。
+ *   struct typetable : 可扩展的类型表，记录每个实参下标对应的 typeid。
+ *   两个阶段：先扫描格式串填 typetable，再由 build_arg_table 依类型用 va_arg 取出实参
+ *   填入 union arg 数组（union arg 定义见 printflocal.h）。
+ *
+ * 【主要函数】inittypes、freetypes、_ensurespace、addtype、addsarg、adduarg、addaster、
+ * addwaster 负责维护类型表；_frr_find_arguments 与 _frr_find_warguments 是窄 / 宽字符
+ * 两个解析入口；__grow_type_table 负责扩容；build_arg_table 负责取值。
+ *
+ * 【阅读顺序】enum typeid → struct typetable → 类型表维护函数 → 两个 find_arguments
+ * → __grow_type_table → build_arg_table。
+ * ============================================================================
+ */
+
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
@@ -59,12 +85,20 @@
 
 #include "printflocal.h"
 
+/* 【常量】MAX_POSARG —— 位置参数下标上限：优先取 <limits.h> 的 NL_ARGMAX，缺省为
+ * 65536。解析 %n$ 时超过此值即视为错误（防止恶意格式串导致巨量分配）。
+ */
 #ifdef	NL_ARGMAX
 #define	MAX_POSARG	NL_ARGMAX
 #else
 #define	MAX_POSARG	65536
 #endif
 
+/* 【枚举】typeid —— 位置参数类型表里每个实参的类型标记。分三类：T_* 为值类型
+ * （如 T_INT / T_LONG / T_DOUBLE），TP_* 为指针类型（如 TP_INT / TP_VOID，对应 %n
+ * 或需要地址的参数），另有 T_WINT / TP_WCHAR 处理宽字符。构建参数表时据此决定用哪种
+ * va_arg 类型取值。
+ */
 /*
  * Type ids for argument type table.
  */
@@ -77,6 +111,10 @@ enum typeid {
 };
 
 /* An expandable array of types. */
+/* 【结构】typetable —— 位置参数类型表。table 指向类型数组（初始指向内嵌的
+ * stattable，溢出后改为 malloc / realloc 所得）；tablesize 为当前容量；tablemax 为
+ * 已用到的最大下标；nextarg 是 1 基的当前参数下标。初始容量为 STATIC_ARG_TBL_SIZE。
+ */
 struct typetable {
 	enum typeid *table; /* table of types */
 	enum typeid stattable[STATIC_ARG_TBL_SIZE];
@@ -85,9 +123,15 @@ struct typetable {
 	u_int nextarg;		/* 1-based argument index */
 };
 
+/* 【函数原型】__grow_type_table 扩容类型表；build_arg_table 依据类型表用 va_arg 取值
+ * 填出参数表。前者返回 0 / -1，后者失败时把 *argtable 置 NULL。
+ */
 static int	__grow_type_table(struct typetable *);
 static void	build_arg_table (struct typetable *, va_list, union arg **);
 
+/* 【函数】inittypes —— 初始化 typetable：table 指向内嵌静态数组、容量置
+ * STATIC_ARG_TBL_SIZE、nextarg 从 1 起，并把所有槽位置为 T_UNUSED。
+ */
 /*
  * Initialize a struct typetable.
  */
@@ -104,6 +148,9 @@ inittypes(struct typetable *types)
 		types->table[n] = T_UNUSED;
 }
 
+/* 【函数】freetypes —— typetable 析构：仅当 table 不是内嵌静态数组（即由 malloc /
+ * realloc 所得）时才 free。
+ */
 /*
  * struct typetable destructor.
  */
@@ -115,6 +162,9 @@ freetypes(struct typetable *types)
 		free (types->table);
 }
 
+/* 【函数】_ensurespace —— 确保类型表还能再放一个类型：nextarg 达到容量时调用
+ * __grow_type_table 扩容；并顺带把 tablemax 推进到 nextarg。返回 0 成功、-1 失败。
+ */
 /*
  * Ensure that there is space to add a new argument type to the type table.
  * Expand the table if necessary. Returns 0 on success.
@@ -132,6 +182,9 @@ _ensurespace(struct typetable *types)
 	return 0;
 }
 
+/* 【函数】addtype —— 向类型表追加一个类型（先 _ensurespace 保证空间）。返回 0 成功、
+ * -1 失败（空间不足或溢出）。
+ */
 /*
  * Add an argument type to the table, expanding if necessary.
  * Returns 0 on success.
@@ -146,6 +199,10 @@ addtype(struct typetable *types, enum typeid type)
 	return 0;
 }
 
+/* 【函数】addsarg —— 按长度修饰 flags 为有符号整数转换符(d / i)登记类型：LONGDBL 对应
+ * T_INT64T、INTMAXT 对应 T_INTMAXT、SIZET 对应 T_SSIZET、PTRDIFFT 对应 T_PTRDIFFT、
+ * LLONGINT 对应 T_LLONG、LONGINT 对应 T_LONG、否则 T_INT。返回 0 / -1。
+ */
 static inline int
 addsarg(struct typetable *types, int flags)
 {
@@ -169,6 +226,9 @@ addsarg(struct typetable *types, int flags)
 	return 0;
 }
 
+/* 【函数】adduarg —— 与 addsarg 对应，为无符号转换符(o / u / x / X)登记类型；注意
+ * SIZET 与 PTRDIFFT 都映射到 T_SIZET（无符号）。返回 0 / -1。
+ */
 static inline int
 adduarg(struct typetable *types, int flags)
 {
@@ -192,6 +252,10 @@ adduarg(struct typetable *types, int flags)
 	return 0;
 }
 
+/* 【函数】addaster —— 处理“星号”宽度 / 精度参数：形如 *n$ 时把 nextarg 临时切到 n
+ * 登记一个 T_INT 再复位，并前移 *fmtp 越过 "n$"；否则直接登记下一个 T_INT。
+ * 返回 0 / -1。
+ */
 /*
  * Add * arguments to the type array.
  */
@@ -222,6 +286,9 @@ addaster(struct typetable *types, char **fmtp)
 }
 
 #ifdef WCHAR_SUPPORT
+/* 【函数】addwaster —— addaster 的宽字符版（仅 WCHAR_SUPPORT 下编译），逻辑相同，
+ * 只是操作 wchar_t 格式串。
+ */
 static inline int
 addwaster(struct typetable *types, wchar_t **fmtp)
 {
@@ -249,6 +316,12 @@ addwaster(struct typetable *types, wchar_t **fmtp)
 }
 #endif /* WCHAR_SUPPORT */
 
+/* 【函数】_frr_find_arguments —— 位置参数（%m$ / %m$.n$）解析入口：先扫描格式串得到
+ * 每个实参的类型表(typetable)，再经 build_arg_table 构建 union arg 参数表，经
+ * *argtable 回填。返回 0 表示成功；失败返回非 0 并置 errno（*argtable 为 NULL 也返回
+ * 非 0）。初始参数表应指向 STATIC_ARG_TBL_SIZE 大小的数组，溢出时会被替换为 malloc
+ * 的表；堆表由调用方（vfprintf）负责释放。
+ */
 /*
  * Find all arguments when a positional parameter is encountered.  Returns a
  * table, indexed by argument number, of pointers to each arguments.  The
@@ -450,6 +523,9 @@ error:
 
 #ifdef WCHAR_SUPPORT
 /* wchar version of __find_arguments. */
+/* 【函数】_frr_find_warguments —— _frr_find_arguments 的宽字符版（WCHAR_SUPPORT 下），
+ * 逻辑一致，只是格式串为 wchar_t * 且用 addwaster 处理星号参数。
+ */
 int
 _frr_find_warguments (const wchar_t *fmt0, va_list ap, union arg **argtable)
 {
@@ -643,6 +719,10 @@ error:
 }
 #endif /* WCHAR_SUPPORT */
 
+/* 【函数】__grow_type_table —— 把类型表容量翻倍（并保证至少能容纳 nextarg+1 项）。
+ * 首次扩容从内嵌静态数组 bcopy 到新 malloc 表，之后用 realloc；新增槽位置 T_UNUSED。
+ * 返回 0 成功、-1 失败（超过 MAX_POSARG 或内存分配失败）。
+ */
 /*
  * Increase the size of the type table. Returns 0 on success.
  */
@@ -679,6 +759,11 @@ __grow_type_table(struct typetable *types)
 	return 0;
 }
 
+/* 【函数】build_arg_table —— 依据已建好的类型表，用 va_arg 逐个取出实参填入 union arg
+ * 数组：tablemax < STATIC_ARG_TBL_SIZE 时复用调用者传入的静态表，否则 malloc 一块。
+ * 注意：T_UNUSED 槽位也会消耗一个 int 参数（“whoops” 兜底）；任意一次 malloc 失败都会
+ * 把 *argtable 置 NULL，交由调用方判定出错。
+ */
 /*
  * Build the argument table from the completed type table.
  * On malloc failure, *argtable is set to NULL.

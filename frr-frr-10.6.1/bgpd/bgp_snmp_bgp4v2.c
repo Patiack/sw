@@ -3,6 +3,32 @@
  *
  * Copyright (C) 2022 Donatas Abraitis <donatas@opensourcerouting.org>
  */
+/* ============================================================================
+ * 【文件导读】bgp_snmp_bgp4v2.c —— BGP4V2-MIB 取值实现
+ * ============================================================================
+ * 【它解决什么问题】把 BGP 会话状态、以及每条 NLRI（前缀）的路径属性，按 BGP4V2-MIB
+ *   定义暴露给 SNMP；相比 BGP4-MIB，它支持 4 字节 AS、IPv6、无类前缀，并区分 VRF。
+ *
+ * 【Net-SNMP 集成骨架】与 bgp_snmp_bgp4.c 同构：同一套回调签名
+ *   (struct variable *v, oid name[], size_t *length, int exact, size_t *var_len,
+ *    WriteMethod **write_method)，同一套 smux_header_table / generic 前置校验。
+ *   区别在于：本 MIB 每列在 bgpv2_variables[] 里写两遍——一遍 OID 尾段为 1（IPv4 族）、
+ *   一遍尾段为 2（IPv6 族）；回调里用 name[namelen-1] 判断地址族，再走 IPv4 / IPv6 分支。
+ *
+ * 【表与索引】
+ *   bgp4V2PeerTable           : 索引 = 地址族(1/2) + 邻居地址(4 / 16 字节)
+ *   bgp4V2PeerErrorsTable     : 复用邻居表索引，暴露最近错误
+ *   bgp4V2PeerEventTimesTable : 复用邻居表索引，暴露时长
+ *   bgp4V2NlriTable           : 索引 = AFI + SAFI + 前缀类型 + 前缀 + 前缀长度 +
+ *                               邻居地址 + NlriIndex（同一前缀下多条路径用 index 区分）
+ *
+ * 【本文件覆盖的对象】上述四张表 + bgp4V2Established / bgp4V2BackwardTransition 两个 trap。
+ *
+ * 【推荐阅读顺序】peer_lookup_all_vrf / ..._next（跨 VRF 找邻居）→ bgpv2PeerTable_lookup
+ *   （地址族 + 地址索引）→ 三个邻居表回调 → bgp4v2PathAttrLookup + bgp4v2PathAttrTable
+ *   （NLRI 表）→ bgpv2_variables[] → 末尾 trap 与 init。
+ * ============================================================================
+ */
 
 #include <zebra.h>
 
@@ -29,12 +55,17 @@
 #include "bgpd/bgp_snmp.h"
 #include "bgpd/bgp_snmp_bgp4v2.h"
 
+/* 【宏】声明回调返回值用的 static 缓冲（见 lib/smux.h）；SNMP_INTEGER 等宏写它们。 */
 SNMP_LOCAL_VARIABLES
 
+/* 【OID 常量】bgpv2_oid：bgp4V2 子树；bgpv2_trap_oid：bgp4V2.0（trap 前缀）。 */
 static oid bgpv2_oid[] = {BGP4V2MIB};
 static oid bgpv2_trap_oid[] = { BGP4V2MIB, 0 };
+/* 【哨兵】0.0.0.0，地址缺失时占位返回。 */
 static struct in_addr bgp_empty_addr = {};
 
+/* 【辅助】跨所有 VRF 的所有邻居，按地址（IPv4 或 IPv6）精确查找 peer。
+ * 依据 sockunion 的地址族走 AF_INET / AF_INET6 比较。 */
 static struct peer *peer_lookup_all_vrf(struct ipaddr *addr)
 {
 	struct bgp *bgp;
@@ -66,6 +97,8 @@ static struct peer *peer_lookup_all_vrf(struct ipaddr *addr)
 	return NULL;
 }
 
+/* 【辅助】get_next：在指定地址族(family)的所有邻居里，找“地址严格大于起点”的最小者，
+ * 供按地址递增遍历。offset 指向 OID 里的地址起始处，从中还原起点地址。 */
 static struct peer *peer_lookup_all_vrf_next(struct ipaddr *addr, oid *offset,
 					     sa_family_t family)
 {
@@ -133,6 +166,10 @@ static struct peer *peer_lookup_all_vrf_next(struct ipaddr *addr, oid *offset,
 	return NULL;
 }
 
+/* 【辅助】bgp4V2PeerTable 实例定位。namelen 之后：OID 末段（name[namelen-1]）是地址族
+ * 标志（1=IPv4, 2=IPv6），其后是邻居地址；据此决定地址长度（4 / 16 字节）。
+ * 注意 net-snmp 5.7.3 兼容 hack：当 offsetlen==0（get_next 首个请求）时把地址段清零，
+ * 规避旧版本未初始化 OID 数组的问题（5.8 / 5.9 无此问题）。 */
 static struct peer *bgpv2PeerTable_lookup(struct variable *v, oid name[],
 					  size_t *length, int exact,
 					  struct ipaddr *addr)
@@ -189,6 +226,12 @@ static struct peer *bgpv2PeerTable_lookup(struct variable *v, oid name[],
 	return NULL;
 }
 
+/* 【表】bgp4V2PeerTable 读取回调：逐列返回邻居信息。经 smux_header_table 与 lookup 后，
+ * 按 v->magic 取数：Instance→vrf_id; AddrType→su_local / su_remote 是否 AF_INET;
+ * Local / Remote Addr / Port→依地址族取 sin 或 sin6; LocalAs→peer->local_as;
+ * LocalIdentifier→peer->local_id; RemoteAs→peer->as; RemoteIdentifier→peer->remote_id;
+ * AdminStatus→BGP_PEER_START_SUPPRESSED 判定; State→connection->status;
+ * Description→peer->desc（SNMP_STRING）。 */
 static uint8_t *bgpv2PeerTable(struct variable *v, oid name[], size_t *length,
 			       int exact, size_t *var_len,
 			       WriteMethod **write_method)
@@ -284,6 +327,11 @@ static uint8_t *bgpv2PeerTable(struct variable *v, oid name[], size_t *length,
 	return NULL;
 }
 
+/* 【表】bgp4V2PeerErrorsTable 读取回调：暴露最近一次错误的收 / 发细节。
+ * 用 peer->last_reset 区分方向：等于 PEER_DOWN_NOTIFY_RECEIVED 视为“收到方向”，
+ * 否则视为“发出方向”；相应列取 notify.code / subcode、resettime、错误文本与 data。
+ * 当 code==CEASE 且 subcode 为 admin-shutdown / admin-reset 时，用
+ * bgp_notify_admin_message 解出人类可读文本。 */
 static uint8_t *bgpv2PeerErrorsTable(struct variable *v, oid name[],
 				     size_t *length, int exact, size_t *var_len,
 				     WriteMethod **write_method)
@@ -387,6 +435,8 @@ static uint8_t *bgpv2PeerErrorsTable(struct variable *v, oid name[],
 	return NULL;
 }
 
+/* 【表】bgp4V2PeerEventTimesTable 读取回调：Established 时长、距上次 UPDATE 时长，
+ * 均为 monotime(NULL) 减内部时间戳（uptime / update_time），时间戳为 0 时返回 0。 */
 static uint8_t *bgpv2PeerEventTimesTable(struct variable *v, oid name[],
 					 size_t *length, int exact,
 					 size_t *var_len,
@@ -421,6 +471,12 @@ static uint8_t *bgpv2PeerEventTimesTable(struct variable *v, oid name[],
 	return NULL;
 }
 
+/* 【辅助】bgp4V2NlriTable 实例定位与遍历。OID 索引段包含：AFI（在 name[namelen-1]）、
+ * SAFI、前缀类型、前缀、前缀长度、邻居地址类型、邻居地址、NlriIndex。
+ *   exact   : 逐段解析并找到指定 (前缀, 邻居, index) 的 path；
+ *   get_next: 在同一前缀的多条 path 里按 peer 地址与 index 选“下一个”，没有则用
+ *             bgp_route_next 走到下一个前缀，并把索引回填进 name[] 与 *length。
+ * 地址用 union ipaddr paddr 承载，family / min_family 记录选中的地址族。 */
 static struct bgp_path_info *
 bgp4v2PathAttrLookup(struct variable *v, oid name[], size_t *length,
 		     struct bgp *bgp, struct prefix *addr, int exact)
@@ -762,6 +818,11 @@ bgp4v2PathAttrLookup(struct variable *v, oid name[], size_t *length,
 	return NULL;
 }
 
+/* 【表】bgp4V2NlriTable 读取回调：逐列返回一条 path 的路径属性。先取默认实例 bgp，
+ * bgp4v2PathAttrLookup 定位 path，再用 AF_FOREACH 找到该 peer 的 peer_af 取 AFI / SAFI；
+ * 然后按 v->magic 取数：Index / AFI / SAFI / PrefixType / Prefix / PrefixLen / Best /
+ * CalcLocalPref / Origin / NextHop(AddrType) / LocalPref / MED / AtomicAggregate /
+ * Aggregator* / AsPath* 等。多数属性先用 bgp_attr_exists 判断是否存在，不存在返回 0。 */
 static uint8_t *bgp4v2PathAttrTable(struct variable *v, oid name[],
 				    size_t *length, int exact, size_t *var_len,
 				    WriteMethod **write_method)
@@ -929,6 +990,9 @@ static uint8_t *bgp4v2PathAttrTable(struct variable *v, oid name[],
 	return NULL;
 }
 
+/* 【trap 载荷】bgp4V2Established / BackwardTransition 两个 trap 的对象列表。
+ * 每条 {namelen, {OID 段}}：前 3 段 {1,2,1} 或 {1,3,1} 定位到表，末段 1 / 2 指定
+ * IPv4 / IPv6 实例。Backward 列表比 Established 多带“最近错误”的三列。 */
 /* BGP V2 Traps. */
 static struct trap_object bgpv2TrapEstListv4[] = {
 	{ 6, { 1, 2, 1, BGP4V2_PEER_STATE, 1, 1 } },
@@ -960,6 +1024,9 @@ static struct trap_object bgpv2TrapBackListv6[] = {
 	{ 6, { 1, 3, 1, BGP4V2_PEER_LAST_ERROR_RECEIVED_TEXT, 1, 2 } }
 };
 
+/* 【变量表】BGP4V2-MIB 注册表：每行 {magic, 类型, 读写, 回调, OID 段数, {OID 段}}。
+ * 重要模式：同一列写两遍——相邻两行 OID 段仅末段不同（1=IPv4, 2=IPv6），因为 MIB 把
+ * 地址族编进了索引。magic 与各回调里 switch(v->magic) 用的常量一致。 */
 static struct variable bgpv2_variables[] = {
 	/* bgp4V2PeerEntry */
 	{BGP4V2_PEER_INSTANCE,
@@ -1579,6 +1646,9 @@ static struct variable bgpv2_variables[] = {
 	 {1, 9, 1, BGP4V2_NLRI_PATH_ATTR_UNKNOWN, 1, 2}},
 };
 
+/* 【trap】bgpv2TrapEstablished：仅当 BGP_OPT_TRAPS_BGP4MIBV2 开启时才发。
+ * 同样要求“刚进入 Established”；按邻居地址族选择 IPv4 / IPv6 的载荷列表
+ * （bgpv2TrapEstListv4 / v6）与对应索引长度（4 / 16 字节）。 */
 int bgpv2TrapEstablished(struct peer *peer)
 {
 	oid index[sizeof(oid) * IN6_ADDR_SIZE];
@@ -1618,6 +1688,7 @@ int bgpv2TrapEstablished(struct peer *peer)
 	return 0;
 }
 
+/* 【trap】bgpv2TrapBackwardTransition：FSM 回退时发；同样按地址族选 v4 / v6 载荷列表。 */
 int bgpv2TrapBackwardTransition(struct peer *peer)
 {
 	oid index[sizeof(oid) * IN6_ADDR_SIZE];
@@ -1652,6 +1723,7 @@ int bgpv2TrapBackwardTransition(struct peer *peer)
 	return 0;
 }
 
+/* 【初始化】把 bgpv2_variables[] 注册为 MIB "mibII/bgpv2"，基 OID 为 bgpv2_oid。 */
 int bgp_snmp_bgp4v2_init(struct event_loop *tm)
 {
 	REGISTER_MIB("mibII/bgpv2", bgpv2_variables, variable, bgpv2_oid);

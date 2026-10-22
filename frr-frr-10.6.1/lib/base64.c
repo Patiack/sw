@@ -4,6 +4,29 @@
  * For details, see http://sourceforge.net/projects/libb64
  */
 
+/*
+ * 文件导读: base64.c
+ * ----------------------------------------------------------------------------
+ * 本文件实现 FRR 使用的 Base64 编解码逻辑, 源自 libb64 项目(公有领域).
+ * 作用: 在二进制数据与 Base64 文本之间转换, 供其它模块把二进制内容编码成可
+ *       打印字符串(例如放进入配置行或 JSON)以及反向还原.
+ *
+ * 核心数据结构: 编码侧用 struct base64_encodestate(阶段 与 残留字节 result),
+ *   解码侧用 struct base64_decodestate(阶段 与 残留字节 plainchar). 二者都是
+ *   状态机, 允许把长数据切成多块分次处理.
+ *
+ * 与其他模块关系: 仅依赖同目录 base64.h 提供类型声明, compiler.h 提供
+ *   fallthrough 宏, 不触及 FRR 其它子系统, 属于自包含工具.
+ *
+ * 阅读顺序: 先看 ENCODING 字母表与 base64_encode_value 的映射, 再读
+ *   base64_encode_block 的 3 字节组状态机; 解码侧先看 base64_decode_value 的
+ *   反查表, 再看 base64_decode_block 的 4 字符组状态机.
+ *
+ * 易踩的坑: 输出缓冲要留足填充位; 解码表把 '=' 记为 -2(正常结束), 非法字符记为
+ *   -1(需跳过); switch 内嵌套 while(1) 配合 fallthrough 实现跨状态连续处理,
+ *   阅读时注意 fallthrough 的语义.
+ */
+
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
@@ -11,15 +34,29 @@
 #include "base64.h"
 #include "compiler.h"
 
+/*
+ * Base64 标准字母表(索引 0 至 63 对应的字符).
+ * 顺序: 大写字母, 小写字母, 数字, 加号, 斜杠.
+ */
 static const char *ENCODING =
 	"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
+/*
+ * 初始化编码状态.
+ * state_in: 待初始化的状态对象.
+ * 阶段置为 step_A(从 3 字节组的第 1 字节开始), 残留结果置 0.
+ */
 void base64_init_encodestate(struct base64_encodestate *state_in)
 {
 	state_in->step = step_A;
 	state_in->result = 0;
 }
 
+/*
+ * 把 6 位值映射为 Base64 字符.
+ * value_in: 0 至 63 的值.
+ * 返回: 对应字母表字符; 若 value_in 大于 63 则返回 '='(填充符).
+ */
 char base64_encode_value(char value_in)
 {
 	if (value_in > 63)
@@ -27,6 +64,16 @@ char base64_encode_value(char value_in)
 	return ENCODING[(int)value_in];
 }
 
+/*
+ * 编码一块明文为 Base64.
+ * plaintext_in: 输入明文起始地址; length_in: 输入字节数;
+ * code_out: 输出缓冲; state_in: 编码状态(支持跨调用续编).
+ * 返回: 写入 code_out 的字符数.
+ * 副作用: 会更新 state_in 的阶段与残留字节; 若输入耗尽时正好处于组中间,
+ *         则保留状态并返回, 由调用方稍后用 base64_encode_blockend 收尾.
+ * 实现: switch 内嵌 while(1), 用 fallthrough 在 step_A/B/C 间顺序流转,
+ *       每 3 个输入字节产出 4 个输出字符.
+ */
 int base64_encode_block(const char *plaintext_in, int length_in, char *code_out,
 			struct base64_encodestate *state_in)
 {
@@ -80,6 +127,12 @@ int base64_encode_block(const char *plaintext_in, int length_in, char *code_out,
 	return codechar - code_out;
 }
 
+/*
+ * 结束编码并补齐尾部填充.
+ * code_out: 输出缓冲; state_in: 编码状态.
+ * 返回: 写入的字符数(0 或 3 或 2).
+ * 依据残留阶段决定补几个 '=': step_B 补两个, step_C 补一个, step_A 不补.
+ */
 int base64_encode_blockend(char *code_out, struct base64_encodestate *state_in)
 {
 	char *codechar = code_out;
@@ -102,6 +155,12 @@ int base64_encode_blockend(char *code_out, struct base64_encodestate *state_in)
 }
 
 
+/*
+ * 把 Base64 字符反查为 6 位值.
+ * value_in: 输入字符.
+ * 返回: 合法字符返回 0 至 63; '='(填充) 返回 -2; 其它非法字符返回 -1.
+ * 实现: 用一张以字符减去 43(即 '+' 的 ASCII) 为下标的静态反查表.
+ */
 signed char base64_decode_value(signed char value_in)
 {
 	static const signed char decoding[] = {
@@ -122,12 +181,25 @@ signed char base64_decode_value(signed char value_in)
 	return decoding[(int)value_in];
 }
 
+/*
+ * 初始化解码状态.
+ * 阶段置为 step_a, 残留输出字节清零.
+ */
 void base64_init_decodestate(struct base64_decodestate *state_in)
 {
 	state_in->step = step_a;
 	state_in->plainchar = 0;
 }
 
+/*
+ * 解码一块 Base64 文本为明文.
+ * code_in: 输入文本; length_in: 输入字符数; plaintext_out: 输出缓冲;
+ * state_in: 解码状态(支持跨调用续解).
+ * 返回: 写入 plaintext_out 的字节数.
+ * 副作用: 更新 state_in 的阶段与残留字节.
+ * 实现: switch 内嵌 while(1), 用 fallthrough 在 step_a 至 step_d 间流转,
+ *       每个状态用 do 循环跳过非法字符(-1), 遇到 '='(-2, 小于 0)也一并跳过.
+ */
 int base64_decode_block(const char *code_in, int length_in, char *plaintext_out,
 			struct base64_decodestate *state_in)
 {

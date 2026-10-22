@@ -15,6 +15,37 @@
  * be updated by their owners).
  */
 
+/*
+ * 文件导读：mgmt_msg_native.h —— mgmtd 原生（非 protobuf）消息定义
+ *
+ * 一、定位
+ *   mgmtd 与前端 / 后端客户端之间既可以用 protobuf 编码，也可以使用本文件
+ *   定义的原生消息。原生消息把每条消息直接布局成 C 结构体，按“头部 + 固定
+ *   字段 + 可选变长字段”的方式直接读写线缆，从而摆脱 protobuf 依赖，也便于
+ *   用 C、rust、go、python 等语言直接解析。
+ *
+ * 二、消息的通用布局规则
+ *   1) 每条消息以 struct mgmt_msg_header 作为第一个（匿名）字段；
+ *   2) 其后是定宽字段，按自然对齐边界摆放；
+ *   3) 可选地追加一个零长度变长字段，按 64 位对齐，这样可用
+ *      “头部指针加一”直接得到变长区首地址；
+ *   4) 每种消息定义一个独立的内存类型（MTYPE），成对的 DEFINE_MTYPE 位于
+ *      mgmt_msg_native.c。
+ *   本文件里大量 _Static_assert 用于在编译期校验各结构体的大小与字段偏移，
+ *   一旦布局被破坏就会编译失败。
+ *
+ * 三、消息分类（按 code 区分，见 MGMT_MSG_CODE_*）
+ *   - 公共 API（前端可用）：GET_DATA、TREE_DATA、NOTIFY、EDIT、RPC、
+ *     LOCK、COMMIT 及其对应的 reply；
+ *   - 仅后端（non-public）：GET_TREE、SUBSCRIBE、TXN_REQ / TXN_REPLY、
+ *     CFG_REQ / CFG_REPLY、CFG_APPLY_REQ / CFG_APPLY_REPLY。
+ *   前端消息编码属于对外稳定 API，变更须遵循向后兼容原则（基本不改，只新增）。
+ *
+ * 四、分配与使用
+ *   用 mgmt_msg_native_alloc_msg() 按 MTYPE 分配、mgmt_msg_native_free_msg()
+ *   释放；变长内容用 mgmt_msg_native_append() 追加。底层其实是 darr 动态
+ *   数组，重新分配后旧的内部指针会失效，须重新获取。
+ */
 #ifndef _FRR_MGMT_MSG_NATIVE_H_
 #define _FRR_MGMT_MSG_NATIVE_H_
 
@@ -153,6 +184,10 @@ extern "C" {
  *
  */
 
+/*
+ * 为每种原生消息声明独立的内存类型，便于内存统计与泄漏排查。对应的
+ * DEFINE_MTYPE 在 mgmt_msg_native.c 中给出。
+ */
 DECLARE_MTYPE(MSG_NATIVE_MSG);
 DECLARE_MTYPE(MSG_NATIVE_ERROR);
 DECLARE_MTYPE(MSG_NATIVE_GET_TREE);
@@ -180,6 +215,12 @@ DECLARE_MTYPE(MSG_NATIVE_COMMIT_REPLY);
 
 /*
  * Native message codes
+ */
+/*
+ * 原生消息的类型码（即 struct mgmt_msg_header.code）。注释里的 Public API
+ * 表示前端客户端可用的对外稳定接口；BE only 表示仅 mgmtd 与后端客户端
+ * 之间使用的非公开接口。注意 12~18 号是从 protobuf 消息派生而来、用于
+ * 去除 protobuf 依赖的后端消息。
  */
 #define MGMT_MSG_CODE_ERROR	 0 /* Public API */
 #define MGMT_MSG_CODE_GET_TREE	 1 /* BE only, non-public API */
@@ -210,15 +251,26 @@ DECLARE_MTYPE(MSG_NATIVE_COMMIT_REPLY);
 /*
  * Datastores
  */
+/*
+ * 数据存储（datastore）标识：NONE 表示未指定；RUNNING 为生效配置；
+ * CANDIDATE 为候选配置（提交前）；OPERATIONAL 为运行状态数据。
+ */
 #define MGMT_MSG_DATASTORE_NONE	       0
 #define MGMT_MSG_DATASTORE_RUNNING     1
 #define MGMT_MSG_DATASTORE_CANDIDATE   2
 #define MGMT_MSG_DATASTORE_OPERATIONAL 3
 
+/*
+ * 返回消息类型码对应的可读名称，主要用于日志。参数 code 为 MGMT_MSG_CODE_*。
+ */
 const char *mgmt_msg_code_name(uint code);
 
 /*
  * Formats
+ */
+/*
+ * 数据序列化格式，取值刻意与 libyang 的 LYD_FORMAT 保持一致（见下方静态
+ * 断言），以便直接透传而不必做映射。
  */
 #define MGMT_MSG_FORMAT_XML    1
 #define MGMT_MSG_FORMAT_JSON   2
@@ -243,6 +295,11 @@ _Static_assert(MGMT_MSG_FORMAT_BINARY == LYD_LYB, "Format mismatch");
  * @refer_id: the session, txn, conn, etc, this message is associated with.
  * @req_id: the request this message is for.
  */
+/*
+ * 所有原生消息的公共头部。code 为消息类型码；resv 保留（发送置 0，接收
+ * 忽略）；vsplit 在变长区被拆成两段时给出第一段长度；refer_id 标识本条消息
+ * 关联的会话 / 事务 / 连接；req_id 标识本条消息针对的请求。
+ */
 struct mgmt_msg_header {
 	uint16_t code;
 	uint16_t resv;
@@ -250,6 +307,10 @@ struct mgmt_msg_header {
 	uint64_t refer_id;
 	uint64_t req_id;
 };
+/*
+ * 编译期校验头部布局：总大小为 3*8 字节，且最后一个字段 req_id 正好贴到
+ * 结构体末尾（无尾部填充）。后续每个消息结构体都有类似的静态断言。
+ */
 _Static_assert(sizeof(struct mgmt_msg_header) == 3 * 8, "Bad padding");
 _Static_assert(sizeof(struct mgmt_msg_header) ==
 		       offsetof(struct mgmt_msg_header, req_id) +
@@ -264,6 +325,10 @@ _Static_assert(sizeof(struct mgmt_msg_header) ==
  *
  * This common error message can be used for replies for many msg requests
  * (req_id).
+ */
+/*
+ * 通用错误消息：error 为错误值，errstr 为可选的错误描述（可为 0 长度）。
+ * 可作为多种请求（按 req_id 匹配）的通用应答。
  */
 struct mgmt_msg_error {
 	struct mgmt_msg_header;
@@ -281,6 +346,10 @@ _Static_assert(sizeof(struct mgmt_msg_error) ==
  *
  * @result_type: ``LYD_FORMAT`` for the returned result.
  * @xpath: the query for the data to return.
+ */
+/*
+ * 后端 oper 数据请求：result_type 指定返回结果的 LYD_FORMAT，
+ * xpath 为要查询的数据路径（零长度变长字段）。
  */
 struct mgmt_msg_get_tree {
 	struct mgmt_msg_header;
@@ -302,6 +371,11 @@ _Static_assert(sizeof(struct mgmt_msg_get_tree) ==
  * @result: The tree data in @result_type format.
  *
  */
+/*
+ * 承载数据树的消息：partial_error 表示因何错误导致结果不完整；
+ * result_type 为 result 的格式；more 表示这是分片返回且后续还有；
+ * result 为按 result_type 编码的树数据（零长度变长字段）。
+ */
 struct mgmt_msg_tree_data {
 	struct mgmt_msg_header;
 	int8_t partial_error;
@@ -316,6 +390,10 @@ _Static_assert(sizeof(struct mgmt_msg_tree_data) ==
 	       "Size mismatch");
 
 /* Flags for get-data request */
+/*
+ * get-data 请求的标志位：STATE 包含 config false 的状态数据；CONFIG 包含
+ * config true 的配置数据；EXACT 表示只要精确命中的节点而非整棵子树。
+ */
 #define GET_DATA_FLAG_STATE	0x01	/* include "config false" data */
 #define GET_DATA_FLAG_CONFIG	0x02	/* include "config true" data */
 #define GET_DATA_FLAG_EXACT	0x04	/* get exact data node instead of the full tree */
@@ -323,6 +401,11 @@ _Static_assert(sizeof(struct mgmt_msg_tree_data) ==
 /*
  * Modes of reporting default values. Non-default values are always reported.
  * These options reflect "with-defaults" modes as defined in RFC 6243.
+ */
+/*
+ * 默认值上报模式，对应 RFC 6243 的 with-defaults：非默认值总是上报，
+ * 这里控制默认值如何处理。EXPLICIT 仅显式设置的值；TRIM 省略等于默认的
+ * 值；ALL 上报全部；ALL_ADD_TAG 上报全部并给默认值打标记。
  */
 #define GET_DATA_DEFAULTS_EXPLICIT    0 /* "explicit" */
 #define GET_DATA_DEFAULTS_TRIM	      1 /* "trim"  */
@@ -336,6 +419,11 @@ _Static_assert(sizeof(struct mgmt_msg_tree_data) ==
  * @flags: combination of ``GET_DATA_FLAG_*`` flags.
  * @defaults: one of ``GET_DATA_DEFAULTS_*`` values.
  * @xpath: the query for the data to return.
+ */
+/*
+ * 前端 get-data 请求：result_type 指定返回格式；flags 为 GET_DATA_FLAG_*
+ * 的组合；defaults 取 GET_DATA_DEFAULTS_*；datastore 指定数据存储；
+ * xpath 为查询路径（零长度变长字段）。
  */
 struct mgmt_msg_get_data {
 	struct mgmt_msg_header;
@@ -352,6 +440,10 @@ _Static_assert(sizeof(struct mgmt_msg_get_data) ==
 	       "Size mismatch");
 
 
+/*
+ * 通知（notify）的操作类型：NOTIFICATION 普通通知；DS_REPLACE 数据存储
+ * 整体替换；DS_DELETE 删除；DS_PATCH 增量修改；DS_GET_SYNC 获取同步。
+ */
 #define NOTIFY_OP_NOTIFICATION 0
 #define NOTIFY_OP_DS_REPLACE   1
 #define NOTIFY_OP_DS_DELETE    2
@@ -365,6 +457,11 @@ _Static_assert(sizeof(struct mgmt_msg_get_data) ==
  * @data: The xpath string of the notification followed by the tree data in
  *        @result_type format.
  * @op: notify operation type.
+ */
+/*
+ * 承载通知数据的消息：result_type 为 data 的格式；op 为 NOTIFY_OP_* 操作
+ * 类型；data 为“通知的 xpath 字符串 + 按 result_type 编码的树数据”的
+ * 拼接变长区。
  */
 struct mgmt_msg_notify_data {
 	struct mgmt_msg_header;
@@ -386,6 +483,11 @@ _Static_assert(sizeof(struct mgmt_msg_notify_data) == offsetof(struct mgmt_msg_n
 /* also deprecated -- unneeded, if DS is candidate, then no "commit", if running then "commit" */
 #define EDIT_FLAG_IMPLICIT_COMMIT 0x02
 
+/*
+ * edit 请求的操作类型，取值刻意与 northbound 的 NB_OP_* 对齐（见下方静态
+ * 断言）：CREATE 新建、MERGE 修改合并、REMOVE 删除整个节点、DELETE 删除值、
+ * REPLACE 整体替换。上方的 EDIT_FLAG_IMPLICIT_LOCK / IMPLICIT_COMMIT 已废弃。
+ */
 #define EDIT_OP_CREATE	0
 #define EDIT_OP_DELETE	4
 #define EDIT_OP_MERGE	2
@@ -407,6 +509,11 @@ _Static_assert(EDIT_OP_REMOVE == NB_OP_DESTROY, "Operation mismatch");
  * @operation: one of ``EDIT_OP_*`` operations.
  * @data: the xpath followed by the tree data for the operation.
  *        for CREATE, xpath points to the parent node.
+ */
+/*
+ * 前端 edit 请求：request_type 为 data 的 LYD_FORMAT；flags 为 EDIT_FLAG_*
+ * 组合（已废弃）；datastore 指定要编辑的存储；operation 为 EDIT_OP_*；
+ * data 为“xpath + 该操作对应的树数据”，其中 CREATE 时 xpath 指向父节点。
  */
 struct mgmt_msg_edit {
 	struct mgmt_msg_header;
@@ -432,6 +539,11 @@ _Static_assert(sizeof(struct mgmt_msg_edit) ==
  * @data: [1] Possible structured data to pass back to client (e.g., non-"error"
  *        yang modeled error data).
  */
+/*
+ * 前端 edit 应答：changed 表示数据存储确实被改动；created 表示对象是新建
+ * 的；data 为按 vsplit 拆分的两段内容——第一段是新建节点的 xpath，第二段
+ * 是可选的结构化数据（如非 error 的 YANG 建模错误数据），可为 0 长度。
+ */
 struct mgmt_msg_edit_reply {
 	struct mgmt_msg_header;
 	uint8_t changed;
@@ -452,6 +564,11 @@ _Static_assert(sizeof(struct mgmt_msg_edit_reply) ==
  * (i.e., the topmost node is `input`)
  * @data: the xpath followed by the tree data for the operation.
  */
+/*
+ * RPC / action 请求：request_type 为 data 的 LYD_FORMAT；restconf 为真且
+ * 携带树数据时，数据采用 RESTCONF 格式（顶层节点为 input）；data 为
+ * “xpath + 操作对应的树数据”。
+ */
 struct mgmt_msg_rpc {
 	struct mgmt_msg_header;
 	uint8_t request_type;
@@ -470,6 +587,10 @@ _Static_assert(sizeof(struct mgmt_msg_rpc) == offsetof(struct mgmt_msg_rpc, data
  * @restconf: If true the and tree data is present it is in RESTCONF format
  * (i.e., the topmost node is `output`)
  * @data: the tree data for the reply.
+ */
+/*
+ * RPC / action 应答：result_type 为 data 的格式；restconf 为真且携带树数据
+ * 时采用 RESTCONF 格式（顶层节点为 output）；data 为回复的树数据。
  */
 struct mgmt_msg_rpc_reply {
 	struct mgmt_msg_header;
@@ -502,6 +623,15 @@ _Static_assert(sizeof(struct mgmt_msg_rpc_reply) ==
  * @replace: if true replace existing selectors with `selectors`.
  * @get_only: [backend-only]: if true do get op, don't change selectors.
  */
+/*
+ * 为前端客户端添加通知选择器：用一组 xpath 前缀限定要下发给该客户端的
+ * 通知。也用于 mgmtd 向后端客户端下发，此时行为取决于 get_only：为假则
+ * 更新后端的过滤器集合；为真则在通知流中按给定选择器做一次 get，且不改动
+ * 后端过滤器（用于让前端先拿到状态快照、再接收通知而不漏掉变化）。
+ *   selectors 选择器 xpath 前缀；
+ *   replace   为真则用 selectors 替换既有选择器；
+ *   get_only  仅后端：为真则执行 get 而不改选择器。
+ */
 struct mgmt_msg_notify_select {
 	struct mgmt_msg_header;
 	uint8_t replace;
@@ -516,6 +646,9 @@ _Static_assert(sizeof(struct mgmt_msg_notify_select) ==
 	       "Size mismatch");
 
 
+/*
+ * 通知数据的默认格式。session 请求里 notify_format 为 0 时使用该默认值。
+ */
 #define DEFAULT_NOTIFY_FORMAT MGMT_MSG_FORMAT_JSON
 /**
  * struct mgmt_msg_session_req - Create or delete a front-end session.
@@ -524,6 +657,11 @@ _Static_assert(sizeof(struct mgmt_msg_notify_select) ==
  * @req_id: For create will use as client-id.
  * @notify_format: Format for notification data or 0 for default.
  * @client_name: For first session request the client name, otherwise empty.
+ */
+/*
+ * 创建或删除一个前端会话：refer_id 为 0 表示创建，否则为要删除的会话 id；
+ * req_id 在创建时用作 client-id；notify_format 指定通知数据格式（0 用默认）；
+ * client_name 首次会话请求时给出客户端名，其余情况为空。
  */
 struct mgmt_msg_session_req {
 	struct mgmt_msg_header;
@@ -543,6 +681,10 @@ _Static_assert(sizeof(struct mgmt_msg_session_req) ==
  * @created: true if this is a reply to a create request, otherwise 0.
  * @refer_id: The session-id for the action (create or delete) just taken.
  */
+/*
+ * 会话请求的应答：created 表示这是对创建请求的应答（否则为 0）；
+ * refer_id 为刚创建或删除的会话 id。
+ */
 struct mgmt_msg_session_reply {
 	struct mgmt_msg_header;
 	uint8_t created;
@@ -555,6 +697,10 @@ struct mgmt_msg_session_reply {
  * @refer_id: The session-id that will own (or release) the lock.
  * @datastore: the datastore to lock or unlock.
  * @lock: true to lock, false to unlock.
+ */
+/*
+ * 对某个数据存储加锁或解锁：refer_id 为将持有（或释放）锁的会话 id；
+ * datastore 取值 MGMT_MSG_DATASTORE_*；lock 为真加锁、为假解锁。
  */
 struct mgmt_msg_lock {
 	struct mgmt_msg_header;
@@ -570,6 +716,9 @@ struct mgmt_msg_lock {
  * @datastore: the datastore to lock or unlock.
  * @lock: true if locked, false if unlocked.
  */
+/*
+ * 加解锁请求的应答：datastore、lock 呼应请求；lock 为真表示当前已加锁。
+ */
 struct mgmt_msg_lock_reply {
 	struct mgmt_msg_header;
 	uint8_t datastore; /* MGMT_MSG_DATASTORE_* */
@@ -577,6 +726,9 @@ struct mgmt_msg_lock_reply {
 	uint8_t resv2[6];
 };
 
+/*
+ * commit 动作：APPLY 提交生效；ABORT 放弃改动；VALIDATE 仅校验不生效。
+ */
 #define MGMT_MSG_COMMIT_APPLY	 0
 #define MGMT_MSG_COMMIT_ABORT	 1
 #define MGMT_MSG_COMMIT_VALIDATE 2
@@ -588,6 +740,10 @@ struct mgmt_msg_lock_reply {
  * @target: the datastore to commit into.
  * @action: apply, abort, or validate the changes from source to target.
  * @unlock: value passed to reply message.
+ */
+/*
+ * 对数据存储执行提交 / 放弃 / 校验：source 为来源存储，target 为目标存储，
+ * action 取 MGMT_MSG_COMMIT_*，unlock 会透传到应答中（指示对方是否解锁）。
  */
 struct mgmt_msg_commit {
 	struct mgmt_msg_header;
@@ -606,6 +762,10 @@ struct mgmt_msg_commit {
  * @target: the datastore committed into.
  * @action: action taken, i.e., apply, abort, or validate.
  * @unlock: true indicates receiver should unlock the datastores.
+ */
+/*
+ * commit 请求的应答：source / target / action 呼应请求；unlock 为真表示
+ * 接收方应解锁这些数据存储。
  */
 struct mgmt_msg_commit_reply {
 	struct mgmt_msg_header;
@@ -628,6 +788,12 @@ struct mgmt_msg_commit_reply {
  *	     prefixes, finally by @nrpc xpath prefixes.
  *
  */
+/*
+ * 后端客户端订阅 YANG 路径：nconfig / noper / nnotify / nrpc 分别为后续
+ * strings 中 config / oper / 通知 / rpc 路径的条数；strings 以客户端名
+ * 开头，其后依次是 nconfig 个 config 前缀、noper 个 oper 前缀、nnotify 个
+ * 通知前缀、nrpc 个 rpc 前缀。
+ */
 struct mgmt_msg_subscribe {
 	struct mgmt_msg_header;
 	uint16_t nconfig; /* config path count */
@@ -645,6 +811,10 @@ struct mgmt_msg_subscribe {
  * @refer_id: The transaction ID to create or delete.
  * @create: true if this is a create request, otherwise delete.
  */
+/*
+ * 创建或删除一个事务：refer_id 为要创建或删除的事务 id；create 为真表示
+ * 创建，否则为删除。
+ */
 struct mgmt_msg_txn_req {
 	struct mgmt_msg_header;
 	uint8_t create;
@@ -656,6 +826,10 @@ struct mgmt_msg_txn_req {
  *
  * @refer_id: The transaction ID for the action (create or delete) just taken.
  * @created: true if this is a reply to a create request, otherwise 0.
+ */
+/*
+ * 事务请求的应答：refer_id 为刚创建或删除的事务 id；created 表示这是对
+ * 创建请求的应答。
  */
 struct mgmt_msg_txn_reply {
 	struct mgmt_msg_header;
@@ -678,6 +852,12 @@ struct mgmt_msg_txn_reply {
  * and the second is the new value. The value may be zero length for YANG value
  * type "empty".
  */
+/*
+ * 向后端下发配置：refer_id 为要加入配置变更的事务 id；config 是一串字符串
+ * 组成的变更序列，末尾一个字符串给出动作串。动作串逐字节解释：'d'（删除）
+ * 后跟 1 个字符串（要删除的 xpath）；'m'（修改）后跟 2 个字符串（xpath 与
+ * 新值，值为 YANG 的 empty 类型时长度可为 0）。
+ */
 struct mgmt_msg_cfg_req {
 	struct mgmt_msg_header;
 	uint8_t resv2[8]; /* bug in compiler */
@@ -693,6 +873,10 @@ _Static_assert(sizeof(struct mgmt_msg_cfg_req) == offsetof(struct mgmt_msg_cfg_r
  *
  * @refer_id: The transaction ID whose configuration was received and validated.
  */
+/*
+ * 配置下发（cfg_req）的应答，表示对应事务的配置已被接收并校验；用 refer_id
+ * 关联事务。
+ */
 struct mgmt_msg_cfg_reply {
 	struct mgmt_msg_header;
 };
@@ -701,6 +885,9 @@ struct mgmt_msg_cfg_reply {
  * struct mgmt_msg_cfg_apply_req - Apply config in transaction.
  *
  * @refer_id: The transaction ID to apply.
+ */
+/*
+ * 请求应用某事务中暂存的配置：refer_id 为要应用的事务 id。
  */
 struct mgmt_msg_cfg_apply_req {
 	struct mgmt_msg_header;
@@ -711,12 +898,19 @@ struct mgmt_msg_cfg_apply_req {
  *
  * @refer_id: The transaction ID which was applied.
  */
+/*
+ * 配置已应用完成的应答：refer_id 为被应用的事务 id。
+ */
 struct mgmt_msg_cfg_apply_reply {
 	struct mgmt_msg_header;
 };
 
 /*
  * Validate that the message ends in a NUL terminating byte
+ */
+/*
+ * 校验消息以 NUL 结尾：长度至少比结构体本身多 1 字节，且最后一个字节为 0。
+ * 用于确保变长字符串区以 NUL 终止，可安全当作字符串处理。
  */
 #define MGMT_MSG_VALIDATE_NUL_TERM(msgp, len)                                  \
 	((len) >= sizeof(*msgp) + 1 && ((char *)msgp)[(len)-1] == 0)
@@ -728,6 +922,10 @@ struct mgmt_msg_cfg_apply_reply {
  * Return:
  *	The minimum size of a message of the given type or 0 if the message
  *	code is unknown.
+ */
+/*
+ * 返回给定消息类型码的最小结构体大小（不含变长区）。code 为 MGMT_MSG_CODE_*；
+ * 类型码未知时返回 0。用于接收侧做长度合法性检查。
  */
 size_t mgmt_msg_get_min_size(uint code);
 
@@ -750,6 +948,17 @@ size_t mgmt_msg_get_min_size(uint code);
  *
  * Return:
  *	The return value of ``msg_conn_send_msg``.
+ */
+/*
+ * 向连接对端发送一条原生错误消息，通常由服务端在无法处理客户端请求时使用。
+ *   conn             连接；
+ *   sess_or_txn_id   会话 id（发给前端）或事务 id（来自后端）；
+ *   req_id           该错误对应的请求 id；
+ *   short_circuit_ok 是否允许短接发送；
+ *   error            错误值；
+ *   errfmt / ap      变参错误描述（vprintfrr 风格）。
+ * 返回 msg_conn_send_msg 的返回值。注意：处理消息过程中不允许关闭连接，故此
+ * 对需要应答的请求必须回以应答或本错误消息。
  */
 extern int vmgmt_msg_native_send_error(struct msg_conn *conn,
 				       uint64_t sess_or_txn_id, uint64_t req_id,
@@ -778,6 +987,11 @@ extern int vmgmt_msg_native_send_error(struct msg_conn *conn,
  *
  * Return: A `msg_type` object created using a dynamic_array.
  */
+/*
+ * 分配一条可追加的原生消息。msg_type 为消息结构体类型，var_len 为初始额外的
+ * 变长区长度，mem_type 为内存类型。返回按该结构体解释的 darr 指针，随后可
+ * 用 mgmt_msg_native_append 追加数据。
+ */
 #define mgmt_msg_native_alloc_msg(msg_type, var_len, mem_type)                                    \
 	({                                                                                        \
 		uint8_t *_nam_buf = NULL;                                                         \
@@ -789,6 +1003,9 @@ extern int vmgmt_msg_native_send_error(struct msg_conn *conn,
  * mgmt_msg_free_native_msg() - Free a native msg.
  * @msg: pointer to message allocated by mgmt_msg_create_native_msg().
  */
+/*
+ * 释放由 mgmt_msg_native_alloc_msg 分配的原生消息（本质是 darr_free）。
+ */
 #define mgmt_msg_native_free_msg darr_free
 
 /**
@@ -796,6 +1013,9 @@ extern int vmgmt_msg_native_send_error(struct msg_conn *conn,
  * @msg: the native message.
  *
  * Return: the total length of the message, fixed + variable length.
+ */
+/*
+ * 返回消息的总长度（定长头部 + 已追加的变长数据）。
  */
 #define mgmt_msg_native_get_msg_len(msg) (darr_len((uint8_t *)(msg)))
 
@@ -812,6 +1032,10 @@ extern int vmgmt_msg_native_send_error(struct msg_conn *conn,
  * be discarded.
  *
  * Return: a pointer to the newly appended data.
+ */
+/*
+ * 向消息尾部追加 len 字节数据，返回指向新追加数据的指针。注意 msg 可能因
+ * 重新分配而改变，之前保存的指向该消息内部的其它指针都会失效，须丢弃。
  */
 #define mgmt_msg_native_append(msg, data, len)                                                     \
 	({                                                                                         \
@@ -834,6 +1058,10 @@ extern int vmgmt_msg_native_send_error(struct msg_conn *conn,
  * message to fit the new data. Any other pointers into the old message should
  * be discarded.
  */
+/*
+ * 向消息尾部追加一个以 NUL 结尾的字符串 s（连同结尾的 0 一起追加）。假定
+ * 消息尾部本来就是一串 NUL 结尾字符串。msg 同样可能被重新分配。
+ */
 #define mgmt_msg_native_add_str(msg, s)                                                            \
 	do {                                                                                       \
 		int _nas_len = strlen(s) + 1;                                                      \
@@ -847,6 +1075,10 @@ extern int vmgmt_msg_native_send_error(struct msg_conn *conn,
  * @short_circuit_ok: True if short-circuit sending is required.
  *
  * Return: The error return value of msg_conn_send_msg().
+ */
+/*
+ * 以 MGMT_MSG_VERSION_NATIVE 版本发送一条原生消息。short_circuit_ok 指示是
+ * 否允许短接路径。返回 msg_conn_send_msg 的错误码。
  */
 #define mgmt_msg_native_send_msg(conn, msg, short_circuit_ok)                  \
 	msg_conn_send_msg(conn, MGMT_MSG_VERSION_NATIVE, msg,                  \
@@ -890,6 +1122,11 @@ extern int vmgmt_msg_native_send_error(struct msg_conn *conn,
  * Return: A pointer to the first argument -- which is a pointer to a pointer to
  * a dynamic array.
  */
+/*
+ * 返回指向消息底层动态数组指针的指针（uint8_t 二级指针）。绝大多数场景直接
+ * 用 mgmt_msg_native_append 即可；需要完整 darr 操作时才用它。该数组包含消息
+ * 头部，故可用各种 darr_* 接口操作尾部的变长数据。
+ */
 #define mgmt_msg_native_get_darrp(msg) ((uint8_t **)&(msg))
 
 /* ------------------------- */
@@ -906,6 +1143,11 @@ extern int vmgmt_msg_native_send_error(struct msg_conn *conn,
  * of a NUL terminated string followed by some data of any format. This starts
  * the first half of the encoding, after which one can simply append the
  * secondary data to the message.
+ */
+/*
+ * xpath, data 格式消息的编码第一步：把 xpath 字符串（含结尾 NUL）追加到消息
+ * 变长区，并把 vsplit 设为该字符串长度。随后再追加任意格式的次级数据，即可用
+ * mgmt_msg_native_xpath_data_decode 解码。
  */
 #define mgmt_msg_native_xpath_encode(msg, xpath)                                                   \
 	do {                                                                                       \
@@ -927,6 +1169,11 @@ extern int vmgmt_msg_native_send_error(struct msg_conn *conn,
  * Return:
  *	The xpath string or NULL if there was an error decoding (i.e., the
  *	message is corrupt).
+ */
+/*
+ * 解码 xpath, data 格式消息：变长区为“NUL 结尾的 xpath + 任意次级数据”。
+ * 校验 vsplit 合法且 xpath 末尾为 NUL 后，返回 xpath 指针，并把次级数据起点
+ * 写入 _data（无次级数据时置 NULL）。消息损坏（校验失败）时返回 NULL。
  */
 #define mgmt_msg_native_xpath_data_decode(msg, msglen, _data)                                      \
 	({                                                                                         \
@@ -954,6 +1201,10 @@ extern int vmgmt_msg_native_send_error(struct msg_conn *conn,
  *	The xpath string or NULL if there was an error decoding (i.e., the
  *	message is corrupt).
  */
+/*
+ * 仅取出 xpath, data 格式消息中的 xpath 字符串。校验 vsplit 合法且末尾为 NUL，
+ * 否则返回 NULL（表示消息损坏）。
+ */
 #define mgmt_msg_native_xpath_decode(msg, msglen)                                                  \
 	({                                                                                         \
 		size_t _m__len = (msglen) - sizeof(*msg);                                          \
@@ -975,6 +1226,10 @@ extern int vmgmt_msg_native_send_error(struct msg_conn *conn,
  * Return:
  *	The secondary data or NULL if there was an error decoding (i.e., the
  *	message is corrupt).
+ */
+/*
+ * 取出 xpath, data 格式消息中的次级数据段起点。校验 vsplit 合法且 xpath 以
+ * NUL 结束，否则返回 NULL（表示消息损坏）。
  */
 #define mgmt_msg_native_data_decode(msg, msglen)                                                   \
 	({                                                                                         \
@@ -999,6 +1254,10 @@ extern int vmgmt_msg_native_send_error(struct msg_conn *conn,
  *	The length of the secondary variable data. The message is assumed to be
  *	validated as not corrupt already.
  */
+/*
+ * 返回 xpath, data 格式消息中次级数据的长度，即总长减去结构体大小再减去
+ * vsplit。假定消息已通过合法性校验、未被破坏。
+ */
 #define mgmt_msg_native_data_len_decode(msg, msglen)                           \
 	((msglen) - sizeof(*msg) - msg->vsplit)
 
@@ -1016,10 +1275,18 @@ extern int vmgmt_msg_native_send_error(struct msg_conn *conn,
  * Return: a dynamic array (darr) of string pointers, or NULL if the message
  * is corrupt.
  */
+/*
+ * 把消息尾部的“一串 NUL 结尾字符串”解码成一个字符串指针的动态数组（darr）。
+ * sdata 指向变长字符串区起点。字符串区损坏时返回 NULL。用户须自行释放该数组。
+ */
 #define mgmt_msg_native_strings_decode(msg, msg_len, sdata)                    \
 	_mgmt_msg_native_strings_decode(sdata,                                 \
 					(msg_len) - ((sdata) - (char *)(msg)))
 
+/*
+ * strings_decode 的底层实现：从 sdata 起、共 sdlen 字节的字符串区，解析出
+ * 各字符串并构造字符串指针数组返回；失败返回 NULL。
+ */
 extern const char **_mgmt_msg_native_strings_decode(const void *sdata,
 						    int sdlen);
 

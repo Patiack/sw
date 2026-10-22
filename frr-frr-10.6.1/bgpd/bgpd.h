@@ -2,6 +2,34 @@
 /* BGP message definition header.
  * Copyright (C) 1996, 97, 98, 99, 2000 Kunihiro Ishiguro
  */
+/* ============================================================================
+ * 【学习导读】bgpd.h —— 整个 bgpd 模块的“数据模型总纲”
+ * ============================================================================
+ * 这是 bgpd 最核心的头文件，几乎每个 .c 都包含它。它不实现逻辑，只定义
+ * “BGP 进程里到底有哪些对象、每个对象长什么样”。读懂它就等于拿到了阅读其余
+ * 所有文件的钥匙。按本文件自上而下的顺序阅读：
+ *
+ *   1) 常量与枚举：AFI/SAFI 的“紧凑索引”、FSM 状态/事件、各类标志位。
+ *   2) struct bgp_master（全局单例 bm）：进程级总控。持有实例链表、监听套接字、
+ *      事件循环、标签池等“跨实例共享”的东西。
+ *   3) struct bgp（实例）：一个 BGP 实例 = default 实例 / 一个 VRF / 一个 view。
+ *      RIB、nexthop 缓存、update-group、EVPN 信息都挂在它下面。
+ *      —— 注意“实例”不等于“进程”：一个 bgpd 进程里可以有多个 struct bgp。
+ *   4) struct peer_group / struct peer：邻居（对等体）及其配置与运行状态。
+ *   5) struct peer_connection：一次具体的 TCP 连接。关键点：一个 peer 建立早期
+ *      可能同时存在“入向”和“出向”两条连接（连接碰撞），所以连接被单独抽出成
+ *      一个结构，而不是直接塞进 peer。
+ *   6) 各种函数原型与 inline 小工具（bgp_lock、afindex 等）。
+ *
+ * 三条贯穿全模块的主线，建议边读边记：
+ *   - 实例线：bm → bgp(实例) → rib[afi][safi] → bgp_dest → bgp_path_info。
+ *   - 邻居线：bgp → peer_group → peer → peer_af(每 AF 一个) → update_subgroup。
+ *   - 连接线：peer → peer_connection → ibuf/obuf(收发 FIFO) → FSM 状态。
+ *
+ * 命名约定：afi_t/safi_t 是 FRR 内部枚举；iana_* 是与对端报文交互时使用的 IANA
+ * 编号，两套编号靠 bgp_map_afi_safi_*() 互转（见文件末尾的函数原型）。
+ * ============================================================================
+ */
 
 #ifndef _QUAGGA_BGPD_H
 #define _QUAGGA_BGPD_H
@@ -62,6 +90,10 @@ struct bgp_pbr_config;
  * behavior
  * in the system.
  */
+/* 邻居 remote-as 的“类型”标记。注意这是位标志而非互斥枚举：
+ * AS_SPECIFIED 表示用户显式配了 remote-as，AS_INTERNAL/AS_EXTERNAL 表示配的是
+ * “internal/external”关键字而非具体 AS 号，AS_AUTO 用于动态邻居自动确定 AS。
+ * 它决定 peer_sort() 如何判定 iBGP/eBGP，是配置解析的关键分支依据。 */
 enum peer_asn_type {
 	AS_UNSPECIFIED = 1,
 	AS_SPECIFIED = 2,
@@ -80,6 +112,10 @@ enum zebra_gr_mode {
 typedef uint16_t as16_t; /* we may still encounter 16 Bit asnums */
 typedef uint16_t bgp_size_t;
 
+/* 把二维的 (afi, safi) 压成一个一维“紧凑索引”。理由：很多数组想按 AF 下标，
+ * 但 afi_t/safi_t 的取值很稀疏（如 AFI_IP=1, AFI_IP6=2...），直接做二维数组会
+ * 浪费空间。于是定义这套 BGP_AF_* 索引，配合 afindex()（见文件末尾）完成
+ * (afi,safi) → 索引 的映射；peer->peer_af_array[BGP_AF_MAX] 等都用它。 */
 enum bgp_af_index {
 	BGP_AF_START,
 	BGP_AF_IPV4_UNICAST = BGP_AF_START,
@@ -110,6 +146,25 @@ extern struct frr_pthread *bgp_pth_ka;
 PREDECL_LIST(peer_connection_fifo);
 
 /* BGP master for system wide configurations and variables.  */
+/* ===========================================================================
+ * struct bgp_master —— 进程级“单例”总控，全局指针就是 bgpd.c 里的 bm
+ * ---------------------------------------------------------------------------
+ * 与 struct bgp（实例）的区别：bm 只有一个，存“跨实例共享”的东西；bgp 可以有
+ * 多个，各存自己的 RIB 与邻居。bm 里值得关注的分组：
+ *   [实例] bgp：所有 BGP 实例的链表，bgp_lookup_by_name() 等在这里查。
+ *   [事件] master：本进程的主事件循环（lib 的 event_loop）。
+ *   [监听] listen_sockets / addresses：监听 179 端口的套接字与监听地址列表。
+ *   [io线程] connection_fifo + peer_connection_mtx + e_process_packet：主线程与
+ *       IO 线程之间用 FIFO + 互斥锁交接“新建立的连接”，是 FRR BGP 多线程模型的
+ *       关键入口（见 bgp_io.c）。
+ *   [全局配置] options(BGP_OPT_*)：如 no-fib / no-listen / no-zebra。
+ *   [ID空间] updgrp_idspace/subgrp_idspace/rd_idspace：update-group、subgroup、
+ *       EVPN RD 的自增 ID 分配器。
+ *   [全局GR] restart_time/stalepath_time/select_defer_time 及 BM_FLAG_GR_* 标志。
+ *   [队列限制] inq_limit/outq_limit + peer_conn_errs_dequeue_limit 等：防止单次
+ *       回调处理过多对象而长时间占用主线程（背压/分批处理）。
+ * ===========================================================================
+ */
 struct bgp_master {
 	/* BGP instance list.  */
 	struct list *bgp;
@@ -269,6 +324,21 @@ struct srv6_policy {
 	char *rmap_name;
 };
 
+/* ===========================================================================
+ * struct vpn_policy —— 每 AF 一份的 VPN(VPNv4/VPNv6) 导入导出策略
+ * ---------------------------------------------------------------------------
+ * 主要是两类信息：
+ *   (1) RT 列表：rtlist[FROMVPN](从 VPN 导入本 VRF 时匹配的 RT) 与
+ *       rtlist[TOVPN]（本 VRF 导出到 VPN 时附带的 RT）。方向枚举就是
+ *       vpn_policy_direction（FROMVPN=0 / TOVPN=1）。
+ *   (2) 到 VPN 的封装参数：tovpn_rd(RD)、tovpn_label(MPLS 标签)、
+ *       tovpn_nexthop，以及 SRv6 的 tovpn_sid* 系列。
+ *   (3) 跨 VRF 泄漏：import_vrf/export_vrf 记录“我把谁导进来/我导出给谁”，
+ *       支持 VRF-to-VRF 与 VRF-to-MPLSVPN 两种方向（呼应 bgp->af_flags 里的
+ *       BGP_CONFIG_VRF_TO_MPLSVPN_EXPORT 等标志）。
+ * 这些成员在 bgp_mplsvpn.c / bgp_evpn.c 里被读写。
+ * ===========================================================================
+ */
 struct vpn_policy {
 	struct bgp *bgp; /* parent */
 	afi_t afi;
@@ -392,6 +462,12 @@ enum bgp_instance_type {
 #define BGP_GLOBAL_GR_EVENT_CMD 4
 
 /* Graceful restart selection deferral timer info */
+/* 每 (afi,safi) 一份的 GR“选路延迟”状态。
+ * 背景：GR 重启后，若立刻根据不完整的 RIB 做 bestpath，会选出错误的路径。因此
+ * FRR 会“推迟最佳路径选择”（select deferral）一段时间，等 EOR 收齐或超时再算。
+ * 这里的 t_select_deferral 是 tier1 定时器；当多跳邻居的 loopback 依赖另一个 BGP
+ * 邻居学到时，需要 tier2 再延迟一层，即 t_select_deferral_tier2。配套的
+ * select_defer_over / select_defer_over_tier2 记录两级延迟是否完成。 */
 struct graceful_restart_info {
 	/* Deferral Timer */
 	struct event *t_select_deferral;
@@ -550,6 +626,34 @@ struct bgp_clearing_info {
 #define BGP_CLEARING_INFO_FLAG_INNER (1 << 2)
 
 /* BGP instance structure.  */
+/* ===========================================================================
+ * struct bgp —— 一个 BGP 实例（instance）
+ * ---------------------------------------------------------------------------
+ * 一个 bgpd 进程里可以有多个实例，每个实例是“default 实例 / 一个 VRF / 一个
+ * view”三者之一（由 inst_type 区分）。绝大多数 RIB/策略/邻居都挂在这一层，是
+ * 阅读 bgp_route.c / bgp_vty.c 时最常回到的结构。关键成员按功能分组：
+ *
+ *  [身份] as / as_pretty、name / name_pretty、inst_type + vrf_id。
+ *  [拓扑] peer（本实例所有邻居链表）、group（peer-group 链表）、
+ *         peer_self（代表“本机自己”的伪邻居，network 命令起源的路由挂它）。
+ *  [路由] rib[afi][safi]：Loc-RIB 主表；static_routes：network 命令产生的静态
+ *         路由；aggregate：聚合路由；connected_table：直连表（用于下一跳有效性
+ *         判断）。这四张表回答“路由从哪来”。
+ *  [下发] process_queue / mq：bestpath 计算与向 zebra 下发的两级工作队列。
+ *  [下一跳] nexthop_cache_table：下一跳可达性缓存（NHT）；import_check_table：
+ *         iBGP 的 import-check 专用缓存。
+ *  [更新组] update_groups[afi]：把配置相同的邻居合并成 update-group 批量发包，
+ *         是 BGP 可扩展性的核心，详见 bgp_updgrp.c。
+ *  [EVPN] vnihash / import_rt_hash / l3vni / vrf_prd(RD) 等，见 bgp_evpn*.c。
+ *  [GR]   gr_info[afi][safi]、GLOBAL_GR_FSM、全局/实例级 GR 标志。
+ *  [标志] flags（BGP_FLAG_*，实例级行为开关）、af_flags[afi][safi]（每 AF 的
+ *         开关，如 BGP_CONFIG_DAMPENING）。
+ *
+ * 注意 lock 字段：struct bgp 有引用计数。peer_delete 可能在 bgp_delete 之后才真正
+ * 完成（因为路由处理队列里还持有 peer 指针），所以实例释放靠 bgp_lock/bgp_unlock
+ * （见文件末尾）延迟到“最后一次引用消失”时才执行 bgp_free()。
+ * ===========================================================================
+ */
 struct bgp {
 	/* AS number of this BGP instance.  */
 	as_t as;
@@ -1134,6 +1238,12 @@ struct afi_safi_info {
 	 || bm->wait_for_fib)
 
 /* BGP peer-group support. */
+/* peer-group = “配置模板 + 动态邻居监听范围”的容器。
+ * 关键点：conf 字段本身就是一个 struct peer，但它是“只存配置、不建连接”的模板
+ * 载体（其 sflags 带 PEER_STATUS_GROUP）。真实邻居加入 peer-group 时，通过
+ * peer_xfer_config() 从 conf 继承配置。listen_range[afi] 则是动态邻居
+ * （neighbor A.B.C.0/24 peer-group PG）的监听前缀，命中范围的入连接会被自动
+ * 创建为 group 的成员（见 bgp_network.c 的 accept 处理）。 */
 struct peer_group {
 	/* Name of the peer-group. */
 	char *name;
@@ -1271,6 +1381,11 @@ enum bgp_peer_sub_sort {
 #define BGP_ANNOUNCE_ROUTE_SHORT_DELAY_MS  100
 #define BGP_ANNOUNCE_ROUTE_DELAY_MS        500
 
+/* peer_af —— “某个 peer 的某个 (afi,safi)”这一最小单元
+ * 它是 peer 与 update-group 体系的连接点：真正的发路由逻辑在 update_subgroup，
+ * 而 peer 通过 peer_af->subgroup 找到自己所属的子组。subgrp_train / pkt_train 是
+ * 两个链表的挂载点：分别表示“本 peer_af 属于哪个 subgroup 的成员链”和“本 peer_af
+ * 挂在哪个待发 packet 的接收者链上”。next_pkt_to_send 指向下一个要发的报文。 */
 struct peer_af {
 	/* back pointer to the peer */
 	struct peer *peer;
@@ -1368,6 +1483,13 @@ enum bgp_fsm_rfc_codes {
  * Note: these do not correspond to RFC-defined event codes. Those are
  * defined elsewhere.
  */
+/* 注意区分三个“事件”枚举，初读极易混淆：
+ *   BGP_FSM_*（bgp_fsm_rfc_codes）—— 直接映射 RFC4271 的事件编号，用于打印/
+ *       跟踪标准流程。
+ *   BGP_*（本枚举 bgp_fsm_events）—— FRR 内部真正驱动状态机的“事件”，把 RFC 事件
+ *       按 FRR 的实现需要做了拆分/合并，bgp_event() 的 switch 用的就是它。
+ *   bgp_fsm_status（下方）—— 状态；e 是“发生了什么”，s 是“现在处于哪”。
+ * 阅读 bgp_fsm.c 时，bgp_event_update()/bgp_event() 是事件注入点。 */
 enum bgp_fsm_events {
 	BGP_Start = 1,
 	BGP_Stop,
@@ -1389,6 +1511,11 @@ enum bgp_fsm_events {
 };
 
 /* BGP finite state machine status.  */
+/* BGP 会话的 7 个标准状态（RFC4271 §8.2.2）。阅读 bgp_fsm.c 时，所有
+ * bgp_event() 的处理都围绕“当前状态 × 事件 → 新状态 + 动作”展开。
+ * 额外补充：
+ *   Clearing：非 RFC 状态，表示正在清理该 peer 的路由（peer_clear 过程中）。
+ *   Deleted：终态，peer 即将释放。 */
 enum bgp_fsm_status {
 	Idle = 1,
 	Connect,
@@ -1432,6 +1559,24 @@ enum connection_direction {
 	ESTABLISHED,
 };
 
+/* ===========================================================================
+ * struct peer_connection —— 一次具体的 TCP 连接
+ * ---------------------------------------------------------------------------
+ * 为什么连接要单独成一个结构？因为 BGP 会话建立早期可能出现“连接碰撞”：双方
+ * 同时向对方发起 TCP，于是本端同时拥有“入向(incoming)”和“出向(outgoing)”两条
+ * 连接，谁先建立谁胜出，另一条被关闭（RFC4271 §6.8 碰撞解决）。把连接态抽出来，
+ * FSM 状态、收发缓冲、各种定时器都挂在“连接”上，而 peer 只保留“当前生效的那条
+ * 连接”指针 connection，碰撞期的另一条放在 peer->doppelganger。这样“同一邻居、
+ * 两条连接、各自跑 FSM”就成了一种自然表达。
+ *
+ * 关键成员：
+ *   dir/status/ostatus：方向、当前 FSM 状态、旧状态（用于判断状态跃迁）。
+ *   io_mtx 保护 ibuf/obuf：这两个 stream_fifo 分别是“待解析的收包”和“待发送的
+ *       发包”队列。BGP 收发异步化，事件回调只负责搬运队列。
+ *   t_read/t_write/t_connect/...：连接相关的定时器/事件句柄。
+ *   su / su_local / su_remote：对端 sockunion、本端地址、对端地址。
+ * ===========================================================================
+ */
 struct peer_connection {
 	struct peer *peer;
 	enum connection_direction dir;
@@ -1509,6 +1654,33 @@ extern void bgp_peer_connection_free(struct peer_connection **connection);
 extern void bgp_peer_connection_buffers_free(struct peer_connection *connection);
 
 /* BGP neighbor structure. */
+/* ===========================================================================
+ * struct peer —— 一个邻居（对等体），同时充当 peer-group 的“配置模板”
+ * ---------------------------------------------------------------------------
+ * 同一个 struct peer 有两种身份：
+ *   (1) 真实邻居：group 指向它所属的 peer-group（可为空）。
+ *   (2) peer-group 的配置模板：sflags 带 PEER_STATUS_GROUP，此时它只存配置、
+ *       不建立连接；成员通过 peer_xfer_config() 继承它的配置。
+ * 这个“一份结构两种用途”的设计，是理解“配置继承/覆盖”机制的起点。
+ *
+ * 配置继承三件套（务必先读英文注释再往下看）：
+ *   flags / flags_override / flags_invert —— 决定“某标志来自 peer-group 还是本
+ *   邻居自己设的”，以及“默认取反”的语义（如 send-community 默认开启）。
+ *   af_flags / af_flags_override / af_flags_invert —— 同一套机制，按 AFI/SAFI。
+ *   filter / filter_override —— 过滤策略的同样的继承机制。
+ *
+ * 其它重点成员：
+ *   as_type/as/sort：远端 AS 与邻居类型（iBGP/eBGP/confed），由 peer_sort() 判定。
+ *   connection / doppelganger：当前生效连接，以及连接碰撞时的“分身”。
+ *   peer_af_array[BGP_AF_MAX]：每个已配置 AF 一个 peer_af，是 peer 与
+ *       update-group 的连接点（真正发路由的逻辑在 peer_af / update_subgroup）。
+ *   afc / afc_nego / afc_adv / afc_recv：四个“每 AF 字节”，分别表示已配置 /
+ *       已协商 / 已通告 / 已接收 该 AF；理解能力协商就看这四个数组。
+ *   cap / af_cap：能力协商结果（*_ADV 我方发出、*_RCV 对方发来）。
+ *   pcount/pmax：收前缀计数与上限（maximum-prefix 限速）。
+ *   xxx_in / xxx_out / stat_pfx_xxx：各类统计计数器（多为原子，供 IO 线程更新）。
+ * ===========================================================================
+ */
 struct peer {
 	/* BGP structure.  */
 	struct bgp *bgp;
@@ -2264,6 +2436,9 @@ DECLARE_QOBJ_TYPE(peer);
 
 /* This structure's member directly points incoming packet data
    stream. */
+/* 解析 UPDATE 报文时，NLRI 部分的外层包裹结构：afi/safi 说明是哪张表，length 是
+ * NLRI 字节长度，nlri 直接指向入站报文缓冲区中的原始字节（不拷贝）。因此 bgp_nlri
+ * 只在“解析期内”有效，处理完必须立即把前缀落进 RIB，不能长期持有指针。 */
 struct bgp_nlri {
 	/* AFI.  */
 	uint16_t afi; /* iana_afi_t */
@@ -2551,6 +2726,10 @@ enum peer_change_type {
  *     simply prefixes caught by ipv4_martian(), i.e. routes outside
  *     the non-reserved IPv4 Unicast address space.
  */
+/* “火星地址”自检条目类型：带这些字段的路由被视为“自己的地址回环”，必须丢弃或用
+ * import 策略过滤，防止把本机地址/本机 MAC 又学回来造成转发环路。每个条目对应
+ * bgp 实例里的一个哈希表或字段（见各行注释）。注意它与 ipv4_martian() 判定的
+ * “保留地址段”不是一回事（后者可选放行）。*/
 enum bgp_martian_type {
 	BGP_MARTIAN_IF_IP,  /* bgp->address_hash */
 	BGP_MARTIAN_TUN_IP, /* bgp->tip_hash */
@@ -2901,6 +3080,11 @@ static inline bool bgp_gr_supported_for_afi_safi(afi_t afi, safi_t safi);
 		}                                                              \
 	} while (0)
 
+/* bgp_lock/bgp_unlock —— struct bgp 的引用计数。
+ * 为什么需要：一个实例上挂着很多异步处理（路由队列、event、peer），删除实例时
+ * 无法立刻 free，必须先摘除所有外部引用；引用计数保证“最后一个持有者”来触发
+ * bgp_free()。典型地，peer_delete 里会 bgp_lock() 并让后续处理持有，直到不再
+ * 需要该实例才 bgp_unlock()。注意 unlock 到 0 时才真正释放。 */
 static inline struct bgp *bgp_lock(struct bgp *bgp)
 {
 	bgp->lock++;
@@ -2914,6 +3098,9 @@ static inline void bgp_unlock(struct bgp *bgp)
 		bgp_free(bgp);
 }
 
+/* (afi,safi) → BGP_AF_* 紧凑索引。返回 BGP_AF_MAX 表示“该组合不被支持/无对应”。
+ * 因为它是纯映射函数，被大量内层循环调用，所以放在头文件里 inline。
+ * 注意 AFI_L2VPN 只映射 SAFI_EVPN。 */
 static inline int afindex(afi_t afi, safi_t safi)
 {
 	switch (afi) {
@@ -2981,6 +3168,8 @@ static inline int afindex(afi_t afi, safi_t safi)
 	return BGP_AF_MAX;
 }
 
+/* 【函数】peer_group_active —— 该 peer 不是 peer-group 本身，但已绑定到某个
+ * peer-group 时返回 1。 */
 /* If the peer is not a peer-group but is bound to a peer-group return 1 */
 static inline int peer_group_active(struct peer *peer)
 {
@@ -2989,6 +3178,8 @@ static inline int peer_group_active(struct peer *peer)
 	return 0;
 }
 
+/* 【函数】peer_afi_active_nego —— 该 peer 在某 afi 上至少协商成功一个 safi 则
+ * 返回 1。 */
 /* If peer is negotiated at least one address family return 1. */
 static inline int peer_afi_active_nego(const struct peer *peer, afi_t afi)
 {
@@ -3003,6 +3194,8 @@ static inline int peer_afi_active_nego(const struct peer *peer, afi_t afi)
 	return 0;
 }
 
+/* 【函数】peer_group_af_configured —— 该 peer-group 至少配置激活了一个地址族
+ * 则返回 1。 */
 /* If at least one address family activated for group, return 1. */
 static inline int peer_group_af_configured(struct peer_group *group)
 {
@@ -3023,11 +3216,15 @@ static inline int peer_group_af_configured(struct peer_group *group)
 	return 0;
 }
 
+/* 【函数】peer_established —— 该连接状态是否为 Established。 */
 static inline bool peer_established(struct peer_connection *connection)
 {
 	return connection->status == Established;
 }
 
+/* 【函数】peer_set_last_reset —— 记录本次会话复位原因（供调试与 SNMP 通知）。
+ * 未建立时直接写入 last_reset；已建立时记录首个复位原因，其余写 down 系列
+ * 字段，避免覆盖仍有用的 last_reset。 */
 static inline void peer_set_last_reset(struct peer *peer, uint8_t reset_cause)
 {
 	/*
@@ -3063,28 +3260,34 @@ static inline void peer_set_last_reset(struct peer *peer, uint8_t reset_cause)
 	}
 }
 
+/* 【函数】peer_dynamic_neighbor —— 该 peer 是否为动态邻居（listen range 自动生成）。 */
 static inline bool peer_dynamic_neighbor(struct peer *peer)
 {
 	return CHECK_FLAG(peer->flags, PEER_FLAG_DYNAMIC_NEIGHBOR);
 }
 
+/* 【函数】peer_dynamic_neighbor_no_nsf —— 动态邻居且不在 NSF 等待中。 */
 static inline bool peer_dynamic_neighbor_no_nsf(struct peer *peer)
 {
 	return (peer_dynamic_neighbor(peer) &&
 		!CHECK_FLAG(peer->sflags, PEER_STATUS_NSF_WAIT));
 }
 
+/* 【函数】peer_is_config_node —— 该 peer 是否为配置节点（对应 YANG 配置树）。 */
 static inline bool peer_is_config_node(const struct peer *peer)
 {
 	return !!CHECK_FLAG(peer->flags, PEER_FLAG_CONFIG_NODE);
 }
 
+/* 【函数】peer_cap_enhe —— 该 peer 在某 (afi,safi) 上是否协商了扩展下一跳能力。 */
 static inline int peer_cap_enhe(struct peer *peer, afi_t afi, safi_t safi)
 {
 	assert(peer);
 	return (CHECK_FLAG(peer->af_cap[afi][safi], PEER_CAP_ENHE_AF_NEGO));
 }
 
+/* 【函数】bgp_vrf_lookup_by_instance_type —— 按实例类型查其 VRF：默认实例对应
+ * VRF_DEFAULT，VRF 实例按名查，其它返回 NULL。 */
 /* Lookup VRF for BGP instance based on its type. */
 static inline struct vrf *bgp_vrf_lookup_by_instance_type(struct bgp *bgp)
 {
@@ -3100,6 +3303,8 @@ static inline struct vrf *bgp_vrf_lookup_by_instance_type(struct bgp *bgp)
 	return vrf;
 }
 
+/* 【函数】bgp_vrf_interfaces —— 统计该实例 VRF 内的接口数；active 为真时只
+ * 统计 up 的接口。会跳过与实例同名的接口。 */
 static inline uint32_t bgp_vrf_interfaces(struct bgp *bgp, bool active)
 {
 	struct vrf *vrf;
@@ -3121,6 +3326,8 @@ static inline uint32_t bgp_vrf_interfaces(struct bgp *bgp, bool active)
 	return count;
 }
 
+/* 【函数】bgp_vrf_link —— 把 BGP 实例与 VRF 绑定：设 vrf_id，并在 vrf->info
+ * 上记录实例（同时加一次引用）。 */
 /* Link BGP instance to VRF. */
 static inline void bgp_vrf_link(struct bgp *bgp, struct vrf *vrf)
 {
@@ -3129,6 +3336,8 @@ static inline void bgp_vrf_link(struct bgp *bgp, struct vrf *vrf)
 		vrf->info = (void *)bgp_lock(bgp);
 }
 
+/* 【函数】bgp_vrf_unlink —— 解除 BGP 实例与 VRF 的绑定：清 vrf_id 与 vrf->info
+ * 并释放对应引用。 */
 /* Unlink BGP instance from VRF. */
 static inline void bgp_vrf_unlink(struct bgp *bgp, struct vrf *vrf)
 {
@@ -3139,6 +3348,8 @@ static inline void bgp_vrf_unlink(struct bgp *bgp, struct vrf *vrf)
 	}
 }
 
+/* 【函数】bgp_in_graceful_shutdown —— 实例级或全局任一处于 Graceful Shutdown
+ * 则返回真。 */
 static inline bool bgp_in_graceful_shutdown(struct bgp *bgp)
 {
 	/* True if either set for this instance or globally */
@@ -3146,6 +3357,7 @@ static inline bool bgp_in_graceful_shutdown(struct bgp *bgp)
 	        !!CHECK_FLAG(bm->flags, BM_FLAG_GRACEFUL_SHUTDOWN));
 }
 
+/* 【函数】bgp_in_graceful_restart —— 已优雅重启且 GR 尚未完成时为真。 */
 static inline bool bgp_in_graceful_restart(void)
 {
 	/* True if BGP has (re)started gracefully (based on flags
@@ -3155,6 +3367,7 @@ static inline bool bgp_in_graceful_restart(void)
 		!CHECK_FLAG(bm->flags, BM_FLAG_GR_COMPLETE));
 }
 
+/* 【函数】bgp_is_graceful_restart_complete —— 已优雅重启且 GR 已标记完成时为真。 */
 static inline bool bgp_is_graceful_restart_complete(void)
 {
 	/* True if BGP has (re)started gracefully (based on flags
@@ -3164,6 +3377,8 @@ static inline bool bgp_is_graceful_restart_complete(void)
 		CHECK_FLAG(bm->flags, BM_FLAG_GR_COMPLETE));
 }
 
+/* 【函数】bgp_update_gr_completion —— 在确认所有实例都已完成延迟选路与同步后，
+ * 把 GR 标记为完成并记录完成时刻。 */
 static inline void bgp_update_gr_completion(void)
 {
 	struct listnode *node, *nnode;
@@ -3188,6 +3403,8 @@ static inline void bgp_update_gr_completion(void)
 	bm->gr_completion_time = monotime(NULL);
 }
 
+/* 【函数】bgp_gr_is_forwarding_preserved —— 转发状态是否被保留：全局优雅重启
+ * 或本实例配置了 GR 保留转发表。 */
 static inline bool bgp_gr_is_forwarding_preserved(struct bgp *bgp)
 {
 	/*
@@ -3199,6 +3416,8 @@ static inline bool bgp_gr_is_forwarding_preserved(struct bgp *bgp)
 		CHECK_FLAG(bgp->flags, BGP_FLAG_GR_PRESERVE_FWD));
 }
 
+/* 【函数】bgp_gr_supported_for_afi_safi —— GR restarter 行为仅支持 IPv4 / IPv6
+ * 单播与 L2VPN EVPN，其余返回假。 */
 static inline bool bgp_gr_supported_for_afi_safi(afi_t afi, safi_t safi)
 {
 	/*
@@ -3211,15 +3430,22 @@ static inline bool bgp_gr_supported_for_afi_safi(afi_t afi, safi_t safi)
 	return false;
 }
 
+/* 【函数声明（供 rfapi 使用）】peer_new —— 新建一个 peer 对象。 */
 /* For benefit of rfapi */
 extern struct peer *peer_new(struct bgp *bgp, union sockunion *su, enum connection_direction dir);
 
+/* 【函数】peer_lookup_in_view —— 在给定 bgp 视图（VRF）中按地址字符串查 peer。 */
 extern struct peer *peer_lookup_in_view(struct vty *vty, struct bgp *bgp,
 					const char *ip_str, bool use_json);
+/* 【函数】bgp_lookup_by_as_name_type —— 按 AS 号（及表示法）/ 名称与实例类型
+ * 查找 bgp 实例，结果写入 bgp_val。 */
 extern int bgp_lookup_by_as_name_type(struct bgp **bgp_val, as_t *as, const char *as_pretty,
 				      enum asnotation_mode asnotation, const char *name,
 				      enum bgp_instance_type inst_type, bool force_config);
 
+/* 【Hook 声明】供插件挂钩的扩展点：VRF 状态变化、peer 状态变化、SNMP 统计
+ * 初始化与更新、RPKI 前缀与连接状态变化等。用 DECLARE_HOOK 声明，实现方
+ * 用 DEFINE_HOOK 注册回调。 */
 /* Hooks */
 DECLARE_HOOK(bgp_vrf_status_changed, (struct bgp *bgp, struct interface *ifp),
 	     (bgp, ifp));
@@ -3235,24 +3461,36 @@ DECLARE_HOOK(bgp_rpki_prefix_status,
 	     (peer, attr, prefix));
 DECLARE_HOOK(bgp_rpki_connection_status, (const char *vrf_name), (vrf_name));
 
+/* 【函数】peer_nsf_stop —— 停止该 peer 的 NSF（良好重启）等待流程。 */
 void peer_nsf_stop(struct peer *peer);
 
+/* 【函数】peer_tcp_mss_set / peer_tcp_mss_unset —— 设置或清除该 peer 的 TCP MSS。 */
 void peer_tcp_mss_set(struct peer *peer, uint32_t tcp_mss);
 void peer_tcp_mss_unset(struct peer *peer);
 
+/* 【函数】bgp_recalculate_afi_safi_bestpaths —— 重新计算某 (afi,safi) 的最佳路径。 */
 extern void bgp_recalculate_afi_safi_bestpaths(struct bgp *bgp, afi_t afi,
 					       safi_t safi);
+/* 【函数】peer_on_policy_change —— 出向策略变化时按 peer 更新其通告。 */
 extern void peer_on_policy_change(struct peer *peer, afi_t afi, safi_t safi,
 				  int outbound);
+/* 【函数】bgp_path_attribute_discard —— 判断某路径属性是否应被丢弃（按配置）。 */
 extern bool bgp_path_attribute_discard(struct peer *peer, char *buf,
 				       size_t size);
+/* 【函数】bgp_path_attribute_treat_as_withdraw —— 判断某路径属性是否应按撤回处理。 */
 extern bool bgp_path_attribute_treat_as_withdraw(struct peer *peer, char *buf,
 						 size_t size);
 
+/* 【函数】srv6_function_free —— 释放一个 SRv6 function 对象。 */
 extern void srv6_function_free(struct bgp_srv6_function *func);
 
+/* 【函数】bgp_session_reset_safe —— 安全复位会话，允许在遍历中删除（用 nnode
+ * 维护迭代安全）。 */
 extern void bgp_session_reset_safe(struct peer *peer, struct listnode **nnode);
 
+/* 【函数】clearing batch（批量清除）接口：把要清除的 peer 与前缀攒成一批后再
+ * 统一处理，减少逐条清除的开销。add 系列往批里加，check 系列做判断，next_dest
+ * 取下一个待处理前缀，completed 与 begin / end 管理批次生命周期与引用计数。 */
 /* If a clearing batch is available for 'peer', add it and return 'true',
  * else return 'false'.
  */
@@ -3274,21 +3512,29 @@ void bgp_clearing_batch_begin(struct bgp *bgp);
 /* End a new batch of peers to clear */
 void bgp_clearing_batch_end_event_start(struct bgp *bgp);
 
+/* 【函数】bgp_srv6_locator_is_configured —— 该实例是否配置了 SRv6 locator。 */
 bool bgp_srv6_locator_is_configured(struct bgp *bgp);
+/* 【函数】bgp_srv6_locator_lookup —— 查该实例可用（或全局）的 SRv6 locator。 */
 struct srv6_locator *bgp_srv6_locator_lookup(struct bgp *bgp_vrf, struct bgp *bgp);
 
+/* 【条件编译】仅在启用 printfrr 扩展属性时，为 %pBP 注册一个“打印 peer”的
+ * 格式化扩展，供日志与调试直接输出 struct peer。 */
 #ifdef _FRR_ATTRIBUTE_PRINTFRR
 /* clang-format off */
 #pragma FRR printfrr_ext "%pBP" (struct peer *)
 /* clang-format on */
 #endif
 
+/* 【宏】IS_BGP_INSTANCE_HIDDEN —— 若实例被标记隐藏，且是默认实例或 VRF 实例，
+ * 则返回真（用于过滤 show 输出）。 */
 /* Macro to check if default bgp instance is hidden */
 #define IS_BGP_INSTANCE_HIDDEN(_bgp)                                           \
 	(CHECK_FLAG(_bgp->flags, BGP_FLAG_INSTANCE_HIDDEN) &&                  \
 	 (_bgp->inst_type == BGP_INSTANCE_TYPE_DEFAULT ||                      \
 	  _bgp->inst_type == BGP_INSTANCE_TYPE_VRF))
 
+/* 【宏】BGP_INSTANCE_HIDDEN_DELETE_IN_PROGRESS —— 实例正在删除且未隐藏，并且
+ * 不是 IPv4 / IPv6 的 MPLS-VPN 实例时返回真（决定删除时是否继续服务该地址族）。 */
 /* Macro to check if bgp instance delete in-progress and !hidden */
 #define BGP_INSTANCE_HIDDEN_DELETE_IN_PROGRESS(_bgp, _afi, _safi)              \
 	(CHECK_FLAG(_bgp->flags, BGP_FLAG_DELETE_IN_PROGRESS) &&               \
@@ -3296,6 +3542,8 @@ struct srv6_locator *bgp_srv6_locator_lookup(struct bgp *bgp_vrf, struct bgp *bg
 	 !(_afi == AFI_IP && _safi == SAFI_MPLS_VPN) &&                        \
 	 !(_afi == AFI_IP6 && _safi == SAFI_MPLS_VPN))
 
+/* 【宏】PEER_HAS_LINK_LOCAL_CAPABILITY —— peer 具备链路本地下一跳能力（标志
+ * 与双向能力位均置位）且本地下一跳为 IPv6 链路本地地址时返回真。 */
 #define PEER_HAS_LINK_LOCAL_CAPABILITY(_peer)                                                     \
 	(CHECK_FLAG(_peer->flags, PEER_FLAG_CAPABILITY_LINK_LOCAL) &&                             \
 	 CHECK_FLAG(_peer->cap, PEER_CAP_LINK_LOCAL_ADV) &&                                       \

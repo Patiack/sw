@@ -3,6 +3,37 @@
  * Copyright (C) 2001 IP Infusion Inc.
  */
 
+/* ============================================================================
+ * 【文件导读】bgp_damp.c —— BGP 路由抖动抑制（flap dampening）的实现
+ * ============================================================================
+ * 【它是什么】bgp_damp.h 里接口的实现。原理、术语与两个核心结构见头文件导读：
+ * 给每条路由维护 penalty（惩罚分），超阈值即抑制(suppress)，衰减到阈值以下再复用。
+ *
+ * 【复用链表是本文件的骨架】被抑制的路由按“预计可复用时间”散列到 reuse_list 数组
+ * 的某个桶（桶下标由 penalty 经 reuse_index 表算出）。定时器 bgp_reuse_timer 每
+ * DELTA_REUSE 秒只处理当前桶（reuse_offset 轮转），把“遍历全部被抑制路由”的开销
+ * 摊薄成每次只处理一个桶——这是理解整套流程的关键。尚未能入桶（或未抑制）的挂在
+ * no_reuse_list。下面那些 reuselist 的 add/del/switch 与 info 的 claim/unclaim 就是在
+ * 这些桶之间搬运条目。
+ *
+ * 【配置挂载点优先级】get_active_bdc_from_pi 决定某条路由用哪套参数：先看 peer 自身
+ * 的 PEER_FLAG_CONFIG_DAMPENING，再看所属 peer-group，最后看 bgp 实例的
+ * BGP_CONFIG_DAMPENING（neighbor 覆盖 bgp）。
+ *
+ * 【三条主路径（按调用时机看最清楚）】
+ *   路由 down ：bgp_damp_withdraw —— 加惩罚分、必要时进入抑制、挂到复用桶。
+ *   路由 up   ：bgp_damp_update   —— 衰减后若已低于复用阈值则解除抑制。
+ *   到期检查 ：bgp_reuse_timer    —— 逐桶衰减，够低者复用并发更新，否则改桶重挂。
+ *
+ * 【状态标志】被抑制的路由带 BGP_PATH_DAMPED；同时保持历史(history)态的路由带
+ * BGP_PATH_HISTORY。清空抑制时二者都要清，注意别只清一个。
+ *
+ * 【阅读顺序】reuselist 辅助 → claim/unclaim → get_active_bdc → 索引与入/出桶 →
+ * decay → timer → withdraw/update/free → 参数计算与 enable/disable → 各 show/write
+ * → peer 级版本。
+ * ============================================================================
+ */
+
 #include <zebra.h>
 #include <math.h>
 
@@ -22,18 +53,23 @@
 #include "bgpd/bgp_advertise.h"
 #include "bgpd/bgp_vty.h"
 
+/* 【函数】把一条抑制记录插入链表头部（SLIST_INSERT_HEAD）。纯链表操作，不涉及
+ * config/index 维护，调用方需自行保证二者一致。 */
 static void bgp_reuselist_add(struct reuselist *list, struct bgp_damp_info *info)
 {
 	assert(info);
 	SLIST_INSERT_HEAD(list, info, entry);
 }
 
+/* 【函数】从链表摘除一条抑制记录（SLIST_REMOVE）。纯链表操作。 */
 static void bgp_reuselist_del(struct reuselist *list, struct bgp_damp_info *info)
 {
 	assert(info);
 	SLIST_REMOVE(list, info, bgp_damp_info, entry);
 }
 
+/* 【函数】把条目从 source 链表移到 target 链表头部。用于复用定时器里“重新定桶”：
+ * 一条路由 penalty 变了，需要从旧桶挪到新桶。 */
 static void bgp_reuselist_switch(struct reuselist *source,
 				 struct bgp_damp_info *info,
 				 struct reuselist *target)
@@ -43,6 +79,9 @@ static void bgp_reuselist_switch(struct reuselist *source,
 	SLIST_INSERT_HEAD(target, info, entry);
 }
 
+/* 【函数】把抑制记录从它当前所在的桶摘除，并把 config 置 NULL（表示当前未挂靠任何
+ * 配置）。index 为哨兵值时从 no_reuse_list 摘；否则从 reuse_list[bdi->index] 摘
+ * （list 非空时用传入的 list，避免重复计算桶地址）。 */
 static void bgp_damp_info_unclaim(struct bgp_damp_info *bdi,
 				  struct reuselist *list)
 {
@@ -56,6 +95,10 @@ static void bgp_damp_info_unclaim(struct bgp_damp_info *bdi,
 	bdi->config = NULL;
 }
 
+/* 【函数】把抑制记录挂靠到配置 bdc：原本无 config 时直接指过去；原本已挂在别的配置
+ * 上（配置被切换，如参数改动）则先 unclaim 再改挂，并同步 afi/safi。
+ * 注意它只改“归属”，不负责把条目放进新配置的桶——那由调用方后续调用
+ * bgp_reuselist_add 完成。 */
 static void bgp_damp_info_claim(struct bgp_damp_info *bdi,
 				struct bgp_damp_config *bdc)
 {
@@ -70,6 +113,9 @@ static void bgp_damp_info_claim(struct bgp_damp_info *bdi,
 	bdi->safi = bdc->safi;
 }
 
+/* 【函数】选出对某条路由生效的 dampening 配置，优先级：peer 自身 →
+ * 所属 peer-group → bgp 实例。pi 为 NULL 返回 NULL；三处均未启用则返回 NULL
+ * （表示该路由不受抑制）。判断 peer-group 前先 peer_group_active。 */
 struct bgp_damp_config *get_active_bdc_from_pi(struct bgp_path_info *pi,
 					       afi_t afi, safi_t safi)
 {
@@ -87,6 +133,10 @@ struct bgp_damp_config *get_active_bdc_from_pi(struct bgp_path_info *pi,
 	return NULL;
 }
 
+/* 【函数】由 penalty 算出应挂在哪个复用桶：先按 (penalty/reuse_limit - 1)*scale_factor
+ * 查 reuse_index 表得到“距当前偏移的桶数”，再加 reuse_offset 取模得到实际桶下标。
+ * 越界时截到最后一个索引。等价于把 penalty 映射成“还要多久可复用”的时间分档。
+ * reuse_limit 已断言非 0（防除零）。 */
 /* Calculate reuse list index by penalty value.  */
 static int bgp_reuse_index(int penalty, struct bgp_damp_config *bdc)
 {
@@ -110,6 +160,8 @@ static int bgp_reuse_index(int penalty, struct bgp_damp_config *bdc)
 	return (bdc->reuse_offset + index) % bdc->reuse_list_size;
 }
 
+/* 【函数】把抑制记录加入合适的复用桶：先 claim 到 bdc，据 penalty 算桶下标，再插入
+ * 该桶链表。 */
 /* Add BGP dampening information to reuse list.  */
 static void bgp_reuse_list_add(struct bgp_damp_info *bdi,
 			       struct bgp_damp_config *bdc)
@@ -119,12 +171,15 @@ static void bgp_reuse_list_add(struct bgp_damp_info *bdi,
 	bgp_reuselist_add(&bdc->reuse_list[bdi->index], bdi);
 }
 
+/* 【函数】把抑制记录从复用桶里删除（即 unclaim）。 */
 /* Delete BGP dampening information from reuse list.  */
 static void bgp_reuse_list_delete(struct bgp_damp_info *bdi)
 {
 	bgp_damp_info_unclaim(bdi, NULL);
 }
 
+/* 【函数】把抑制记录放入 no_reuse_list（未抑制或暂不入桶的条目），并把 index 置为
+ * 哨兵 BGP_DAMP_NO_REUSE_LIST_INDEX。 */
 static void bgp_no_reuse_list_add(struct bgp_damp_info *bdi,
 				  struct bgp_damp_config *bdc)
 {
@@ -133,11 +188,15 @@ static void bgp_no_reuse_list_add(struct bgp_damp_info *bdi,
 	bgp_reuselist_add(&bdc->no_reuse_list, bdi);
 }
 
+/* 【函数】把抑制记录从 no_reuse_list 删除（即 unclaim）。 */
 static void bgp_no_reuse_list_delete(struct bgp_damp_info *bdi)
 {
 	bgp_damp_info_unclaim(bdi, NULL);
 }
 
+/* 【函数】按经过的时间 tdiff（秒）衰减 penalty 并返回新值：用预计算的 decay_array
+ * 查表——tdiff 除以刻度 DELTA_T 得下标 i，返回 penalty*decay_array[i]。
+ * tdiff 不足一个刻度(i==0)原值返回；下标超出数组上限（已超过最大抑制时间）返回 0。 */
 /* Return decayed penalty value.  */
 int bgp_damp_decay(time_t tdiff, int penalty, struct bgp_damp_config *bdc)
 {
@@ -154,6 +213,15 @@ int bgp_damp_decay(time_t tdiff, int penalty, struct bgp_damp_config *bdc)
 	return (int)(penalty * bdc->decay_array[i]);
 }
 
+/* 【函数】复用定时器回调（RFC2439 4.8.7）：每 DELTA_REUSE 秒跑一次，每次只处理当前
+ * reuse_offset 指向的桶，随后偏移加一对桶数取模（轮转）。先把 t_reuse 置 NULL 并重挂
+ * 定时器（保持周期）。对桶内每条记录：
+ *   1) 按 t_now - t_updated 衰减 penalty 并刷新 t_updated；
+ *   2) 若 penalty < reuse_limit：解除抑制（清 BGP_PATH_DAMPED）；若上次是 UPDATE 记录
+ *      还要把路由重新纳入聚合并 bgp_process 触发更新；penalty 已低于阈值一半则直接
+ *      bgp_damp_info_free，否则转入 no_reuse_list 等彻底衰减；
+ *   3) 否则 penalty 仍高，按新值重算桶下标并移动到新桶。
+ * 处理完断言临时桶 plist 已空（证明每条都被正确搬走）。 */
 /* Handler of reuse timer event.  Each route in the current reuse-list
    is evaluated.  RFC2439 Section 4.8.7.  */
 static void bgp_reuse_timer(struct event *t)
@@ -231,6 +299,16 @@ static void bgp_reuse_timer(struct event *t)
 	assert(SLIST_EMPTY(&plist));
 }
 
+/* 【函数】路由变为不可达（down）时调用（RFC2439 4.8.2），是“加惩罚分”的主入口。
+ * 先取生效配置，未配置则返回 BGP_DAMP_USED。
+ *   - 无历史记录：新建 bgp_damp_info，初始 penalty = DEFAULT_PENALTY（若仅属性变化
+ *     attr_change 则减半），flap=1，挂到 no_reuse_list。
+ *   - 已有记录：若配置变了先 claim 到新配置并重挂；衰减后累加 penalty，封顶到 ceiling，
+ *     flap 自增。
+ * 随后置 lastrecord=WITHDRAW、标历史态；若已在抑制中则按需重挂桶并返回
+ * BGP_DAMP_SUPPRESSED；否则当 penalty 达到 suppress 阈值就进入抑制（标 BGP_PATH_DAMPED、
+ * 记 suppress_time、从 no_reuse_list 转入复用桶）。
+ * 返回状态宏（USED / SUPPRESSED），调用方据此决定是否真的撤回通告。 */
 /* A route becomes unreachable (RFC2439 Section 4.8.2).  */
 int bgp_damp_withdraw(struct bgp_path_info *path, struct bgp_dest *dest,
 		      afi_t afi, safi_t safi, int attr_change)
@@ -323,6 +401,14 @@ int bgp_damp_withdraw(struct bgp_path_info *path, struct bgp_dest *dest,
 	return BGP_DAMP_USED;
 }
 
+/* 【函数】路由变为可达（up）时调用：对记录做衰减并判定能否恢复。无 damp_info 直接返回
+ * BGP_DAMP_USED。否则衰减 penalty：
+ *   未被抑制且已低于 suppress 阈值 → 保持 USED；
+ *   曾被抑制且已低于 reuse 阈值 → 解除抑制（清 DAMPED、移入 no_reuse_list、清
+ *       suppress_time），返回 USED；
+ *   其余 → 仍抑制，返回 BGP_DAMP_SUPPRESSED。
+ * 最后：penalty 仍在复用阈值一半以上则更新 t_updated，否则直接 free 掉记录。
+ * 同时清除历史态标志。返回状态宏。 */
 int bgp_damp_update(struct bgp_path_info *path, struct bgp_dest *dest,
 		    afi_t afi, safi_t safi)
 {
@@ -365,6 +451,10 @@ int bgp_damp_update(struct bgp_path_info *path, struct bgp_dest *dest,
 	return status;
 }
 
+/* 【函数】释放一条抑制记录：先从所在桶摘除（unclaim），清空 path 上的 damp_info 指针
+ * 与 HISTORY/DAMPED 标志；若上次记录是 WITHDRAW 且 withdraw 为真，还要从聚合计数里
+ * 扣除、把路由标记删除并 bgp_process。最后释放结构体。
+ * 前置条件：bdi->path / bdi->dest 等反向指针仍需有效。 */
 void bgp_damp_info_free(struct bgp_damp_info *bdi, struct reuselist *list,
 			int withdraw)
 {
@@ -390,6 +480,15 @@ void bgp_damp_info_free(struct bgp_damp_info *bdi, struct reuselist *list,
 	XFREE(MTYPE_BGP_DAMP_INFO, bdi);
 }
 
+/* 【函数】据可配参数（半衰期、复用/抑制阈值、最大抑制时间）计算并填充整套派生量：
+ *   - ceiling：惩罚上限 = reuse_limit * 2^(max_suppress_time / half_life)。
+ *   - decay_array：按 DELTA_T 刻度预计算的衰减系数表（array[1] 为一个刻度的衰减比，
+ *     其后逐项累乘），使运行时衰减只需查表。
+ *   - reuse_list / reuse_list_size：按 max_suppress_time 与 DELTA_REUSE 决定桶数
+ *     （上限 REUSE_LIST_SIZE）。
+ *   - reuse_index 与 scale_factor：把 penalty 映射到桶下标的索引表。
+ * 这几个数组由 bgp_damp_info_clean 统一释放；重复调用会覆盖旧指针，故切换参数前
+ * 必须先 clean。 */
 static void bgp_damp_parameter_set(time_t hlife, unsigned int reuse,
 				   unsigned int sup, time_t maxsup,
 				   struct bgp_damp_config *bdc)
@@ -455,6 +554,9 @@ static void bgp_damp_parameter_set(time_t hlife, unsigned int reuse,
 	}
 }
 
+/* 【函数】在 bgp 实例级启用 dampening。若已启用且四个参数完全相同则直接返回 0（幂等）；
+ * 参数有变则先 disable 再重建。置 BGP_CONFIG_DAMPENING 标志，调 bgp_damp_parameter_set
+ * 算派生参数，记录 afi/safi，并注册复用定时器（周期 DELTA_REUSE）。返回 0。 */
 int bgp_damp_enable(struct bgp *bgp, afi_t afi, safi_t safi, time_t half,
 		    unsigned int reuse, unsigned int suppress, time_t max)
 {
@@ -480,6 +582,10 @@ int bgp_damp_enable(struct bgp *bgp, afi_t afi, safi_t safi, time_t half,
 	return 0;
 }
 
+/* 【函数】清空某配置下的全部抑制信息：遍历每个复用桶与 no_reuse_list，逐条 free
+ * （对处于 UPDATE 记录的要先补聚合计数并 bgp_process），随后释放 decay_array、
+ * reuse_index、reuse_list 三个数组并清零对应 size，最后取消复用定时器。
+ * 这是 disable 与删除实例/邻居时的统一清理路径。 */
 /* Clean all the bgp_damp_info stored in reuse_list and no_reuse_list. */
 void bgp_damp_info_clean(struct bgp *bgp, struct bgp_damp_config *bdc,
 			 afi_t afi, safi_t safi)
@@ -522,6 +628,9 @@ void bgp_damp_info_clean(struct bgp *bgp, struct bgp_damp_config *bdc,
 	event_cancel(&bdc->t_reuse);
 }
 
+/* 【函数】在 bgp 实例级关闭 dampening：若未启用则直接返回 0；否则取消复用定时器、
+ * 调 bgp_damp_info_clean 清理全部记录，并清 BGP_CONFIG_DAMPENING 标志。返回 0。
+ * 注：删除 bgp 实例时也走这里释放内存。 */
 /* Disable route flap dampening for a bgp instance.
  *
  * Please note that this function also gets used to free memory when deleting a
@@ -550,6 +659,9 @@ int bgp_damp_disable(struct bgp *bgp, afi_t afi, safi_t safi)
 	return 0;
 }
 
+/* 【函数】把实例级 dampening 配置写回 running-config。全为默认值时写
+ * `bgp dampening`；仅半衰期非默认写带一个参数的形式；否则写全部四个参数。
+ * 注意单位换算：半衰期与最大抑制时间对外以分钟显示（内部以秒存储）。 */
 void bgp_config_write_damp(struct vty *vty, struct bgp *bgp, afi_t afi,
 			   safi_t safi)
 {
@@ -572,6 +684,10 @@ void bgp_config_write_damp(struct vty *vty, struct bgp *bgp, afi_t afi,
 			bdc->suppress_value, bdc->max_suppress_time / 60LL);
 }
 
+/* 【函数】据当前 penalty 估算“还需多久衰减到 reuse 阈值以下”，返回格式化字符串
+ * （或写入 json）。penalty 已不高于 reuse_limit 时时间为 0（输出 00:00:00 / 0）。
+ * 按结果时长分档格式化：时分秒 / hh:mm:ss / Ndhhmm / wwdhhh；use_json 为真时把毫秒
+ * 数放入 json 字段 reuseTimerMsecs。返回 buf（json 模式下也返回 buf）。 */
 static const char *bgp_get_reuse_time(struct bgp_damp_config *bdc,
 				      unsigned int penalty, char *buf,
 				      size_t len, bool use_json,
@@ -639,6 +755,9 @@ static const char *bgp_get_reuse_time(struct bgp_damp_config *bdc,
 	return buf;
 }
 
+/* 【函数】在 show 输出里打印某条路由的 dampening 信息：重算当前 penalty，输出 penalty
+ * 与抖动次数及起始时长；若正被抑制且不处于历史态，再附“reuse in ...”。json_path
+ * 非空时改写为 json 字段。path->extra 为空、未启用或无记录时直接返回。 */
 void bgp_damp_info_vty(struct vty *vty, struct bgp *bgp,
 		       struct bgp_path_info *path, afi_t afi, safi_t safi,
 		       json_object *json_path)
@@ -696,6 +815,9 @@ void bgp_damp_info_vty(struct vty *vty, struct bgp *bgp,
 }
 
 
+/* 【函数】供外部（如 show 的每个前缀行）取该路由的“可复用时间”字符串：取生效配置、
+ * 校验使能与记录存在后，重算 penalty 并交给 bgp_get_reuse_time 格式化。
+ * 返回 buf 或 NULL（未配置 / 无记录）。 */
 const char *bgp_damp_reuse_time_vty(struct vty *vty, struct bgp_path_info *path,
 				    char *timebuf, size_t len, afi_t afi,
 				    safi_t safi, bool use_json,
@@ -732,6 +854,9 @@ const char *bgp_damp_reuse_time_vty(struct vty *vty, struct bgp_path_info *path,
 }
 
 
+/* 【函数】打印单个 (afi, safi) 的 dampening 参数（半衰期、复用/抑制阈值、最大抑制时间、
+ * 最大抑制上限）：use_json 时输出 json，否则按行文本。若该 afi/safi 未启用，非 json
+ * 模式打印一行提示。恒返回 CMD_SUCCESS。 */
 static int bgp_print_dampening_parameters(struct bgp *bgp, struct vty *vty,
 					  afi_t afi, safi_t safi, bool use_json)
 {
@@ -772,6 +897,9 @@ static int bgp_print_dampening_parameters(struct bgp *bgp, struct vty *vty,
 	return CMD_SUCCESS;
 }
 
+/* 【函数】show 入口：取默认 BGP 实例（无实例或隐藏则警告并返回 CMD_WARNING）。
+ * 未指定 afi-all 就只打印传入的 (afi, safi)；否则按 IP / IP6 或全部 AFI/SAFI 逐个
+ * 调 bgp_print_dampening_parameters。返回 CMD_SUCCESS / CMD_WARNING。 */
 int bgp_show_dampening_parameters(struct vty *vty, afi_t afi, safi_t safi,
 				  uint16_t show_flags)
 {
@@ -822,6 +950,9 @@ int bgp_show_dampening_parameters(struct vty *vty, afi_t afi, safi_t safi,
 	return CMD_SUCCESS;
 }
 
+/* 【函数】在 peer（或 peer-group）级启用 dampening：逻辑同实例级（幂等检查 → 参数变则
+ * 先 disable → 置 PEER_FLAG_CONFIG_DAMPENING → 算参数 → 注册复用定时器），但作用于
+ * peer->damp[afi][safi]。peer 为 NULL 直接返回。本函数返回 void。 */
 void bgp_peer_damp_enable(struct peer *peer, afi_t afi, safi_t safi, time_t half,
 			  unsigned int reuse, unsigned int suppress, time_t max)
 {
@@ -845,6 +976,9 @@ void bgp_peer_damp_enable(struct peer *peer, afi_t afi, safi_t safi, time_t half
 			&bdc->t_reuse);
 }
 
+/* 【函数】在 peer 级关闭 dampening：未启用则返回；否则清理该 peer 的记录（调
+ * bgp_damp_info_clean）并清 PEER_FLAG_CONFIG_DAMPENING 标志。删除 peer / peer-group 时
+ * 也走这里释放内存。 */
 /* Disable route flap dampening for a peer.
  *
  * Please note that this function also gets used to free memory when deleting a
@@ -863,6 +997,8 @@ void bgp_peer_damp_disable(struct peer *peer, afi_t afi, safi_t safi)
 	UNSET_FLAG(peer->af_flags[afi][safi], PEER_FLAG_CONFIG_DAMPENING);
 }
 
+/* 【函数】把 peer 级 dampening 配置写回 running-config，规则同实例级（默认值 / 仅半衰
+ * 期 / 全参数三种形式），前缀为 `neighbor X dampening ...`。 */
 void bgp_config_write_peer_damp(struct vty *vty, struct peer *peer, afi_t afi,
 				safi_t safi)
 {
@@ -886,6 +1022,8 @@ void bgp_config_write_peer_damp(struct vty *vty, struct peer *peer, afi_t afi,
 			bdc->suppress_value, bdc->max_suppress_time / 60LL);
 }
 
+/* 【函数】打印单个 peer 在某 (afi, safi) 的 dampening 参数（文本，或填充传入的 json）。
+ * peer 为 NULL 返回；未启用时非 json 模式打印一行提示。 */
 static void bgp_print_peer_dampening_parameters(struct vty *vty,
 						struct peer *peer, afi_t afi,
 						safi_t safi, bool use_json,
@@ -926,6 +1064,9 @@ static void bgp_print_peer_dampening_parameters(struct vty *vty,
 			get_afi_safi_str(afi, safi, false));
 }
 
+/* 【函数】show 某 peer 的 dampening 参数：use_json 时新建含 addressFamily 的 json 对象，
+ * 填充后美化打印再释放；否则打印“For address family”标题后调
+ * bgp_print_peer_dampening_parameters。 */
 void bgp_show_peer_dampening_parameters(struct vty *vty, struct peer *peer,
 					afi_t afi, safi_t safi, bool use_json)
 {

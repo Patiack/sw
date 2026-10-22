@@ -6,6 +6,33 @@
  *                    Rafael Zalamena
  */
 
+/*
+ * 文件导读 filter_nb.c —— 访问列表 / 前缀列表的北向接口（YANG）实现
+ *
+ * 定位：本文件是「配置数据树 -> 内存结构」的落地层。filter_cli.c 负责把命令
+ *   写进候选配置，本文件的回调再把候选配置 apply 到运行配置，并同步更新
+ *   filter.c / plist.c 里的 C 数据结构；它不解析命令行，也不做匹配运算。
+ *
+ * 三方分工回顾：
+ *   filter.h      ：数据结构与原型；
+ *   filter.c      ：访问列表核心（存 / 查 / 匹配）；
+ *   filter_nb.c   ：YANG 回调（validate / create / destroy / modify / cli_show），
+ *                   把配置树落到 filter.c 的 access_list 及 plist.c 的 prefix_list；
+ *   filter_cli.c  ：命令行（DEFPY_YANG）与 show / 比较回调。
+ *
+ * 本文件主要内容：
+ *   - prefix_list_length_validate            ：校验 ge / le 长度约束；
+ *   - acl_is_dup / acl_cisco_is_dup / acl_zebra_is_dup ：查重逻辑；
+ *   - *_create / *_destroy / *_modify        ：各类节点的增删改回调；
+ *   - frr_filter_info                        ：YANG 模块回调表（见文件末尾）。
+ *
+ * 关键约定：
+ *   - 多数回调在 args->event != NB_EV_APPLY 时直接返回 NB_OK，即只在 apply
+ *     阶段真正改动内存结构；校验只在 validate 阶段做。
+ *   - nb_running_get_entry 用于从数据节点找回对应的 C 结构。
+ *   - cli_show 回调负责把运行配置反向打印成命令行文本。
+ */
+
 #include "zebra.h"
 
 #include "lib/northbound.h"
@@ -17,6 +44,13 @@
 #include "lib/plist_int.h"
 #include "lib/routemap.h"
 
+/*
+ * prefix_list_length_validate —— 校验前缀列表条目的 ge / le 长度约束。
+ * 参数：args 含待校验节点及错误信息缓冲区。
+ * 返回：NB_OK；不满足则写 args->errmsg 并返回 NB_ERR_VALIDATION。
+ * 三条规则都需满足：前缀长度 <= le、前缀长度 <= ge、ge <= le。
+ * 坑：le / ge 可能不存在，取值前必须先用 yang_dnode_exists 判断。
+ */
 static enum nb_error prefix_list_length_validate(struct nb_cb_modify_args *args)
 {
 	int type = yang_dnode_get_enum(args->dnode, "../../type");
@@ -76,6 +110,11 @@ log_and_fail:
 	return NB_ERR_VALIDATION;
 }
 
+/*
+ * prefix_list_entry_set_empty —— 把一个前缀列表条目重置为“空值”：
+ *   any=false、prefix 清零、ge=le=0。
+ * 参数：ple 待重置的条目；无返回值。
+ */
 /**
  * Sets prefix list entry to blank value.
  *
@@ -89,6 +128,11 @@ static void prefix_list_entry_set_empty(struct prefix_list_entry *ple)
 	ple->le = 0;
 }
 
+/*
+ * prefix_list_nb_validate_v4_af_type —— 校验给定列表节点的 type 是否为 IPv4。
+ * 返回：NB_OK；若不是 YPLT_IPV4，写入错误信息并返回 NB_ERR_VALIDATION。
+ * 用途：供 YANG must 表达式引用，防止 v4 / v6 前缀混用。
+ */
 static int
 prefix_list_nb_validate_v4_af_type(const struct lyd_node *plist_dnode,
 				   char *errmsg, size_t errmsg_len)
@@ -105,6 +149,10 @@ prefix_list_nb_validate_v4_af_type(const struct lyd_node *plist_dnode,
 	return NB_OK;
 }
 
+/*
+ * prefix_list_nb_validate_v6_af_type —— 校验给定列表节点的 type 是否为 IPv6。
+ * 返回：NB_OK；否则写入错误信息并返回 NB_ERR_VALIDATION。
+ */
 static int
 prefix_list_nb_validate_v6_af_type(const struct lyd_node *plist_dnode,
 				   char *errmsg, size_t errmsg_len)
@@ -121,6 +169,13 @@ prefix_list_nb_validate_v6_af_type(const struct lyd_node *plist_dnode,
 	return NB_OK;
 }
 
+/*
+ * lib_prefix_list_entry_prefix_length_greater_or_equal_modify
+ *   —— ge（最小长度）叶子的 modify 回调。
+ * 逻辑：仅 NB_EV_APPLY 阶段生效；取回对应 prefix_list_entry，调用
+ *   prefix_list_entry_update_start 启动更新，然后写入 ple->ge。
+ * 返回：NB_OK。
+ */
 static int lib_prefix_list_entry_prefix_length_greater_or_equal_modify(
 	struct nb_cb_modify_args *args)
 {
@@ -139,6 +194,11 @@ static int lib_prefix_list_entry_prefix_length_greater_or_equal_modify(
 	return NB_OK;
 }
 
+/*
+ * lib_prefix_list_entry_prefix_length_lesser_or_equal_modify
+ *   —— le（最大长度）叶子的 modify 回调：启动更新后写入 ple->le（流程同 ge）。
+ * 返回：NB_OK。
+ */
 static int lib_prefix_list_entry_prefix_length_lesser_or_equal_modify(
 	struct nb_cb_modify_args *args)
 {
@@ -157,6 +217,11 @@ static int lib_prefix_list_entry_prefix_length_lesser_or_equal_modify(
 	return NB_OK;
 }
 
+/*
+ * lib_prefix_list_entry_prefix_length_greater_or_equal_destroy
+ *   —— ge 叶子的 destroy 回调：把 ple->ge 复位为 0，并启动条目更新。
+ * 返回：NB_OK。
+ */
 static int lib_prefix_list_entry_prefix_length_greater_or_equal_destroy(
 	struct nb_cb_destroy_args *args)
 {
@@ -175,6 +240,11 @@ static int lib_prefix_list_entry_prefix_length_greater_or_equal_destroy(
 	return NB_OK;
 }
 
+/*
+ * lib_prefix_list_entry_prefix_length_lesser_or_equal_destroy
+ *   —— le 叶子的 destroy 回调：把 ple->le 复位为 0，并启动条目更新。
+ * 返回：NB_OK。
+ */
 static int lib_prefix_list_entry_prefix_length_lesser_or_equal_destroy(
 	struct nb_cb_destroy_args *args)
 {
@@ -193,6 +263,11 @@ static int lib_prefix_list_entry_prefix_length_lesser_or_equal_destroy(
 	return NB_OK;
 }
 
+/*
+ * cisco_unset_addr_mask —— 把一条 Cisco 规则的地址 / 掩码复位为“未设置”，
+ *   等价于 0.0.0.0/32（地址全 0，通配符全 0 即 host 全 0）。
+ * 参数：addr / mask 分别为地址与通配符掩码，就地修改；无返回值。
+ */
 /**
  * Unsets the cisco style rule for addresses so it becomes disabled (the
  * equivalent of setting: `0.0.0.0/32`).
@@ -206,6 +281,15 @@ static void cisco_unset_addr_mask(struct in_addr *addr, struct in_addr *mask)
 	mask->s_addr = CISCO_BIN_HOST_WILDCARD_MASK;
 }
 
+/*
+ * _acl_is_dup —— yang_dnode_iterate 的回调：判断某条目是否与查询参数重复。
+ * 参数：dnode 当前条目；arg 为 struct acl_dup_args。
+ * 返回：命中则填 ada_found / ada_seq 并返回 YANG_ITER_STOP；
+ *   否则 YANG_ITER_CONTINUE 继续遍历。
+ * 逻辑：先跳过调用方自身；再比 action；最后逐项比对 ada_xpath / ada_value，
+ *   任一类型不符或取值不同即视为不重复。
+ * 坑：ada_xpath 中出现 NULL 表示没有更多待比值，比较循环随之结束。
+ */
 static int _acl_is_dup(const struct lyd_node *dnode, void *arg)
 {
 	struct acl_dup_args *ada = arg;
@@ -242,6 +326,13 @@ static int _acl_is_dup(const struct lyd_node *dnode, void *arg)
 	return YANG_ITER_STOP;
 }
 
+/*
+ * acl_is_dup —— 对外查重入口：在指定列表的所有 entry 中查找与 ada 描述
+ *   完全相同的条目。
+ * 参数：dnode 用于定位候选配置；ada 查重参数（类型 / 名字 / 动作 / 取值）。
+ * 返回：是否找到重复项（并回填 ada->ada_seq）。
+ * 逻辑：先复位 ada_found，再用 _acl_is_dup 遍历 <type>/<name> 下的 entry。
+ */
 bool acl_is_dup(const struct lyd_node *dnode, struct acl_dup_args *ada)
 {
 	ada->ada_found = false;
@@ -254,6 +345,15 @@ bool acl_is_dup(const struct lyd_node *dnode, struct acl_dup_args *ada)
 	return ada->ada_found;
 }
 
+/*
+ * acl_cisco_is_dup —— 判断一条 Cisco 风格规则是否与列表中已有条目重复。
+ * 参数：dnode 为触发点（其父 entry 才是要检查的条目）。
+ * 返回：是否重复。
+ * 逻辑：把 entry 下所有“已存在”的 cisco 相关字段（host / network / any /
+ *   destination-* 等）收集成 xpath + value 列表，填入 acl_dup_args，
+ *   再调用 acl_is_dup 比对。
+ * 坑：ada_entry_dnode 设为自身 entry，供 _acl_is_dup 跳过自己。
+ */
 static bool acl_cisco_is_dup(const struct lyd_node *dnode)
 {
 	const struct lyd_node *entry_dnode =
@@ -295,6 +395,14 @@ static bool acl_cisco_is_dup(const struct lyd_node *dnode)
 	return acl_is_dup(entry_dnode, &ada);
 }
 
+/*
+ * acl_zebra_is_dup —— 判断一条 zebra 风格规则是否重复。
+ * 参数：dnode 触发点；type 列表类型（IPv4 / IPv6 / MAC）。
+ * 返回：是否重复。
+ * 逻辑：按 type 选定 ada_type 字符串，再把存在的 zebra 字段
+ *   （ipv4-prefix / ipv6-prefix / mac / any 等）收集进 acl_dup_args，
+ *   最后调用 acl_is_dup 比对。
+ */
 static bool acl_zebra_is_dup(const struct lyd_node *dnode,
 			     enum yang_access_list_type type)
 {
@@ -345,6 +453,12 @@ static bool acl_zebra_is_dup(const struct lyd_node *dnode,
 	return acl_is_dup(entry_dnode, &ada);
 }
 
+/*
+ * plist_dnode_to_prefix —— 从一段前缀列表 entry 节点提取匹配要素。
+ * 参数（出参）：any 是否 any；p 前缀；ge / le 长度约束。
+ * 逻辑：先默认 any=false、ge=le=0；若存在 any 叶子则置 any=true 直接返回；
+ *   否则按 type（IPv4 / IPv6）读对应前缀与 ge / le 字段。
+ */
 static void plist_dnode_to_prefix(const struct lyd_node *dnode, bool *any,
 				  struct prefix *p, int *ge, int *le)
 {
@@ -383,6 +497,13 @@ static void plist_dnode_to_prefix(const struct lyd_node *dnode, bool *any,
 	}
 }
 
+/*
+ * _plist_is_dup —— yang_dnode_iterate 回调：判断某前缀列表条目是否与查询参数重复。
+ * 参数：dnode 当前条目；arg 为 struct plist_dup_args。
+ * 返回：命中则填 pda_found / pda_seq 并 YANG_ITER_STOP；否则 YANG_ITER_CONTINUE。
+ * 逻辑：跳过调用方自身；比 action；用 plist_dnode_to_prefix 取出条目要素，
+ *   any 条目要求对方也是 any，否则要求前缀相同且 ge / le 都相等。
+ */
 static int _plist_is_dup(const struct lyd_node *dnode, void *arg)
 {
 	struct plist_dup_args *pda = arg;
@@ -415,6 +536,11 @@ static int _plist_is_dup(const struct lyd_node *dnode, void *arg)
 	return YANG_ITER_STOP;
 }
 
+/*
+ * plist_is_dup —— 对外查重入口：在指定前缀列表中查找与 pda 描述相同的条目。
+ * 参数：dnode 定位候选配置；pda 查重参数（类型 / 名字 / 动作 / 前缀 / ge / le）。
+ * 返回：是否找到重复项（并回填 pda->pda_seq）。
+ */
 bool plist_is_dup(const struct lyd_node *dnode, struct plist_dup_args *pda)
 {
 	pda->pda_found = false;
@@ -429,6 +555,13 @@ bool plist_is_dup(const struct lyd_node *dnode, struct plist_dup_args *pda)
 
 /*
  * XPath: /frr-filter:lib/access-list
+ */
+/*
+ * lib_access_list_create —— /frr-filter:lib/access-list 的 create 回调。
+ * 逻辑：仅 NB_EV_APPLY 生效；按 type 选 AFI，用 access_list_get 取回或新建
+ *   对应 access_list，并把它绑定到数据节点（nb_running_set_entry）。
+ * 返回：NB_OK。
+ * 注意：这里才真正在 filter.c 中创建内存里的访问列表。
  */
 static int lib_access_list_create(struct nb_cb_create_args *args)
 {
@@ -459,6 +592,12 @@ static int lib_access_list_create(struct nb_cb_create_args *args)
 	return NB_OK;
 }
 
+/*
+ * lib_access_list_destroy —— access-list 的 destroy 回调。
+ * 逻辑：仅 NB_EV_APPLY 生效；从数据节点取回并解绑 access_list，
+ *   调用 access_list_delete 彻底释放。
+ * 返回：NB_OK。
+ */
 static int lib_access_list_destroy(struct nb_cb_destroy_args *args)
 {
 	struct access_list *acl;
@@ -474,6 +613,12 @@ static int lib_access_list_destroy(struct nb_cb_destroy_args *args)
 
 /*
  * XPath: /frr-filter:lib/access-list/remark
+ */
+/*
+ * lib_access_list_remark_modify —— access-list/remark 的 modify 回调。
+ * 逻辑：仅 NB_EV_APPLY 生效；先释放旧 remark，再 XSTRDUP 新值存入 acl->remark。
+ * 返回：NB_OK。
+ * 注意：remark 用 MTYPE_TMP 分配，其生命周期须与 acl->remark 一致。
  */
 static int lib_access_list_remark_modify(struct nb_cb_modify_args *args)
 {
@@ -493,6 +638,11 @@ static int lib_access_list_remark_modify(struct nb_cb_modify_args *args)
 	return NB_OK;
 }
 
+/*
+ * lib_access_list_remark_destroy —— access-list/remark 的 destroy 回调：
+ *   释放 acl->remark（XFREE 宏会把指针一并置为 NULL）。
+ * 返回：NB_OK。
+ */
 static int
 lib_access_list_remark_destroy(struct nb_cb_destroy_args *args)
 {
@@ -511,6 +661,12 @@ lib_access_list_remark_destroy(struct nb_cb_destroy_args *args)
 
 /*
  * XPath: /frr-filter:lib/access-list/entry
+ */
+/*
+ * lib_access_list_entry_create —— access-list/entry 的 create 回调。
+ * 逻辑：仅 NB_EV_APPLY 生效；filter_new 新建一条规则，设 seq、回指 acl，
+ *   用 access_list_filter_add 挂入列表，并把规则绑定到该 entry 数据节点。
+ * 返回：NB_OK。
  */
 static int lib_access_list_entry_create(struct nb_cb_create_args *args)
 {
@@ -531,6 +687,12 @@ static int lib_access_list_entry_create(struct nb_cb_create_args *args)
 	return NB_OK;
 }
 
+/*
+ * lib_access_list_entry_destroy —— access-list/entry 的 destroy 回调。
+ * 逻辑：取回并解绑规则 f，由 f->acl 找回列表，调用 access_list_filter_delete
+ *   把规则摘除并释放。
+ * 返回：NB_OK。
+ */
 static int lib_access_list_entry_destroy(struct nb_cb_destroy_args *args)
 {
 	struct access_list *acl;
@@ -546,6 +708,12 @@ static int lib_access_list_entry_destroy(struct nb_cb_destroy_args *args)
 	return NB_OK;
 }
 
+/*
+ * lib_access_list_entry_apply_finish —— entry 的 apply-finish 回调。
+ * 逻辑：整条 entry 修改完成后调用 access_list_filter_update，触发钩子与
+ *   route-map 依赖通知，令下游重新计算。
+ * 用途：把“一次配置事务完成”的收尾动作与逐字段的内存更新解耦。
+ */
 static void
 lib_access_list_entry_apply_finish(struct nb_cb_apply_finish_args *args)
 {
@@ -557,6 +725,13 @@ lib_access_list_entry_apply_finish(struct nb_cb_apply_finish_args *args)
 
 /*
  * XPath: /frr-filter:lib/access-list/entry/action
+ */
+/*
+ * lib_access_list_entry_action_modify —— entry/action 的 modify 回调。
+ * 逻辑：仅 NB_EV_APPLY 生效；读字符串，若为 "permit" 则 f->type = FILTER_PERMIT，
+ *   否则 f->type = FILTER_DENY。
+ * 返回：NB_OK。
+ * 坑：除 "permit" 外一律按 deny 处理，勿把 dynamic 等取值误算。
  */
 static int
 lib_access_list_entry_action_modify(struct nb_cb_modify_args *args)
@@ -579,6 +754,13 @@ lib_access_list_entry_action_modify(struct nb_cb_modify_args *args)
 
 /*
  * XPath: /frr-filter:lib/access-list/entry/ipv4-prefix
+ */
+/*
+ * lib_access_list_entry_ipv4_prefix_modify —— entry/ipv4-prefix 的 modify 回调。
+ * 逻辑：① NB_EV_VALIDATE 阶段用 acl_zebra_is_dup 查重，重复则报错返回；
+ *   ② NB_EV_APPLY 阶段把规则标记为 zebra 风格（f->cisco=0），
+ *   并把前缀读入 f->u.zfilter.prefix。
+ * 返回：NB_OK / NB_ERR_VALIDATION。
  */
 static int
 lib_access_list_entry_ipv4_prefix_modify(struct nb_cb_modify_args *args)
@@ -610,6 +792,11 @@ lib_access_list_entry_ipv4_prefix_modify(struct nb_cb_modify_args *args)
 	return NB_OK;
 }
 
+/*
+ * lib_access_list_entry_ipv4_prefix_destroy —— entry/ipv4-prefix 的 destroy 回调：
+ *   把 f->u.zfilter.prefix 清零（规则本身不删除，仅清空前缀）。
+ * 返回：NB_OK。
+ */
 static int
 lib_access_list_entry_ipv4_prefix_destroy(struct nb_cb_destroy_args *args)
 {
@@ -628,6 +815,12 @@ lib_access_list_entry_ipv4_prefix_destroy(struct nb_cb_destroy_args *args)
 
 /*
  * XPath: /frr-filter:lib/access-list/entry/ipv4-exact-match
+ */
+/*
+ * lib_access_list_entry_ipv4_exact_match_modify —— entry/ipv4-exact-match 的 modify 回调。
+ * 逻辑：VALIDATE 阶段用 acl_zebra_is_dup 查重；APPLY 阶段把布尔值写入
+ *   f->u.zfilter.exact。
+ * 返回：NB_OK / NB_ERR_VALIDATION。
  */
 static int
 lib_access_list_entry_ipv4_exact_match_modify(struct nb_cb_modify_args *args)
@@ -658,6 +851,11 @@ lib_access_list_entry_ipv4_exact_match_modify(struct nb_cb_modify_args *args)
 	return NB_OK;
 }
 
+/*
+ * lib_access_list_entry_ipv4_exact_match_destroy —— entry/ipv4-exact-match 的 destroy 回调：
+ *   把 f->u.zfilter.exact 复位为 0。
+ * 返回：NB_OK。
+ */
 static int
 lib_access_list_entry_ipv4_exact_match_destroy(struct nb_cb_destroy_args *args)
 {
@@ -676,6 +874,12 @@ lib_access_list_entry_ipv4_exact_match_destroy(struct nb_cb_destroy_args *args)
 
 /*
  * XPath: /frr-filter:lib/access-list/entry/host
+ */
+/*
+ * lib_access_list_entry_host_modify —— entry/host 的 modify 回调（标准 ACL 单主机）。
+ * 逻辑：VALIDATE 查重；APPLY 置 f->cisco=1、ipv6=false，写 fc->addr，
+ *   并把通配符掩码设为 host 全 0（要求精确匹配）。
+ * 返回：NB_OK / NB_ERR_VALIDATION。
  */
 static int
 lib_access_list_entry_host_modify(struct nb_cb_modify_args *args)
@@ -707,6 +911,11 @@ lib_access_list_entry_host_modify(struct nb_cb_modify_args *args)
 	return NB_OK;
 }
 
+/*
+ * lib_access_list_entry_host_destroy —— entry/host 的 destroy 回调（标准 ACL 单主机）。
+ * 逻辑：复位地址与掩码（cisco_unset_addr_mask），回到“未设置”状态。
+ * 返回：NB_OK。
+ */
 static int
 lib_access_list_entry_host_destroy(struct nb_cb_destroy_args *args)
 {
@@ -727,12 +936,22 @@ lib_access_list_entry_host_destroy(struct nb_cb_destroy_args *args)
 /*
  * XPath: /frr-filter:lib/access-list/entry/network
  */
+/*
+ * lib_access_list_entry_network_create —— entry/network 容器节点的 create 回调。
+ * 本节点自身无数据，实际处理都在子节点（address / mask）回调中完成，
+ *   故这里直接返回 NB_OK。
+ */
 static int lib_access_list_entry_network_create(struct nb_cb_create_args *args)
 {
 	/* Nothing to do here, everything is done in children callbacks */
 	return NB_OK;
 }
 
+/*
+ * lib_access_list_entry_network_destroy —— entry/network 的 destroy 回调：
+ *   复位标准 ACL 的地址 / 掩码（cisco_unset_addr_mask）。
+ * 返回：NB_OK。
+ */
 static int lib_access_list_entry_network_destroy(struct nb_cb_destroy_args *args)
 {
 	struct filter_cisco *fc;
@@ -750,6 +969,11 @@ static int lib_access_list_entry_network_destroy(struct nb_cb_destroy_args *args
 
 /*
  * XPath: /frr-filter:lib/access-list/entry/network/address
+ */
+/*
+ * lib_access_list_entry_network_address_modify —— entry/network/address 的 modify 回调。
+ * 逻辑：VALIDATE 查重；APPLY 置 cisco=1、ipv6=false，把地址写入 fc->addr。
+ * 返回：NB_OK / NB_ERR_VALIDATION。
  */
 static int
 lib_access_list_entry_network_address_modify(struct nb_cb_modify_args *args)
@@ -783,6 +1007,11 @@ lib_access_list_entry_network_address_modify(struct nb_cb_modify_args *args)
 /*
  * XPath: /frr-filter:lib/access-list/entry/network/mask
  */
+/*
+ * lib_access_list_entry_network_mask_modify —— entry/network/mask 的 modify 回调。
+ * 逻辑：VALIDATE 查重；APPLY 把通配符掩码写入 fc->addr_mask（置 cisco、ipv6=false）。
+ * 返回：NB_OK / NB_ERR_VALIDATION。
+ */
 static int
 lib_access_list_entry_network_mask_modify(struct nb_cb_modify_args *args)
 {
@@ -815,6 +1044,12 @@ lib_access_list_entry_network_mask_modify(struct nb_cb_modify_args *args)
 /*
  * XPath: /frr-filter:lib/access-list/entry/source-any
  */
+/*
+ * lib_access_list_entry_source_any_create —— entry/source-any 的 create 回调。
+ * 逻辑：VALIDATE 查重；APPLY 置 cisco=1、地址 INADDR_ANY、掩码为 any 通配符
+ *   （CISCO_BIN_ANY_WILDCARD_MASK），表示匹配任意源。
+ * 返回：NB_OK / NB_ERR_VALIDATION。
+ */
 static int
 lib_access_list_entry_source_any_create(struct nb_cb_create_args *args)
 {
@@ -845,6 +1080,11 @@ lib_access_list_entry_source_any_create(struct nb_cb_create_args *args)
 	return NB_OK;
 }
 
+/*
+ * lib_access_list_entry_source_any_destroy —— entry/source-any 的 destroy 回调：
+ *   复位地址 / 掩码为未设置（cisco_unset_addr_mask）。
+ * 返回：NB_OK。
+ */
 static int
 lib_access_list_entry_source_any_destroy(struct nb_cb_destroy_args *args)
 {
@@ -864,6 +1104,14 @@ lib_access_list_entry_source_any_destroy(struct nb_cb_destroy_args *args)
 
 /*
  * XPath: /frr-filter:lib/access-list/entry/destination-host
+ */
+/*
+ * lib_access_list_entry_destination_host_modify —— entry/destination-host 的 modify 回调
+ *   （扩展 ACL 的目的单主机）。
+ * 逻辑：VALIDATE 查重；APPLY 置 extended=1，把目的地址写入 fc->wtf.mask，
+ *   通配符掩码设为 host 全 0。
+ * 坑：IPv4 扩展的目的地址借用了 wtf.mask 字段存储。
+ * 返回：NB_OK / NB_ERR_VALIDATION。
  */
 static int lib_access_list_entry_destination_host_modify(
 	struct nb_cb_modify_args *args)
@@ -895,6 +1143,11 @@ static int lib_access_list_entry_destination_host_modify(
 	return NB_OK;
 }
 
+/*
+ * lib_access_list_entry_destination_host_destroy —— entry/destination-host 的 destroy 回调：
+ *   置 extended=0 并复位目的地址 / 掩码。
+ * 返回：NB_OK。
+ */
 static int lib_access_list_entry_destination_host_destroy(
 	struct nb_cb_destroy_args *args)
 {
@@ -916,6 +1169,10 @@ static int lib_access_list_entry_destination_host_destroy(
 /*
  * XPath: /frr-filter:lib/access-list/entry/destination-network
  */
+/*
+ * lib_access_list_entry_destination_network_create —— entry/destination-network
+ *   容器节点的 create 回调，无自身数据，交由子节点回调处理。
+ */
 static int
 lib_access_list_entry_destination_network_create(struct nb_cb_create_args *args)
 {
@@ -923,6 +1180,11 @@ lib_access_list_entry_destination_network_create(struct nb_cb_create_args *args)
 	return NB_OK;
 }
 
+/*
+ * lib_access_list_entry_destination_network_destroy —— entry/destination-network 的 destroy 回调：
+ *   置 extended=0 并复位目的地址 / 掩码。
+ * 返回：NB_OK。
+ */
 static int lib_access_list_entry_destination_network_destroy(
 	struct nb_cb_destroy_args *args)
 {
@@ -942,6 +1204,12 @@ static int lib_access_list_entry_destination_network_destroy(
 
 /*
  * XPath: /frr-filter:lib/access-list/entry/destination-network/address
+ */
+/*
+ * lib_access_list_entry_destination_network_address_modify
+ *   —— entry/destination-network/address 的 modify 回调。
+ * 逻辑：VALIDATE 查重；APPLY 置 extended=1，把目的网络地址写入 fc->wtf.mask。
+ * 返回：NB_OK / NB_ERR_VALIDATION。
  */
 static int lib_access_list_entry_destination_network_address_modify(
 	struct nb_cb_modify_args *args)
@@ -975,6 +1243,12 @@ static int lib_access_list_entry_destination_network_address_modify(
 /*
  * XPath: /frr-filter:lib/access-list/entry/destination-network/mask
  */
+/*
+ * lib_access_list_entry_destination_network_mask_modify
+ *   —— entry/destination-network/mask 的 modify 回调：
+ *   置 extended=1，把目的通配符掩码写入 fc->wtf.mask_mask。
+ * 返回：NB_OK / NB_ERR_VALIDATION。
+ */
 static int lib_access_list_entry_destination_network_mask_modify(
 	struct nb_cb_modify_args *args)
 {
@@ -1007,6 +1281,11 @@ static int lib_access_list_entry_destination_network_mask_modify(
 /*
  * XPath: /frr-filter:lib/access-list/entry/destination-any
  */
+/*
+ * lib_access_list_entry_destination_any_create —— entry/destination-any 的 create 回调：
+ *   置 extended=1，目的地址 INADDR_ANY、掩码 any 通配符（匹配任意目的）。
+ * 返回：NB_OK / NB_ERR_VALIDATION。
+ */
 static int lib_access_list_entry_destination_any_create(
 	struct nb_cb_create_args *args)
 {
@@ -1037,6 +1316,11 @@ static int lib_access_list_entry_destination_any_create(
 	return NB_OK;
 }
 
+/*
+ * lib_access_list_entry_destination_any_destroy —— entry/destination-any 的 destroy 回调：
+ *   置 extended=0 并复位目的地址 / 掩码。
+ * 返回：NB_OK。
+ */
 static int lib_access_list_entry_destination_any_destroy(
 	struct nb_cb_destroy_args *args)
 {
@@ -1057,6 +1341,11 @@ static int lib_access_list_entry_destination_any_destroy(
 
 /*
  * XPath: /frr-filter:lib/access-list/entry/ipv6-host
+ */
+/*
+ * lib_access_list_entry_ipv6_host_modify —— entry/ipv6-host 的 modify 回调（IPv6 单主机）。
+ * 逻辑：VALIDATE 查重；APPLY 置 cisco=1、ipv6=true，写 fc->addr6，掩码清零。
+ * 返回：NB_OK / NB_ERR_VALIDATION。
  */
 static int lib_access_list_entry_ipv6_host_modify(struct nb_cb_modify_args *args)
 {
@@ -1087,6 +1376,11 @@ static int lib_access_list_entry_ipv6_host_modify(struct nb_cb_modify_args *args
 	return NB_OK;
 }
 
+/*
+ * lib_access_list_entry_ipv6_host_destroy —— entry/ipv6-host 的 destroy 回调：
+ *   置 ipv6=true 并把地址 addr6 清零（随后掩码亦复位）。
+ * 返回：NB_OK。
+ */
 static int lib_access_list_entry_ipv6_host_destroy(struct nb_cb_destroy_args *args)
 {
 	struct filter_cisco *fc;
@@ -1107,12 +1401,22 @@ static int lib_access_list_entry_ipv6_host_destroy(struct nb_cb_destroy_args *ar
 /*
  * XPath: /frr-filter:lib/access-list/entry/ipv6-network
  */
+/*
+ * lib_access_list_entry_ipv6_network_create —— entry/ipv6-network 容器 create 回调，
+ *   无自身数据，交由子节点回调处理。
+ */
 static int lib_access_list_entry_ipv6_network_create(struct nb_cb_create_args *args)
 {
 	/* Nothing to do here, everything is done in children callbacks */
 	return NB_OK;
 }
 
+/*
+ * lib_access_list_entry_ipv6_network_destroy —— entry/ipv6-network 的 destroy 回调：
+ *   置 ipv6=true、extended=0，并把 addr6 / addr6_mask 清零。
+ * 返回：NB_OK。
+ * 注意：此处 memset 长度传的是 sizeof(addr6_mask)，对 addr6 的清理是等长复用。
+ */
 static int lib_access_list_entry_ipv6_network_destroy(struct nb_cb_destroy_args *args)
 {
 	struct filter_cisco *fc;
@@ -1133,6 +1437,12 @@ static int lib_access_list_entry_ipv6_network_destroy(struct nb_cb_destroy_args 
 
 /*
  * XPath: /frr-filter:lib/access-list/entry/ipv6-network/address
+ */
+/*
+ * lib_access_list_entry_ipv6_network_address_modify —— entry/ipv6-network/address 的 modify 回调。
+ * 逻辑：VALIDATE 阶段用 acl_cisco_is_dup 查重；APPLY 阶段置 cisco=1、ipv6=true，
+ *   把节点上的 IPv6 地址写入 fc->addr6。
+ * 返回：NB_OK / NB_ERR_VALIDATION。
  */
 static int lib_access_list_entry_ipv6_network_address_modify(struct nb_cb_modify_args *args)
 {
@@ -1165,6 +1475,12 @@ static int lib_access_list_entry_ipv6_network_address_modify(struct nb_cb_modify
 /*
  * XPath: /frr-filter:lib/access-list/entry/network/mask
  */
+/*
+ * lib_access_list_entry_ipv6_network_mask_modify —— entry/ipv6-network/mask 的 modify 回调
+ *   （函数名沿用旧 XPath 命名，注释块声明的 XPath 为 .../network/mask）。
+ * 逻辑：VALIDATE 查重；APPLY 置 cisco=1、ipv6=true，把掩码写入 fc->addr6_mask。
+ * 返回：NB_OK / NB_ERR_VALIDATION。
+ */
 static int lib_access_list_entry_ipv6_network_mask_modify(struct nb_cb_modify_args *args)
 {
 	struct filter_cisco *fc;
@@ -1196,6 +1512,12 @@ static int lib_access_list_entry_ipv6_network_mask_modify(struct nb_cb_modify_ar
 /*
  * XPath: /frr-filter:lib/access-list/entry/ipv6-source-any
  */
+/*
+ * lib_access_list_entry_ipv6_source_any_create —— entry/ipv6-source-any 的 create 回调。
+ * 逻辑：VALIDATE 查重；APPLY 置 cisco=1、ipv6=true，源地址 addr6 清零、
+ *   源掩码 addr6_mask 全 0xFF（IPv6 中 wildcard 全 1 表示“任意源”）。
+ * 返回：NB_OK / NB_ERR_VALIDATION。
+ */
 static int lib_access_list_entry_ipv6_source_any_create(struct nb_cb_create_args *args)
 {
 	struct filter_cisco *fc;
@@ -1225,6 +1547,11 @@ static int lib_access_list_entry_ipv6_source_any_create(struct nb_cb_create_args
 	return NB_OK;
 }
 
+/*
+ * lib_access_list_entry_ipv6_source_any_destroy —— entry/ipv6-source-any 的 destroy 回调：
+ *   置 ipv6=true，并把 addr6 / addr6_mask 清零。
+ * 返回：NB_OK。
+ */
 static int lib_access_list_entry_ipv6_source_any_destroy(struct nb_cb_destroy_args *args)
 {
 	struct filter_cisco *fc;
@@ -1244,6 +1571,13 @@ static int lib_access_list_entry_ipv6_source_any_destroy(struct nb_cb_destroy_ar
 
 /*
  * XPath: /frr-filter:lib/access-list/entry/ipv6-destination-host
+ */
+/*
+ * lib_access_list_entry_ipv6_destination_host_modify —— entry/ipv6-destination-host 的
+ *   modify 回调（扩展 ACL 单一目的主机）。
+ * 逻辑：VALIDATE 查重；APPLY 置 ipv6=true、extended=1，把目的地址写入 fc->sadr6.dst，
+ *   并把目的掩码 dst_mask 清零（精确匹配单主机）。
+ * 返回：NB_OK / NB_ERR_VALIDATION。
  */
 static int lib_access_list_entry_ipv6_destination_host_modify(struct nb_cb_modify_args *args)
 {
@@ -1274,6 +1608,11 @@ static int lib_access_list_entry_ipv6_destination_host_modify(struct nb_cb_modif
 	return NB_OK;
 }
 
+/*
+ * lib_access_list_entry_ipv6_destination_host_destroy —— entry/ipv6-destination-host 的
+ *   destroy 回调：置 ipv6=true、extended=0，并清空 sadr6.dst / sadr6.dst_mask。
+ * 返回：NB_OK。
+ */
 static int lib_access_list_entry_ipv6_destination_host_destroy(struct nb_cb_destroy_args *args)
 {
 	struct filter_cisco *fc;
@@ -1295,12 +1634,21 @@ static int lib_access_list_entry_ipv6_destination_host_destroy(struct nb_cb_dest
 /*
  * XPath: /frr-filter:lib/access-list/entry/ipv6-destination-network
  */
+/*
+ * lib_access_list_entry_ipv6_destination_network_create —— entry/ipv6-destination-network
+ *   容器 create 回调，无自身数据，交由子节点回调处理。
+ */
 static int lib_access_list_entry_ipv6_destination_network_create(struct nb_cb_create_args *args)
 {
 	/* Nothing to do here, everything is done in children callbacks */
 	return NB_OK;
 }
 
+/*
+ * lib_access_list_entry_ipv6_destination_network_destroy —— entry/ipv6-destination-network 的
+ *   destroy 回调：置 ipv6=true、extended=1，并清空 addr6 / addr6_mask。
+ * 返回：NB_OK。
+ */
 static int lib_access_list_entry_ipv6_destination_network_destroy(struct nb_cb_destroy_args *args)
 {
 	struct filter_cisco *fc;
@@ -1321,6 +1669,13 @@ static int lib_access_list_entry_ipv6_destination_network_destroy(struct nb_cb_d
 
 /*
  * XPath: /frr-filter:lib/access-list/entry/ipv6-destination-network/address
+ */
+/*
+ * lib_access_list_entry_ipv6_destination_network_address_modify
+ *   —— entry/ipv6-destination-network/address 的 modify 回调。
+ * 逻辑：VALIDATE 查重；APPLY 置 ipv6=true、extended=1，
+ *   把目的网络地址写入 fc->sadr6.dst。
+ * 返回：NB_OK / NB_ERR_VALIDATION。
  */
 static int
 lib_access_list_entry_ipv6_destination_network_address_modify(struct nb_cb_modify_args *args)
@@ -1354,6 +1709,13 @@ lib_access_list_entry_ipv6_destination_network_address_modify(struct nb_cb_modif
 /*
  * XPath: /frr-filter:lib/access-list/entry/ipv6-destination-network/mask
  */
+/*
+ * lib_access_list_entry_ipv6_destination_network_mask_modify
+ *   —— entry/ipv6-destination-network/mask 的 modify 回调。
+ * 逻辑：VALIDATE 查重；APPLY 置 ipv6=true、extended=1，
+ *   把目的网络掩码写入 fc->sadr6.dst_mask。
+ * 返回：NB_OK / NB_ERR_VALIDATION。
+ */
 static int lib_access_list_entry_ipv6_destination_network_mask_modify(struct nb_cb_modify_args *args)
 {
 	struct filter_cisco *fc;
@@ -1385,6 +1747,12 @@ static int lib_access_list_entry_ipv6_destination_network_mask_modify(struct nb_
 /*
  * XPath: /frr-filter:lib/access-list/entry/ipv6-destination-any
  */
+/*
+ * lib_access_list_entry_ipv6_destination_any_create —— entry/ipv6-destination-any 的 create 回调。
+ * 逻辑：VALIDATE 查重；APPLY 置 ipv6=true、extended=1，目的地址清零、
+ *   目的掩码 dst_mask 全 0xFF（匹配任意 IPv6 目的）。
+ * 返回：NB_OK / NB_ERR_VALIDATION。
+ */
 static int lib_access_list_entry_ipv6_destination_any_create(struct nb_cb_create_args *args)
 {
 	struct filter_cisco *fc;
@@ -1414,6 +1782,11 @@ static int lib_access_list_entry_ipv6_destination_any_create(struct nb_cb_create
 	return NB_OK;
 }
 
+/*
+ * lib_access_list_entry_ipv6_destination_any_destroy —— entry/ipv6-destination-any 的 destroy 回调：
+ *   置 ipv6=true、extended=0，并清空 sadr6.dst / sadr6.dst_mask。
+ * 返回：NB_OK。
+ */
 static int lib_access_list_entry_ipv6_destination_any_destroy(struct nb_cb_destroy_args *args)
 {
 	struct filter_cisco *fc;
@@ -1434,6 +1807,14 @@ static int lib_access_list_entry_ipv6_destination_any_destroy(struct nb_cb_destr
 
 /*
  * XPath: /frr-filter:lib/access-list/entry/any
+ */
+/*
+ * lib_access_list_entry_any_create —— entry/any 的 create 回调（zebra 风格匹配任意）。
+ * 逻辑：VALIDATE 用 acl_zebra_is_dup 查重（读 ../../type 取列表类型）；
+ *   APPLY 置 f->cisco=0，清空 fz->prefix，并按 ../../type 设 prefix.family
+ *   （YALT_IPV4→AF_INET / YALT_IPV6→AF_INET6 / YALT_MAC→AF_ETHERNET），
+ *   配合前缀长度 0 表示“匹配任意”。
+ * 返回：NB_OK / NB_ERR_VALIDATION。
  */
 static int lib_access_list_entry_any_create(struct nb_cb_create_args *args)
 {
@@ -1478,6 +1859,11 @@ static int lib_access_list_entry_any_create(struct nb_cb_create_args *args)
 	return NB_OK;
 }
 
+/*
+ * lib_access_list_entry_any_destroy —— entry/any 的 destroy 回调：
+ *   把 f->u.zfilter.prefix.family 复位为 AF_UNSPEC。
+ * 返回：NB_OK。
+ */
 static int lib_access_list_entry_any_destroy(struct nb_cb_destroy_args *args)
 {
 	struct filter_zebra *fz;
@@ -1495,6 +1881,13 @@ static int lib_access_list_entry_any_destroy(struct nb_cb_destroy_args *args)
 
 /*
  * XPath: /frr-filter:lib/prefix-list
+ */
+/*
+ * lib_prefix_list_create —— /frr-filter:lib/prefix-list 的 create 回调。
+ * 逻辑：仅 NB_EV_APPLY 生效；按 type 取 AFI（0=ipv4→AFI_IP，1=ipv6→AFI_IP6），
+ *   用 prefix_list_get 取回或新建 prefix_list，再用 nb_running_set_entry 绑定到 dnode。
+ * 返回：NB_OK。
+ * 注意：此处直接比较裸 0 / 1，与枚举 YPLT_IPV4 / YPLT_IPV6 取值一致。
  */
 static int lib_prefix_list_create(struct nb_cb_create_args *args)
 {
@@ -1521,6 +1914,12 @@ static int lib_prefix_list_create(struct nb_cb_create_args *args)
 	return NB_OK;
 }
 
+/*
+ * lib_prefix_list_destroy —— /frr-filter:lib/prefix-list 的 destroy 回调。
+ * 逻辑：APPLY 阶段 nb_running_unset_entry 解绑 dnode，再 prefix_list_delete
+ *   删除整条前缀列表。
+ * 返回：NB_OK。
+ */
 static int lib_prefix_list_destroy(struct nb_cb_destroy_args *args)
 {
 	struct prefix_list *pl;
@@ -1536,6 +1935,12 @@ static int lib_prefix_list_destroy(struct nb_cb_destroy_args *args)
 
 /*
  * XPath: /frr-filter:lib/prefix-list/remark
+ */
+/*
+ * lib_prefix_list_remark_modify —— /frr-filter:lib/prefix-list/remark 的 modify 回调。
+ * 逻辑：APPLY 阶段先 XFREE 旧的 pl->desc，再把新 remark 字符串 XSTRDUP 存入 pl->desc。
+ * 返回：NB_OK。
+ * 注意：desc 使用 MTYPE_TMP 内存类型。
  */
 static int lib_prefix_list_remark_modify(struct nb_cb_modify_args *args)
 {
@@ -1555,6 +1960,11 @@ static int lib_prefix_list_remark_modify(struct nb_cb_modify_args *args)
 	return NB_OK;
 }
 
+/*
+ * lib_prefix_list_remark_destroy —— /frr-filter:lib/prefix-list/remark 的 destroy 回调：
+ *   APPLY 阶段释放 pl->desc（XFREE），表示该前缀列表不再有备注。
+ * 返回：NB_OK。
+ */
 static int lib_prefix_list_remark_destroy(struct nb_cb_destroy_args *args)
 {
 	struct prefix_list *pl;
@@ -1571,6 +1981,14 @@ static int lib_prefix_list_remark_destroy(struct nb_cb_destroy_args *args)
 
 /*
  * XPath: /frr-filter:lib/prefix-list/entry
+ */
+/*
+ * lib_prefix_list_entry_create —— /frr-filter:lib/prefix-list/entry 的 create 回调。
+ * 逻辑：APPLY 阶段取父 prefix-list，prefix_list_entry_new 新建条目，
+ *   设 ple->pl 与 ple->seq（读 sequence 叶子），调用 prefix_list_entry_set_empty 初始化，
+ *   最后 nb_running_set_entry 绑定 dnode。
+ * 返回：NB_OK。
+ * 说明：条目各匹配字段由后续子回调（action / ipv4-prefix 等）填充。
  */
 static int lib_prefix_list_entry_create(struct nb_cb_create_args *args)
 {
@@ -1590,6 +2008,12 @@ static int lib_prefix_list_entry_create(struct nb_cb_create_args *args)
 	return NB_OK;
 }
 
+/*
+ * lib_prefix_list_entry_destroy —— /frr-filter:lib/prefix-list/entry 的 destroy 回调。
+ * 逻辑：APPLY 阶段 nb_running_unset_entry 解绑；若条目已 installed 到内核
+ *   （调用 prefix_list_entry_delete2 做删除），否则直接 prefix_list_entry_free。
+ * 返回：NB_OK。
+ */
 static int lib_prefix_list_entry_destroy(struct nb_cb_destroy_args *args)
 {
 	struct prefix_list_entry *ple;
@@ -1606,6 +2030,13 @@ static int lib_prefix_list_entry_destroy(struct nb_cb_destroy_args *args)
 	return NB_OK;
 }
 
+/*
+ * lib_prefix_list_entry_apply_finish —— /frr-filter:lib/prefix-list/entry 的 apply_finish 回调。
+ * 逻辑：取回条目后调用 prefix_list_entry_update_finish，收尾一次前缀列表条目更新。
+ *   update 流程由各子回调里的 prefix_list_entry_update_start 启动，
+ *   即使被多个子回调多次调用 start，也会因 ple->installed 保护而只真正执行一次。
+ * 返回：无（void）。
+ */
 static void
 lib_prefix_list_entry_apply_finish(struct nb_cb_apply_finish_args *args)
 {
@@ -1624,6 +2055,12 @@ lib_prefix_list_entry_apply_finish(struct nb_cb_apply_finish_args *args)
 
 /*
  * XPath: /frr-filter:lib/prefix-list/entry/action
+ */
+/*
+ * lib_prefix_list_entry_action_modify —— /frr-filter:lib/prefix-list/entry/action 的 modify 回调。
+ * 逻辑：APPLY 阶段先调 prefix_list_entry_update_start 启动更新，
+ *   再读动作枚举：YPLA_PERMIT → ple->type = PREFIX_PERMIT，否则 PREFIX_DENY。
+ * 返回：NB_OK。
  */
 static int lib_prefix_list_entry_action_modify(struct nb_cb_modify_args *args)
 {
@@ -1647,6 +2084,15 @@ static int lib_prefix_list_entry_action_modify(struct nb_cb_modify_args *args)
 	return NB_OK;
 }
 
+/*
+ * lib_prefix_list_entry_prefix_modify —— 前缀列表条目「前缀」字段的通用 modify 实现，
+ *   被 ipv4-prefix / ipv6-prefix 两个 YANG 叶子回调复用。
+ * 逻辑：APPLY 阶段 update_start；读前缀到 ple->prefix；
+ *   再用 apply_mask 归一化网络地址，若与原值不同则打印 zlog_info 并纠正，
+ *   保证存储的始终是“网络地址 + 掩码”形式。
+ * 返回：NB_OK。
+ * 坑：用户可填入带主机位的地址，这里静默修正为按掩码归零后的网络地址。
+ */
 static int lib_prefix_list_entry_prefix_modify(struct nb_cb_modify_args *args)
 {
 	struct prefix_list_entry *ple;
@@ -1674,6 +2120,12 @@ static int lib_prefix_list_entry_prefix_modify(struct nb_cb_modify_args *args)
 	return NB_OK;
 }
 
+/*
+ * lib_prefix_list_entry_prefix_destroy —— 前缀列表条目「前缀」字段的通用 destroy 实现，
+ *   被 ipv4-prefix / ipv6-prefix 两个 YANG 叶子回调复用。
+ * 逻辑：APPLY 阶段 update_start，然后把 ple->prefix 清零。
+ * 返回：NB_OK。
+ */
 static int lib_prefix_list_entry_prefix_destroy(struct nb_cb_destroy_args *args)
 {
 	struct prefix_list_entry *ple;
@@ -1694,6 +2146,12 @@ static int lib_prefix_list_entry_prefix_destroy(struct nb_cb_destroy_args *args)
 /*
  * XPath: /frr-filter:lib/prefix-list/entry/ipv4-prefix
  */
+/*
+ * lib_prefix_list_entry_ipv4_prefix_modify —— /frr-filter:lib/prefix-list/entry/ipv4-prefix 的 modify 回调。
+ * 逻辑：VALIDATE 阶段取父 prefix-list 节点，用 prefix_list_nb_validate_v4_af_type
+ *   校验该列表确为 IPv4 类型；APPLY 委托通用实现 lib_prefix_list_entry_prefix_modify。
+ * 返回：NB_OK / NB_ERR_VALIDATION。
+ */
 static int
 lib_prefix_list_entry_ipv4_prefix_modify(struct nb_cb_modify_args *args)
 {
@@ -1708,6 +2166,11 @@ lib_prefix_list_entry_ipv4_prefix_modify(struct nb_cb_modify_args *args)
 	return lib_prefix_list_entry_prefix_modify(args);
 }
 
+/*
+ * lib_prefix_list_entry_ipv4_prefix_destroy —— /frr-filter:lib/prefix-list/entry/ipv4-prefix 的 destroy 回调：
+ *   非 APPLY 事件直接返回 NB_OK，否则委托 lib_prefix_list_entry_prefix_destroy。
+ * 返回：NB_OK。
+ */
 static int
 lib_prefix_list_entry_ipv4_prefix_destroy(struct nb_cb_destroy_args *args)
 {
@@ -1720,6 +2183,12 @@ lib_prefix_list_entry_ipv4_prefix_destroy(struct nb_cb_destroy_args *args)
 
 /*
  * XPath: /frr-filter:lib/prefix-list/entry/ipv6-prefix
+ */
+/*
+ * lib_prefix_list_entry_ipv6_prefix_modify —— /frr-filter:lib/prefix-list/entry/ipv6-prefix 的 modify 回调。
+ * 逻辑：VALIDATE 阶段用 prefix_list_nb_validate_v6_af_type 校验所属列表为 IPv6 类型；
+ *   APPLY 委托通用实现 lib_prefix_list_entry_prefix_modify。
+ * 返回：NB_OK / NB_ERR_VALIDATION。
  */
 static int
 lib_prefix_list_entry_ipv6_prefix_modify(struct nb_cb_modify_args *args)
@@ -1736,6 +2205,11 @@ lib_prefix_list_entry_ipv6_prefix_modify(struct nb_cb_modify_args *args)
 	return lib_prefix_list_entry_prefix_modify(args);
 }
 
+/*
+ * lib_prefix_list_entry_ipv6_prefix_destroy —— /frr-filter:lib/prefix-list/entry/ipv6-prefix 的 destroy 回调：
+ *   非 APPLY 直接返回，否则委托 lib_prefix_list_entry_prefix_destroy。
+ * 返回：NB_OK。
+ */
 static int
 lib_prefix_list_entry_ipv6_prefix_destroy(struct nb_cb_destroy_args *args)
 {
@@ -1748,6 +2222,13 @@ lib_prefix_list_entry_ipv6_prefix_destroy(struct nb_cb_destroy_args *args)
 
 /*
  * XPath: /frr-filter:lib/prefix-list/entry/ipv4-prefix-length-greater-or-equal
+ */
+/*
+ * lib_prefix_list_entry_ipv4_prefix_length_greater_or_equal_modify
+ *   —— /frr-filter:lib/prefix-list/entry/ipv4-prefix-length-greater-or-equal 的 modify 回调。
+ * 逻辑：VALIDATE 先调 prefix_list_length_validate 校验 ge / le 组合是否合法，
+ *   再取父 prefix-list 校验其确为 IPv4 类型；APPLY 委托通用实现写入 ple->ge。
+ * 返回：NB_OK / NB_ERR_VALIDATION。
  */
 static int lib_prefix_list_entry_ipv4_prefix_length_greater_or_equal_modify(
 	struct nb_cb_modify_args *args)
@@ -1768,6 +2249,12 @@ static int lib_prefix_list_entry_ipv4_prefix_length_greater_or_equal_modify(
 		args);
 }
 
+/*
+ * lib_prefix_list_entry_ipv4_prefix_length_greater_or_equal_destroy
+ *   —— ipv4-prefix-length-greater-or-equal 的 destroy 回调：
+ *   VALIDATE 校验所属列表为 IPv4 类型，否则委托通用实现（把 ple->ge 复位为 0）。
+ * 返回：NB_OK / NB_ERR_VALIDATION。
+ */
 static int lib_prefix_list_entry_ipv4_prefix_length_greater_or_equal_destroy(
 	struct nb_cb_destroy_args *args)
 {
@@ -1785,6 +2272,12 @@ static int lib_prefix_list_entry_ipv4_prefix_length_greater_or_equal_destroy(
 
 /*
  * XPath: /frr-filter:lib/prefix-list/entry/ipv4-prefix-length-lesser-or-equal
+ */
+/*
+ * lib_prefix_list_entry_ipv4_prefix_length_lesser_or_equal_modify
+ *   —— /frr-filter:lib/prefix-list/entry/ipv4-prefix-length-lesser-or-equal 的 modify 回调。
+ * 逻辑：VALIDATE 校验 ge / le 组合与 IPv4 列表类型；APPLY 委托通用实现写入 ple->le。
+ * 返回：NB_OK / NB_ERR_VALIDATION。
  */
 static int lib_prefix_list_entry_ipv4_prefix_length_lesser_or_equal_modify(
 	struct nb_cb_modify_args *args)
@@ -1805,6 +2298,12 @@ static int lib_prefix_list_entry_ipv4_prefix_length_lesser_or_equal_modify(
 		args);
 }
 
+/*
+ * lib_prefix_list_entry_ipv4_prefix_length_lesser_or_equal_destroy
+ *   —— ipv4-prefix-length-lesser-or-equal 的 destroy 回调：
+ *   VALIDATE 校验 IPv4 列表类型，否则委托通用实现（把 ple->le 复位为 0）。
+ * 返回：NB_OK / NB_ERR_VALIDATION。
+ */
 static int lib_prefix_list_entry_ipv4_prefix_length_lesser_or_equal_destroy(
 	struct nb_cb_destroy_args *args)
 {
@@ -1822,6 +2321,12 @@ static int lib_prefix_list_entry_ipv4_prefix_length_lesser_or_equal_destroy(
 
 /*
  * XPath: /frr-filter:lib/prefix-list/entry/ipv6-prefix-length-greater-or-equal
+ */
+/*
+ * lib_prefix_list_entry_ipv6_prefix_length_greater_or_equal_modify
+ *   —— /frr-filter:lib/prefix-list/entry/ipv6-prefix-length-greater-or-equal 的 modify 回调。
+ * 逻辑：VALIDATE 校验 ge / le 组合并确认列表为 IPv6 类型；APPLY 委托通用实现写入 ple->ge。
+ * 返回：NB_OK / NB_ERR_VALIDATION。
  */
 static int lib_prefix_list_entry_ipv6_prefix_length_greater_or_equal_modify(
 	struct nb_cb_modify_args *args)
@@ -1842,6 +2347,12 @@ static int lib_prefix_list_entry_ipv6_prefix_length_greater_or_equal_modify(
 		args);
 }
 
+/*
+ * lib_prefix_list_entry_ipv6_prefix_length_greater_or_equal_destroy
+ *   —— ipv6-prefix-length-greater-or-equal 的 destroy 回调：
+ *   VALIDATE 校验 IPv6 列表类型，否则委托通用实现（把 ple->ge 复位为 0）。
+ * 返回：NB_OK / NB_ERR_VALIDATION。
+ */
 static int lib_prefix_list_entry_ipv6_prefix_length_greater_or_equal_destroy(
 	struct nb_cb_destroy_args *args)
 {
@@ -1859,6 +2370,12 @@ static int lib_prefix_list_entry_ipv6_prefix_length_greater_or_equal_destroy(
 
 /*
  * XPath: /frr-filter:lib/prefix-list/entry/ipv6-prefix-length-lesser-or-equal
+ */
+/*
+ * lib_prefix_list_entry_ipv6_prefix_length_lesser_or_equal_modify
+ *   —— /frr-filter:lib/prefix-list/entry/ipv6-prefix-length-lesser-or-equal 的 modify 回调。
+ * 逻辑：VALIDATE 校验 ge / le 组合与 IPv6 列表类型；APPLY 委托通用实现写入 ple->le。
+ * 返回：NB_OK / NB_ERR_VALIDATION。
  */
 static int lib_prefix_list_entry_ipv6_prefix_length_lesser_or_equal_modify(
 	struct nb_cb_modify_args *args)
@@ -1879,6 +2396,12 @@ static int lib_prefix_list_entry_ipv6_prefix_length_lesser_or_equal_modify(
 		args);
 }
 
+/*
+ * lib_prefix_list_entry_ipv6_prefix_length_lesser_or_equal_destroy
+ *   —— ipv6-prefix-length-lesser-or-equal 的 destroy 回调：
+ *   VALIDATE 校验 IPv6 列表类型，否则委托通用实现（把 ple->le 复位为 0）。
+ * 返回：NB_OK / NB_ERR_VALIDATION。
+ */
 static int lib_prefix_list_entry_ipv6_prefix_length_lesser_or_equal_destroy(
 	struct nb_cb_destroy_args *args)
 {
@@ -1896,6 +2419,14 @@ static int lib_prefix_list_entry_ipv6_prefix_length_lesser_or_equal_destroy(
 
 /*
  * XPath: /frr-filter:lib/prefix-list/entry/any
+ */
+/*
+ * lib_prefix_list_entry_any_create —— /frr-filter:lib/prefix-list/entry/any 的 create 回调
+ *   （prefix-list 条目匹配任意前缀，对应 `prefix any`）。
+ * 逻辑：VALIDATE 直接放行（能走到这里即合法）；APPLY 取回条目并 update_start，
+ *   置 ple->any=true，清空前缀，并按 ../../type 设 family 与 ge / le
+ *   （YPLT_IPV4: AF_INET、ge=0、le=IPV4_MAX_BITLEN；YPLT_IPV6: AF_INET6、ge=0、le=IPV6_MAX_BITLEN）。
+ * 返回：NB_OK。
  */
 static int lib_prefix_list_entry_any_create(struct nb_cb_create_args *args)
 {
@@ -1938,6 +2469,11 @@ static int lib_prefix_list_entry_any_create(struct nb_cb_create_args *args)
 	return NB_OK;
 }
 
+/*
+ * lib_prefix_list_entry_any_destroy —— /frr-filter:lib/prefix-list/entry/any 的 destroy 回调：
+ *   APPLY 阶段 update_start 后把 ple->any 置回 false。
+ * 返回：NB_OK。
+ */
 static int lib_prefix_list_entry_any_destroy(struct nb_cb_destroy_args *args)
 {
 	struct prefix_list_entry *ple;
@@ -1955,6 +2491,23 @@ static int lib_prefix_list_entry_any_destroy(struct nb_cb_destroy_args *args)
 	return NB_OK;
 }
 
+/*
+ * frr_filter_info —— 本模块的 YANG 回调注册表（YANG 模块 "frr-filter"）。
+ * 作用：把 YANG 模型中的每个节点 xpath 映射到 filter_nb.c 中的回调函数；
+ *   北向框架在校验 / 提交候选配置时据此回调，完成配置校验与运行态落库。
+ * 关键字段：
+ *   .name  —— YANG 模块名 "frr-filter"；
+ *   .nodes —— 节点数组，每项含 .xpath，以及 .cbs（回调集合）。
+ * 回调类型含义：
+ *   create / destroy      —— 列表或容器节点的建立与删除；
+ *   modify                —— 叶子值变更；
+ *   apply_finish          —— 子树提交完成后收尾（如触发前缀条目更新）；
+ *   cli_show / cli_cmp    —— 由 filter_cli.c 提供，负责 show 输出与排序比较。
+ * 阅读建议：先看 access-list 与 entry 主表，再看 entry 下各类匹配叶子，
+ *   最后看 prefix-list 系列与结尾的 frr_filter_cli_info。
+ * 注意：xpath 字符串必须与 YANG 模型严格一致，错一个字符回调就不会被触发；
+ *   上方的 clang-format off 指令是为了保持条目的多行排版，勿随意格式化。
+ */
 /* clang-format off */
 const struct frr_yang_module_info frr_filter_info = {
 	.name = "frr-filter",
@@ -2250,6 +2803,14 @@ const struct frr_yang_module_info frr_filter_info = {
 	}
 };
 
+/*
+ * frr_filter_cli_info —— 本模块「仅 CLI 展示」的 YANG 回调注册表（模块名同为 "frr-filter"）。
+ * 作用：与 frr_filter_info 的区别在于它只注册 cli_show / cli_cmp，
+ *   用于配置回显与条目排序；ignore_cfg_cbs = true 表示这里不处理配置增删改，
+ *   避免同一模块被注册两套配置回调。回调实现在 filter_cli.c。
+ * 注意：remark 与 entry 两类节点分别注册 remark_show / show 与 cmp，
+ *   供 `show running-config` 与 `show ... access-list / prefix-list` 复用。
+ */
 const struct frr_yang_module_info frr_filter_cli_info = {
 	.name = "frr-filter",
 	.ignore_cfg_cbs = true,

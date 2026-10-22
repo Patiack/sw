@@ -5,6 +5,54 @@
  * This file is part of FRRouting
  */
 
+/* ============================================================================
+ * 【文件导读】bgp_evpn_vty.c —— EVPN 的 CLI（VTY）层：命令解析、show 输出、配置读写
+ * ============================================================================
+ * 【职责与定位】本文件是 EVPN 的**命令行前端**，不含 EVPN 核心协议逻辑。它做三件事：
+ *   1) show 命令族：`show bgp l2vpn evpn ...`（route / vni / es / next-hop / all /
+ *      summary / vni ... 等），把 bgp_evpn.c / bgp_evpn_mh.c 里维护的表**遍历并
+ *      格式化**成文本或 JSON。
+ *   2) 配置命令：`advertise-all-vni`、`vni <n>` 下的 `flood` / `rd` / `route-target`
+ *      / `import` / `export` / `advertise-svi-ip` 等；它们改写 EVPN 配置结构并
+ *      触发相应的 apply / 重建（例如 flood 变化触发 VNI 通告 / 重新编程）。
+ *   3) 配置回写：把 EVPN 配置写进 running-config（bgp_config_write_evpn_info）。
+ *
+ * 【核心数据结构 / 关键概念】
+ *   - AFI_L2VPN / SAFI_EVPN : EVPN 的地址族组合；EVPN 路由表挂在这套 afi/safi 下。
+ *   - struct bgpevpn            : 一个 L2 VNI（MAC-VRF，MAC 表项）的本地实例。
+ *   - struct bgp_evpn_vrf       : 一个 L3 VNI / 租户 VRF（IP-VRF，IP 前缀）的本地实例。
+ *     两者由 bgp_evpn_private.h 定义（本文件不定义，只使用）。
+ *   - VNI 类型: L2 = MAC-VRF，L3 = IP-VRF，由 vni / vrf_id 是否非零区分。
+ *   - RD（Route Distinguisher）: 每 VNI/VRF 一条，用于 EVPN 路由的区分。
+ *   - RT（Route Target / VNI 出/入向路由目标）: 控制 import / export 的扩展团体。
+ *   - ESI（Ethernet Segment Identifier）/ ES: 多归属接入，MH 相关（bgp_evpn_mh.h）。
+ *   - 显示模式开关: SHOW_DISPLAY_STANDARD / TAGS / OVERLAY，控制 show 的详细程度。
+ *
+ * 【本文件在主流程中的位置】（谁调它、它调谁）
+ *   - 谁调它: bgpd 初始化时调用 bgp_ethernetvpn_init() 注册全部命令；VTY 解析到
+ *     这些命令后进入本文件的 handler；bgp_config_write 通过 bgp_config_write_evpn_info
+ *     回写配置。
+ *   - 它调谁: 遍历 bgp_evpn.c 暴露的 VNI 表 / EVPN 路由表 / import-rt 表、
+ *     bgp_evpn_mh.c 暴露的 ES 表，并调用 bgp_evpn.h 的查询/操作函数（如
+ *     bgp_evpn_lookup_vni、evpn_XX_install 等）；配置命令还会调用
+ *     bgp_evpn_mh.h / bgp_zebra.h 的接口下发/回收硬件状态。
+ *   - 本文件基本只“读表 + 格式化”以及“改配置 + 触发 apply”，不直接编码 BGP 报文。
+ *
+ * 【易错点 / 阅读建议】
+ *   - show 输出与 JSON 输出是**两套并行代码**，同一函数里常见 `if (json) {...}
+ *     else {...}`；注意两边字段要一一对应，改一处别忘另一处。
+ *   - 配置命令（DEFUN/DEFPY）里往往先校验（VNI 是否存在、是否与 L3 VNI 冲突），
+ *     再改结构，最后按需调用 apply/重建函数；注释会标注“改了哪个字段 / 是否触发重建”。
+ *   - 大量使用 hash 遍历回调（如 vni_walk_ctx + 各 *_walk 回调），请先看清“遍历的
+ *     是哪种表、回调里的 ctx 携带了什么”。
+ *   建议阅读顺序：文件头常量与 vni_walk_ctx → display_* / show_* 辅助函数
+ *                 → show bgp l2vpn evpn 各子命令 DEFUN/DEFPY
+ *                 → vni / advertise-* / rd / route-target 等配置命令
+ *                 → bgp_config_write_evpn_info（回写）
+ *                 → 末尾 bgp_ethernetvpn_init（命令注册总表）。
+ * ============================================================================
+ */
+
 #include <zebra.h>
 #include "command.h"
 #include "prefix.h"
@@ -31,11 +79,26 @@
 #include "bgpd/bgp_community.h"
 #include "bgpd/bgp_addpath.h"
 
+/* 【显示模式】传给 show 辅助函数的“详细程度”开关，决定打印哪些额外信息：
+ *   SHOW_DISPLAY_STANDARD : 标准输出（默认）。
+ *   SHOW_DISPLAY_TAGS     : 额外打印标签 / 叠加层信息位（see bgp_evpn.c 的 detail 位）。
+ *   SHOW_DISPLAY_OVERLAY  : 打印叠加层(overlay)索引，如 L3VNI / gateway-ip 相关列。 */
 #define SHOW_DISPLAY_STANDARD 0
 #define SHOW_DISPLAY_TAGS 1
 #define SHOW_DISPLAY_OVERLAY 2
+/* VNI 名字字符串缓冲长度（形如 “VNI 1000” / 十进制最长 8 位，留足余量）。 */
 #define VNI_STR_LEN 32
 
+/* 【结构】vni_walk_ctx —— 遍历 VNI 哈希表时传给回调的上下文。
+ * 本文件大量使用 hash_walk 回调（参数只有 bucket + args），需要的信息都从这里取。
+ * 字段（按代码实际使用）：
+ *   bgp       : 当前操作的 bgp 实例（default 或某 VRF）。
+ *   vty       : 输出目标（文本模式使用）。
+ *   vtep_ip   : 过滤条件——只看该远端 VTEP 关联的条目（用于 vni <n> 下按 VTEP 展示）。
+ *   json      : JSON 输出对象；非 NULL 时走 JSON 分支，否则走文本分支。
+ *   detail    : 是否明细输出（传自命令行的 detail 关键字）。
+ *   type      : 只处理该 EVPN 路由类型过滤（见 bgp_evpn_cli_parse_type）。
+ *   mac_table : 是否以“MAC 表(mac_table)”视角展示（决定打印 MAC 还是 IP 前缀）。 */
 /*
  * Context for VNI hash walk - used by callbacks.
  */
@@ -49,6 +112,9 @@ struct vni_walk_ctx {
 	bool mac_table;
 };
 
+/* 【函数】argv_find_and_parse_oly_idx —— 解析命令行里的叠加层索引类型。
+ * 见 bgp_evpn_vty.h 的同名声明：命中 "gateway-ip" 则返回 OVERLAY_INDEX_GATEWAY_IP，
+ * 否则为 OVERLAY_INDEX_TYPE_NONE；始终返回 1（表示解析无致命错误）。 */
 int argv_find_and_parse_oly_idx(struct cmd_token **argv, int argc, int *oly_idx,
 				enum overlay_index_type *oly)
 {
@@ -58,6 +124,12 @@ int argv_find_and_parse_oly_idx(struct cmd_token **argv, int argc, int *oly_idx,
 	return 1;
 }
 
+/* 【函数】display_vrf_import_rt —— 打印一个“VRF 导入 RT 节点”(vrf_irt_node)：
+ * 即某个 route-target 被哪些 **VRF（L3）** 导入。用于 EVPN L3 的 show import-rt。
+ *   入参 irt->rt 是扩展团体格式的 RT；先解出 type/subtype，非 ECOMMUNITY_ROUTE_TARGET
+ *   直接返回；再按 AS(2B) / IP / AS4(4B) 三种编码把 RT 还原成 “a:b” 文本。
+ *   最后遍历 irt->vrfs 列出所有导入该 RT 的 VRF 名字。
+ * 文本与 JSON 两条分支并存：json 非 NULL 时填充 json_rt/json_vrfs。 */
 static void display_vrf_import_rt(struct vty *vty, struct vrf_irt_node *irt,
 				  json_object *json)
 {
@@ -156,6 +228,8 @@ static void display_vrf_import_rt(struct vty *vty, struct vrf_irt_node *irt,
 	}
 }
 
+/* 【函数】show_vrf_import_rt_entry —— 哈希遍历回调：从 bucket 取出 vrf_irt_node，
+ * 转交 display_vrf_import_rt 打印。args[0]=vty，args[1]=json。 */
 static void show_vrf_import_rt_entry(struct hash_bucket *bucket, void *args[])
 {
 	json_object *json = NULL;
@@ -168,6 +242,11 @@ static void show_vrf_import_rt_entry(struct hash_bucket *bucket, void *args[])
 	display_vrf_import_rt(vty, irt, json);
 }
 
+/* 【函数】display_import_rt —— 与 display_vrf_import_rt 对应，但打印的是某个
+ * route-target 被哪些 **VNI（L2）** 导入（irt->vnis 列表，元素为 struct bgpevpn）。
+ * RT 解码逻辑与 display_vrf_import_rt 基本相同（AS / IP / AS4）。
+ * 注意：源码此处有 “TODO: This needs to go into a function” —— 两个 display_import_rt
+ * 的 RT 解码部分是重复代码，将来可能抽出公共函数，阅读时以实际代码为准。 */
 static void display_import_rt(struct vty *vty, struct irt_node *irt,
 			      json_object *json)
 {
@@ -264,6 +343,8 @@ static void display_import_rt(struct vty *vty, struct irt_node *irt,
 	}
 }
 
+/* 【函数】show_import_rt_entry —— 哈希遍历回调：取出 irt_node 交给 display_import_rt。
+ * args[0]=vty，args[1]=json。 */
 static void show_import_rt_entry(struct hash_bucket *bucket, void *args[])
 {
 	json_object *json = NULL;
@@ -278,6 +359,11 @@ static void show_import_rt_entry(struct hash_bucket *bucket, void *args[])
 	return;
 }
 
+/* 【函数】bgp_evpn_show_route_rd_header —— 打印/输出某条 “RD 分组节点” 的表头。
+ * EVPN 路由表在 show 时按 RD 分组；rd_dest 的前缀里携带 RD 值。
+ *   按 RD 类型（RD_TYPE_AS / AS4 / IP）把 RD 解码为 “a:b” 文本存入 rd_str，
+ *   文本模式打印 “Route Distinguisher: <rd>”，JSON 模式写入 json 的 "rd" 字段。
+ * 未知类型输出 "Unknown"。 */
 static void bgp_evpn_show_route_rd_header(struct vty *vty,
 					  struct bgp_dest *rd_dest,
 					  json_object *json, char *rd_str,
@@ -337,6 +423,11 @@ static void bgp_evpn_show_route_rd_header(struct vty *vty,
 	}
 }
 
+/* 【函数】bgp_evpn_show_route_header —— 打印 EVPN 路由表的人类可读表头：
+ *   - 表版本号(tbl_ver) 与本地 router-id；
+ *   - 状态码/起源码图例；
+ *   - type-1..type-5 五种 EVPN 前缀的字段布局说明（[EthTag]/[ESI]/[MAC]/[IP] 等）。
+ * JSON 模式直接返回（JSON 不需要这些图例文字）。 */
 static void bgp_evpn_show_route_header(struct vty *vty, struct bgp *bgp,
 				       uint64_t tbl_ver, json_object *json)
 {
@@ -362,6 +453,12 @@ static void bgp_evpn_show_route_header(struct vty *vty, struct bgp *bgp,
 	vty_out(vty, "%s", ri_header);
 }
 
+/* 【函数】display_l3vni —— 打印一个 **L3 VNI（IP-VRF / 租户 VRF）** 的详情。
+ * 信息来源为 struct bgp（该 VRF 的 bgp 实例）：l3vni、RD(vrf_prd)、originator IP、
+ * 站点 MAC(site-of-origin)、System-IP / System-MAC(advertise-pip)、Router-MAC，
+ * 以及该 VRF 的 import / export Route Target 列表(vrf_import_rtl / vrf_export_rtl)。
+ * L3 VNI 的 Advertise-gw-macip / Advertise-svi-macip 恒为 "n/a"（那是 L2 的概念）。
+ * 文本与 JSON 双分支。 */
 static void display_l3vni(struct vty *vty, struct bgp *bgp_vrf,
 			  json_object *json)
 {
@@ -478,6 +575,16 @@ static void display_l3vni(struct vty *vty, struct bgp *bgp_vrf,
 		json_object_object_add(json, "exportRts", json_export_rtl);
 }
 
+/* 【函数】display_vni —— 打印一个 **L2 VNI（MAC-VRF）** 的详情。
+ * 入参 struct bgpevpn 携带：vni、租户 VRF(tenant_vrf_id)、RD(prd)、originator IP、
+ * 组播组(mcast_grp)、SVI 接口(svi_ifindex，经 ifindex2ifname 转名)、
+ * 站点 MAC、以及三个开关的显示：advertise-gw-macip / advertise-svi-macip /
+ * （L2 没有 advertise-pip）。这里对 gw/svi macip 做“三级显示”：
+ *   本 VNI 未显式开启但全局开启 → "Active"；
+ *   本 VNI 显式开启 → "Enabled"；
+ *   否则 → "Disabled"。
+ * 最后列 import / export Route Target(import_rtl / export_rtl)。
+ * 文本与 JSON 双分支，字段需一一对应。 */
 static void display_vni(struct vty *vty, struct bgpevpn *vpn, json_object *json)
 {
 	char *ecom_str;
@@ -624,6 +731,12 @@ static void display_vni(struct vty *vty, struct bgpevpn *vpn, json_object *json)
 		json_object_object_add(json, "exportRts", json_export_rtl);
 }
 
+/* 【函数】show_esi_routes —— 打印某个 ES(bgp_evpn_es) 自有的 EVPN 路由表
+ * (es->route_table) 的全部前缀与路径。用于 `show bgp l2vpn evpn es ...` 之类。
+ *   遍历 es->route_table：每个前缀打印其所有路径(route_vty_out)；
+ *   表头/图例仅在首次有路径时打印一次(header 标志)；
+ *   末尾输出前缀数/路径数(prefix_cnt / path_cnt)，无路径时提示
+ *   “No EVPN prefixes exist for this ESI”。JSON 模式下每个前缀一个对象。 */
 static void show_esi_routes(struct bgp *bgp,
 			    struct bgp_evpn_es *es,
 			    struct vty *vty,
@@ -712,6 +825,13 @@ static void show_esi_routes(struct bgp *bgp,
 	}
 }
 
+/* 【函数】bgp_evpn_show_routes_mac_ip_es —— 打印与某个 ESI 关联的 MAC-IP 路由。
+ * 遍历全局 ES 表(bgp_mh_info->es_rb_tree)：esi 非 NULL 时只处理匹配该 ESI 的 ES。
+ *   global_table 决定取自哪个路径链表：
+ *     true  → es->macip_global_path_list（全局表里的 MAC-IP 路径）；
+ *     false → es->macip_evi_path_list（按 EVI 分组的 MAC-IP 路径）。
+ *   只统计/输出 BGP_PATH_VALID 的路径；detail 决定用 route_vty_out_detail 还是
+ *   route_vty_out。表头仅打印一次。末尾给出路径计数或“无匹配”提示。 */
 /* Display all MAC-IP VNI routes linked to an ES */
 static void bgp_evpn_show_routes_mac_ip_es(struct vty *vty, esi_t *esi,
 					   json_object *json, int detail,
@@ -791,18 +911,33 @@ static void bgp_evpn_show_routes_mac_ip_es(struct vty *vty, esi_t *esi,
 	}
 }
 
+/* 【函数】bgp_evpn_show_routes_mac_ip_evi_es —— 薄封装：以 global_table=false
+ * 调用 bgp_evpn_show_routes_mac_ip_es，展示按 EVI 分组的 MAC-IP 路径。 */
 static void bgp_evpn_show_routes_mac_ip_evi_es(struct vty *vty, esi_t *esi,
 					       json_object *json, int detail)
 {
 	bgp_evpn_show_routes_mac_ip_es(vty, esi, json, detail, false);
 }
 
+/* 【函数】bgp_evpn_show_routes_mac_ip_global_es —— 薄封装：以 global_table=true
+ * 调用 bgp_evpn_show_routes_mac_ip_es，展示全局表里的 MAC-IP 路径。 */
 static void bgp_evpn_show_routes_mac_ip_global_es(struct vty *vty, esi_t *esi,
 						  json_object *json, int detail)
 {
 	bgp_evpn_show_routes_mac_ip_es(vty, esi, json, detail, true);
 }
 
+/* 【函数】show_vni_routes —— 打印**单个 VNI** 的路由表内容。这是 vni 路由展示的核心。
+ *   表选择：mac_table=true → vpn->mac_table（MAC-VRF 的 MAC 表）；
+ *           mac_table=false → vpn->ip_table（IP-VRF 的 IP 前缀/远端 MAC-IP）。
+ *   type 非 0 时只打印该 EVPN 路由类型(route_type)的条目。
+ *   vtep_ip 非 NULL 时只保留下一跳等于该 VTEP 的路径（IPv4 比 attr->nexthop，
+ *     IPv6 比 attr->mp_nexthop_global）。
+ *   MAC-IP 路由(BGP_EVPN_MAC_IP_ROUTE)的特殊处理：VNI 本地表里的条目常常只存了
+ *     MAC 或只存了 IP，这里用 evpn_type2_prefix_global_copy 从 path info 补全成
+ *     “全局完整”的 MAC-IP 前缀再打印。
+ *   detail 决定 route_vty_out_detail（含属性明细）还是 route_vty_out（精简行）。
+ *   末尾输出前缀数/路径数。文本与 JSON 双分支。 */
 static void show_vni_routes(struct bgp *bgp, struct bgpevpn *vpn,
 			    struct vty *vty, int type, bool mac_table,
 			    struct ipaddr *vtep_ip, json_object *json,
@@ -946,6 +1081,9 @@ static void show_vni_routes(struct bgp *bgp, struct bgpevpn *vpn,
 	}
 }
 
+/* 【函数】show_vni_routes_hash —— VNI 哈希遍历回调：对一个 VNI 调用 show_vni_routes，
+ * 使用 wctx 里的 bgp / type / mac_table / vtep_ip / detail。JSON 时以 VNI 号字符串
+ * 为键挂到上层 json。用于 `show bgp l2vpn evpn route vni <n>` 一类命令。 */
 static void show_vni_routes_hash(struct hash_bucket *bucket, void *arg)
 {
 	struct bgpevpn *vpn = (struct bgpevpn *)bucket->data;
@@ -970,6 +1108,10 @@ static void show_vni_routes_hash(struct hash_bucket *bucket, void *arg)
 		json_object_object_add(json, vni_str, json_vni);
 }
 
+/* 【函数】show_vni_routes_all_hash —— VNI 哈希遍历回调：对一个 VNI **两张表都打**：
+ *   先 show_vni_routes(mac_table=false) 打 IP 表，再打 MAC 表(mac_table=true)。
+ * JSON 时把 MAC 表挂在 json_vni 下的 "macTable"。用于不带 mac_table 限定的
+ * “show … route vni <n>” 概览。 */
 static void show_vni_routes_all_hash(struct hash_bucket *bucket, void *arg)
 {
 	struct bgpevpn *vpn = (struct bgpevpn *)bucket->data;
@@ -1006,6 +1148,11 @@ static void show_vni_routes_all_hash(struct hash_bucket *bucket, void *arg)
 		json_object_object_add(json_vni, "macTable", json_vni_mac);
 }
 
+/* 【函数】show_l3vni_entry —— 打印**一行** L3 VNI 摘要（用于 `show bgp l2vpn evpn vni`
+ * 的表格视图）。bgp->l3vni 为 0 直接返回（该 bgp 不是 L3 VNI）。
+ *   文本模式一行列：in-kernel 标记(*)、VNI、类型(L3)、RD、import RT、export RT、
+ *   站点 MAC、租户 VRF 名；多 RT 时只显示第一个并加 “, ...”。
+ *   JSON 模式组装成结构化对象，键为 VNI 号字符串。 */
 static void show_l3vni_entry(struct vty *vty, struct bgp *bgp,
 			     json_object *json)
 {
@@ -1143,6 +1290,10 @@ static void show_l3vni_entry(struct vty *vty, struct bgp *bgp,
 		vty_out(vty, "\n");
 }
 
+/* 【函数】show_vni_entry —— VNI 哈希遍历回调：打印**一行** L2 VNI 摘要（对应
+ * `show bgp l2vpn evpn vni` 表格）。文本一行列：in-kernel 标记(*)、VNI、类型(L2)、
+ * RD、import RT、export RT、站点 MAC、租户 VRF 名；多 RT 时只显示第一个并加 “, ...”。
+ * JSON 组装为结构化对象。args[0]=vty，args[1]=json。 */
 static void show_vni_entry(struct hash_bucket *bucket, void *args[])
 {
 	struct vty *vty;
@@ -1297,6 +1448,18 @@ static void show_vni_entry(struct hash_bucket *bucket, void *args[])
 		vty_out(vty, "\n");
 }
 
+/* 【函数】bgp_show_ethernet_vpn —— `show bgp l2vpn evpn ...` 的**总引擎**。
+ * 在 EVPN 地址族(bgp->rib[AFI_L2VPN][SAFI_EVPN])下遍历“RD 分组 → 前缀 → 路径”。
+ *   prd       : 只显示该 RD（NULL 表示全部 RD）。
+ *   type      : bgp_show_type_* 过滤类型（邻居 / 团体 / 扩展团体 / 大团体 等），
+ *               决定用哪套 attr 做匹配（output_arg 是匹配目标）。
+ *   option    : SHOW_DISPLAY_STANDARD / TAGS / OVERLAY，选择打印格式
+ *               （route_vty_out / route_vty_out_tag / route_vty_out_overlay）。
+ *   use_json  : JSON 或文本。
+ *   逐 RD 打印表头(bgp_evpn_show_route_rd_header)、必要时打印整体表头
+ *   (bgp_evpn_show_route_header 或 TAG/OVERLAY 头)。末尾统计并输出
+ *   output_count / total_count；无 bgp 实例时文本提示或输出 "{}"。
+ * 多个 show 子命令（含 rd / tags / neighbors 变体）复用本函数。 */
 static int bgp_show_ethernet_vpn(struct vty *vty, struct prefix_rd *prd,
 				 enum bgp_show_type type, void *output_arg,
 				 int option, bool use_json)
@@ -1521,6 +1684,10 @@ static int bgp_show_ethernet_vpn(struct vty *vty, struct prefix_rd *prd,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】show [ip] bgp l2vpn evpn [json]
+ * 语法：显示整个 EVPN 地址族的全部路由（标准显示）。可选 [json] 输出 JSON。
+ * 行为：调用 bgp_show_ethernet_vpn(prd=NULL, normal, STANDARD)。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 DEFUN(show_ip_bgp_l2vpn_evpn,
       show_ip_bgp_l2vpn_evpn_cmd,
       "show [ip] bgp l2vpn evpn [json]",
@@ -1531,6 +1698,11 @@ DEFUN(show_ip_bgp_l2vpn_evpn,
 				     use_json(argc, argv));
 }
 
+/* 【命令】show [ip] bgp l2vpn evpn rd <RD|all> [json]
+ * 语法：显示指定 RD（或 all）下的 EVPN 路由。
+ * 行为：all 走 prd=NULL 全量；否则 str2prefix_rd 解析 RD 字符串，失败报
+ *   "%% Malformed Route Distinguisher"。再调 bgp_show_ethernet_vpn(STANDARD)。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 DEFUN(show_ip_bgp_l2vpn_evpn_rd,
       show_ip_bgp_l2vpn_evpn_rd_cmd,
       "show [ip] bgp l2vpn evpn rd <ASN:NN_OR_IP-ADDRESS:NN|all> [json]",
@@ -1565,6 +1737,11 @@ DEFUN(show_ip_bgp_l2vpn_evpn_rd,
 				     use_json(argc, argv));
 }
 
+/* 【命令】show [ip] bgp l2vpn evpn all tags
+ * 语法：显示全部 EVPN 前缀的 BGP 标签（tag 视角）。
+ * 行为：bgp_show_ethernet_vpn(prd=NULL, normal, SHOW_DISPLAY_TAGS)，内部走
+ *   route_vty_out_tag 打印标签列。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 DEFUN(show_ip_bgp_l2vpn_evpn_all_tags,
       show_ip_bgp_l2vpn_evpn_all_tags_cmd,
       "show [ip] bgp l2vpn evpn all tags",
@@ -1580,6 +1757,10 @@ DEFUN(show_ip_bgp_l2vpn_evpn_all_tags,
 				     SHOW_DISPLAY_TAGS, 0);
 }
 
+/* 【命令】show [ip] bgp l2vpn evpn rd <RD|all> tags
+ * 语法：显示指定 RD 下 EVPN 前缀的 BGP 标签。
+ * 行为：all → 全量；否则解析 RD；均以 SHOW_DISPLAY_TAGS 调用 bgp_show_ethernet_vpn。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 DEFUN(show_ip_bgp_l2vpn_evpn_rd_tags,
       show_ip_bgp_l2vpn_evpn_rd_tags_cmd,
       "show [ip] bgp l2vpn evpn rd <ASN:NN_OR_IP-ADDRESS:NN|all> tags",
@@ -1612,6 +1793,12 @@ DEFUN(show_ip_bgp_l2vpn_evpn_rd_tags,
 				     SHOW_DISPLAY_TAGS, 0);
 }
 
+/* 【命令】show [ip] bgp l2vpn evpn neighbors <addr|WORD> routes [json]
+ * 语法：显示从指定邻居学到的 EVPN 路由。
+ * 行为：先 bgp_vty_find_and_parse_afi_safi_bgp 定位 bgp 实例，再 peer_lookup_in_view
+ *   找邻居；邻居不存在或未启用 L2VPN/EVPN 地址族则报错（JSON 时给出 warning 对象）。
+ *   成功则以 bgp_show_type_neighbor 调 bgp_show_ethernet_vpn（output_arg=peer）。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 DEFUN(show_ip_bgp_l2vpn_evpn_neighbor_routes,
       show_ip_bgp_l2vpn_evpn_neighbor_routes_cmd,
       "show [ip] bgp l2vpn evpn neighbors <A.B.C.D|X:X::X:X|WORD> routes [json]",
@@ -1679,6 +1866,11 @@ DEFUN(show_ip_bgp_l2vpn_evpn_neighbor_routes,
 				     SHOW_DISPLAY_STANDARD, uj);
 }
 
+/* 【命令】show [ip] bgp l2vpn evpn rd <RD|all> neighbors <addr|WORD> routes [json]
+ * 语法：显示指定 RD 下、从指定邻居学到的 EVPN 路由。
+ * 行为：定位 bgp 与 peer（同前），all → prd=0，否则解析 RD；以
+ *   bgp_show_type_neighbor 调 bgp_show_ethernet_vpn。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 DEFUN(show_ip_bgp_l2vpn_evpn_rd_neighbor_routes,
       show_ip_bgp_l2vpn_evpn_rd_neighbor_routes_cmd,
       "show [ip] bgp l2vpn evpn rd <ASN:NN_OR_IP-ADDRESS:NN|all> neighbors <A.B.C.D|X:X::X:X|WORD> routes [json]",
@@ -1779,6 +1971,11 @@ DEFUN(show_ip_bgp_l2vpn_evpn_rd_neighbor_routes,
 					     peer, SHOW_DISPLAY_STANDARD, uj);
 }
 
+/* 【命令】show [ip] bgp l2vpn evpn neighbors <addr|WORD> advertised-routes [json]
+ * 语法：显示**本机通告给**指定邻居的 EVPN 路由。
+ * 行为：定位 bgp/peer 后调用 show_adj_route_vpn(vty, peer, NULL, AFI_L2VPN, SAFI_EVPN, uj)。
+ *   uj 时 argc--（去掉 json 关键字，因为 show_adj_route_vpn 自己解析）。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 DEFUN(show_ip_bgp_l2vpn_evpn_neighbor_advertised_routes,
       show_ip_bgp_l2vpn_evpn_neighbor_advertised_routes_cmd,
       "show [ip] bgp l2vpn evpn neighbors <A.B.C.D|X:X::X:X|WORD> advertised-routes [json]",
@@ -1848,6 +2045,10 @@ DEFUN(show_ip_bgp_l2vpn_evpn_neighbor_advertised_routes,
 	return show_adj_route_vpn(vty, peer, NULL, AFI_L2VPN, SAFI_EVPN, uj);
 }
 
+/* 【命令】show [ip] bgp l2vpn evpn rd <RD|all> neighbors <addr|WORD> advertised-routes [json]
+ * 语法：显示本机通告给指定邻居、且属于指定 RD（或 all）的 EVPN 路由。
+ * 行为：定位 bgp/peer；all → show_adj_route_vpn(prd=NULL)，否则解析 RD 再调用。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 DEFUN(show_ip_bgp_l2vpn_evpn_rd_neighbor_advertised_routes,
       show_ip_bgp_l2vpn_evpn_rd_neighbor_advertised_routes_cmd,
       "show [ip] bgp l2vpn evpn rd <ASN:NN_OR_IP-ADDRESS:NN|all> neighbors <A.B.C.D|X:X::X:X|WORD> advertised-routes [json]",
@@ -1951,6 +2152,10 @@ DEFUN(show_ip_bgp_l2vpn_evpn_rd_neighbor_advertised_routes,
 	return show_adj_route_vpn(vty, peer, &prd, AFI_L2VPN, SAFI_EVPN, uj);
 }
 
+/* 【命令】show [ip] bgp l2vpn evpn all overlay [json]
+ * 语法：以“叠加层(overlay)信息”视角显示全部 EVPN 前缀（额外列如 L3VNI 等）。
+ * 行为：bgp_show_ethernet_vpn(prd=NULL, normal, SHOW_DISPLAY_OVERLAY)。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 DEFUN(show_ip_bgp_l2vpn_evpn_all_overlay,
       show_ip_bgp_l2vpn_evpn_all_overlay_cmd,
       "show [ip] bgp l2vpn evpn all overlay [json]",
@@ -1968,6 +2173,10 @@ DEFUN(show_ip_bgp_l2vpn_evpn_all_overlay,
 				     use_json(argc, argv));
 }
 
+/* 【命令】show [ip] bgp l2vpn evpn rd <RD|all> overlay
+ * 语法：以叠加层(overlay)视角显示指定 RD 下的 EVPN 前缀。
+ * 行为：all → 全量；否则解析 RD；均以 SHOW_DISPLAY_OVERLAY 调 bgp_show_ethernet_vpn。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 DEFUN(show_ip_bgp_evpn_rd_overlay,
       show_ip_bgp_evpn_rd_overlay_cmd,
       "show [ip] bgp l2vpn evpn rd <ASN:NN_OR_IP-ADDRESS:NN|all> overlay",
@@ -2002,6 +2211,12 @@ DEFUN(show_ip_bgp_evpn_rd_overlay,
 				     use_json(argc, argv));
 }
 
+/* 【命令】show bgp l2vpn evpn rt RT [exact-match] [json]
+ * 语法：显示匹配指定 route-target 的 EVPN 路由。
+ * 行为：把 RT 字符串转成 ecommunity；exact-match 时用“精确匹配”类型
+ *   (bgp_show_type_extcommunity_exact)，否则用包含匹配；以该 ecom 为 output_arg
+ *   调 bgp_show_ethernet_vpn 过滤。失败报 "%% Malformed Route Target list"。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 DEFUN(show_bgp_l2vpn_evpn_rt,
       show_bgp_l2vpn_evpn_rt_cmd,
       "show bgp l2vpn evpn rt RT [exact-match] [json]",
@@ -2040,6 +2255,12 @@ DEFUN(show_bgp_l2vpn_evpn_rt,
 }
 
 
+/* 【命令】show bgp l2vpn evpn <community AA:NN | large-community AA:BB:CC> [exact-match] [json]
+ * 语法：显示匹配标准团体或大团体的 EVPN 路由。
+ * 行为：大团体走 lcommunity 解析+匹配（bgp_show_type_lcommunity / _exact），
+ *   标准团体走 community 解析+匹配（bgp_show_type_community / _exact）；
+ *   以对应 com/lcom 为 output_arg 调 bgp_show_ethernet_vpn，随后释放。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 DEFUN(show_bgp_l2vpn_evpn_com,
       show_bgp_l2vpn_evpn_com_cmd,
       "show bgp l2vpn evpn \
@@ -2105,6 +2326,11 @@ DEFUN(show_bgp_l2vpn_evpn_com,
 	return ret;
 }
 
+/* 【命令】network <prefix> rd <RD> ethtag <v> label <v> esi <v> gwip <ip> routermac <mac> [route-map RM]
+ * 语法：手工注入一条 EVPN type-5（IP 前缀）静态路由，主要用于**测试**。
+ * 行为：解析各字段索引后调用 bgp_static_set(...BGP_EVPN_IP_PREFIX_ROUTE...)，
+ *   把该 RT-5 前缀作为本地静态的 EVPN 路由（按给定 RD/ESI/gwip/routermac 组装）。
+ * 改配置结构：向 EVPN 静态路由表加入一条 type-5；触发 apply/重建：是（会触发路由通告）。 */
 /* For testing purpose, static route of EVPN RT-5. */
 DEFUN(evpnrt5_network,
       evpnrt5_network_cmd,
@@ -2144,6 +2370,10 @@ DEFUN(evpnrt5_network,
 			      argv[idx_ethtag]->arg, argv[idx_routermac]->arg);
 }
 
+/* 【命令】no network <prefix> rd <RD> ethtag <v> label <v> esi <v> gwip <ip>
+ * 语法：删除上面 network 命令注入的 EVPN type-5 静态路由。
+ * 行为：以 set=false 调 bgp_static_set(...BGP_EVPN_IP_PREFIX_ROUTE...) 删除对应条目。
+ * 改配置结构：从 EVPN 静态路由表删除一条 type-5；触发 apply/重建：是（撤销通告）。 */
 /* For testing purpose, static route of EVPN RT-5. */
 DEFUN(no_evpnrt5_network,
       no_evpnrt5_network_cmd,
@@ -2176,16 +2406,30 @@ DEFUN(no_evpnrt5_network,
 			      argv[idx_gwip]->arg, argv[idx_ethtag]->arg, NULL);
 }
 
+/* 【函数】evpn_import_rt_delete_auto —— 删除该 VNI 自动生成的 import RT
+ * （调用 evpn_rt_delete_auto(bgp, vni, vpn->import_rtl, false)）。
+ * 一般在用户显式配置了 import RT 后调用，以避免“自动 RT”与“手工 RT”并存。 */
 static void evpn_import_rt_delete_auto(struct bgp *bgp, struct bgpevpn *vpn)
 {
 	evpn_rt_delete_auto(bgp, vpn->vni, vpn->import_rtl, false);
 }
 
+/* 【函数】evpn_export_rt_delete_auto —— 删除该 VNI 自动生成的 export RT
+ * （调用 evpn_rt_delete_auto(bgp, vni, vpn->export_rtl, false)）。 */
 static void evpn_export_rt_delete_auto(struct bgp *bgp, struct bgpevpn *vpn)
 {
 	evpn_rt_delete_auto(bgp, vpn->vni, vpn->export_rtl, false);
 }
 
+/* 【函数】evpn_configure_import_rt —— 为一个 VNI 增加一条 import RT（VTY 处理内核）。
+ * 调用方需自行确认“这确实是一次变更”。顺序很关键：
+ *   1) 若 VNI 是 live（已在 kernel），先 bgp_evpn_uninstall_routes 卸载旧 RT 命中的路由；
+ *   2) bgp_evpn_unmap_vni_from_its_rts 解除 RT↔VNI 映射；
+ *   3) evpn_import_rt_delete_auto 去掉自动 RT；
+ *   4) 把新 RT 加入 vpn->import_rtl，置 VNI_FLAG_IMPRT_CFGD 标记，
+ *      bgp_evpn_map_vni_to_its_rts 重建映射；
+ *   5) 若 live，bgp_evpn_install_routes 按新 RT 重新安装路由。
+ * 即：改 import RT 会**先卸后装**已有路由。 */
 /*
  * Configure the Import RTs for a VNI (vty handler). Caller expected to
  * check that this is a change.
@@ -2217,6 +2461,10 @@ static void evpn_configure_import_rt(struct bgp *bgp, struct bgpevpn *vpn,
 		bgp_evpn_install_routes(bgp, vpn);
 }
 
+/* 【函数】evpn_unconfigure_import_rt —— 为一个 VNI 删除 import RT（VTY 处理内核）。
+ * 与 configure 对称：先 uninstall 已有路由、解除 RT↔VNI 映射；
+ *   ecomdel==NULL 表示删除全部 import RT；否则按 ecommunity 比较精确删除单条。
+ * 删除后通常回退到“自动 RT”（由调用方随后重建），并重建映射 / 重装路由。 */
 /*
  * Unconfigure Import RT(s) for a VNI (vty handler).
  */
@@ -2274,6 +2522,11 @@ static void evpn_unconfigure_import_rt(struct bgp *bgp, struct bgpevpn *vpn,
 		bgp_evpn_install_routes(bgp, vpn);
 }
 
+/* 【函数】evpn_configure_export_rt —— 为 VNI 配置/替换 export RT（VTY 处理内核）。
+ * 注意：每个 VNI **只允许一条** export RT，故配置语义是“替换”：
+ *   先去自动 RT(evpn_export_rt_delete_auto)，把新 RT 加入 vpn->export_rtl，
+ *   置 VNI_FLAG_EXPRT_CFGD；若 VNI live，bgp_evpn_handle_export_rt_change
+ *   触发用新 export RT 重新通告本 VNI 的路由。 */
 /*
  * Configure the Export RT for a VNI (vty handler). Caller expected to
  * check that this is a change. Note that only a single export RT is
@@ -2293,6 +2546,10 @@ static void evpn_configure_export_rt(struct bgp *bgp, struct bgpevpn *vpn,
 		bgp_evpn_handle_export_rt_change(bgp, vpn);
 }
 
+/* 【函数】evpn_unconfigure_export_rt —— 删除 VNI 的 export RT（VTY 处理内核）。
+ *   ecomdel==NULL 删除全部；否则 ecommunity_match 精确删除一条。
+ *   若删空则清 VNI_FLAG_EXPRT_CFGD 并回退到自动 export RT(bgp_evpn_derive_auto_rt_export)；
+ *   若 VNI live，触发 bgp_evpn_handle_export_rt_change 重新通告。 */
 /*
  * Unconfigure the Export RT for a VNI (vty handler)
  */
@@ -2337,6 +2594,10 @@ static void evpn_unconfigure_export_rt(struct bgp *bgp, struct bgpevpn *vpn,
 		bgp_evpn_handle_export_rt_change(bgp, vpn);
 }
 
+/* 【函数】evpn_configure_vrf_rd —— 为某个 **VRF（L3VNI）** 配置/替换 RD。
+ *   先 bgp_evpn_handle_vrf_rd_change(bgp_vrf, 1)：撤下用旧 RD 通告的所有 type-5；
+ *   更新 vrf_prd / vrf_prd_pretty，置 BGP_VRF_RD_CFGD；
+ *   再 bgp_evpn_handle_vrf_rd_change(bgp_vrf, 0)：用新 RD 重新通告 type-5。 */
 /*
  * Configure RD for VRF
  */
@@ -2362,6 +2623,10 @@ static void evpn_configure_vrf_rd(struct bgp *bgp_vrf, struct prefix_rd *rd,
 	bgp_evpn_handle_vrf_rd_change(bgp_vrf, 0);
 }
 
+/* 【函数】evpn_unconfigure_vrf_rd —— 取消 VRF 的手工 RD，回退到自动 RD。
+ *   先撤下旧 RD 通告的 type-5(bgp_evpn_handle_vrf_rd_change(bgp_vrf,1))；
+ *   清 BGP_VRF_RD_CFGD，bgp_evpn_derive_auto_rd_for_vrf 重算自动 RD，释放 pretty；
+ *   再用新 RD 重新通告(bgp_evpn_handle_vrf_rd_change(bgp_vrf,0))。 */
 /*
  * Unconfigure RD for VRF
  */
@@ -2383,6 +2648,10 @@ static void evpn_unconfigure_vrf_rd(struct bgp *bgp_vrf)
 	bgp_evpn_handle_vrf_rd_change(bgp_vrf, 0);
 }
 
+/* 【函数】evpn_configure_rd —— 为 **L2 VNI** 配置/替换 RD（VTY 处理内核）。
+ *   若 VNI live，先 bgp_evpn_handle_rd_change(bgp, vpn, 1) 撤下用旧 RD 的通告；
+ *   更新 vpn->prd / prd_pretty，置 VNI_FLAG_RD_CFGD；
+ *   再 bgp_evpn_handle_rd_change(bgp, vpn, 0) 用新 RD 重新通告本 VNI 路由。 */
 /*
  * Configure RD for a VNI (vty handler)
  */
@@ -2407,6 +2676,8 @@ static void evpn_configure_rd(struct bgp *bgp, struct bgpevpn *vpn,
 		bgp_evpn_handle_rd_change(bgp, vpn, 0);
 }
 
+/* 【函数】evpn_unconfigure_rd —— 取消 L2 VNI 的手工 RD，回退到自动 RD。
+ *   若 live 先撤旧通告；bgp_evpn_derive_auto_rd 重算自动 RD；若 live 再重新通告。 */
 /*
  * Unconfigure RD for a VNI (vty handler)
  */
@@ -2426,6 +2697,10 @@ static void evpn_unconfigure_rd(struct bgp *bgp, struct bgpevpn *vpn)
 		bgp_evpn_handle_rd_change(bgp, vpn, 0);
 }
 
+/* 【函数】evpn_create_update_vni —— 若 L2 VNI 不存在则创建，并标记“用户已配置”。
+ *   先 bgp_evpn_lookup_vni 查：不存在时若该 VNI 号已被配置为 L3VNI 则报错返回 NULL，
+ *   否则以本地 router-id 作为 originator、INADDR_ANY 组播组新建(bgp_evpn_new)。
+ *   最后置 VNI_FLAG_CFGD 表示“这是用户显式配置的 VNI”（区别于仅学习到的 VNI）。 */
 /*
  * Create VNI, if not already present (VTY handler). Mark as configured.
  */
@@ -2459,6 +2734,12 @@ static struct bgpevpn *evpn_create_update_vni(struct bgp *bgp, vni_t vni)
 	return vpn;
 }
 
+/* 【函数】evpn_delete_vni —— 删除一个 L2 VNI 的“用户配置”。
+ *   若 VNI 不 live（尚未在 kernel，只是配置），直接 bgp_evpn_free 释放；
+ *   否则清 VNI_FLAG_CFGD，并逐一回退已配置的参数：
+ *     RD(is_rd_configured)、export RT、import RT —— 各走对应的 unconfigure，
+ *     从而恢复到自动值；VNI 本身继续存在（作为“学习到的”实体）。
+ * 注释提醒：这里对每个参数都按需做 unconfigure，未做优化（因为该操作很少见）。 */
 /*
  * Delete VNI. If VNI does not exist in the system (i.e., just
  * configuration), all that is needed is to free it. Otherwise,
@@ -2490,6 +2771,9 @@ static void evpn_delete_vni(struct bgp *bgp, struct bgpevpn *vpn)
 		evpn_unconfigure_import_rt(bgp, vpn, NULL);
 }
 
+/* 【函数】evpn_show_vrf_import_rts —— 遍历 EVPN 实例的“VRF 导入 RT 哈希表”
+ * (bgp_evpn->vrf_import_rt_hash)，逐条调用 show_vrf_import_rt_entry 打印
+ * “哪些 VRF 导入了哪些 RT”。args[0]=vty，args[1]=json。 */
 /*
  * Display import RT mapping to VRFs (vty handler)
  * bgp_evpn: evpn bgp instance
@@ -2508,6 +2792,8 @@ static void evpn_show_vrf_import_rts(struct vty *vty, struct bgp *bgp_evpn,
 		     args);
 }
 
+/* 【函数】evpn_show_import_rts —— 遍历 bgp 的“VNI 导入 RT 哈希表”(bgp->import_rt_hash)，
+ * 逐条调用 show_import_rt_entry 打印“哪些 VNI 导入了哪些 RT”。 */
 /*
  * Display import RT mapping to VNIs (vty handler)
  */
@@ -2525,6 +2811,9 @@ static void evpn_show_import_rts(struct vty *vty, struct bgp *bgp,
 		args);
 }
 
+/* 【函数】evpn_show_routes_vni_all —— 打印**所有 VNI** 的 EVPN 路由（可按类型/表/VTEP 过滤）。
+ *   填好 vni_walk_ctx（含把 sockunion 形式的 vtep_ip 转成 struct ipaddr），
+ *   再 hash_iterate(bgp->vnihash, show_vni_routes_hash)。无 VNI 时直接返回。 */
 /*
  * Display EVPN routes for all VNIs - vty handler.
  */
@@ -2560,6 +2849,8 @@ static void evpn_show_routes_vni_all(struct vty *vty, struct bgp *bgp, int type,
 		     &wctx);
 }
 
+/* 【函数】evpn_show_routes_vni_all_type_all —— 打印所有 VNI、所有类型的 EVPN 路由
+ * （IP 表与 MAC 表都打）。用 show_vni_routes_all_hash 作遍历回调。 */
 /*
  * Display EVPN routes for all VNIs & all types - vty handler.
  */
@@ -2595,6 +2886,12 @@ static void evpn_show_routes_vni_all_type_all(struct vty *vty, struct bgp *bgp,
 		     &wctx);
 }
 
+/* 【函数】evpn_show_route_vni_multicast —— 打印指定 VNI 下**一条 type-3 路由**
+ * （含组播/IMET 路由，由 originator IP 标识）。用于 show ... vni <n> route type-3
+ * 的精确查询。
+ *   定位 VNI(bgp_evpn_lookup_vni)，用 build_evpn_type3_prefix 构造前缀查表；
+ *   命中后打印明细头 + 每条路径的明细(route_vty_out_detail)。未命中报
+ *   "%% Network not in table"。用毕 unlock dest。 */
 /*
  * Display EVPN routes for a VNI -- for specific type-3 route (vty handler).
  */
@@ -2670,6 +2967,12 @@ static void evpn_show_route_vni_multicast(struct vty *vty, struct bgp *bgp,
 	bgp_dest_unlock_node(dest);
 }
 
+/* 【函数】evpn_show_route_vni_macip —— 打印指定 VNI 下**一条 type-2（MAC/IP）路由**。
+ * 由于 MAC 是“按路径”存储的，这里需要在路径链表里按 MAC 匹配：
+ *   build_evpn_type2_prefix 构造前缀查表；若同时给了 mac 和 ip，则先在该前缀的
+ *   路径里找 MAC 匹配的路径，找不到报 “%% Network not in table”。
+ *   打印明细前，对 VNI 本地 MAC-IP 前缀做“全局补全”(evpn_type2_prefix_global_copy)，
+ *   再逐路径打印明细。用毕 unlock。 */
 /*
  * Display EVPN routes for a VNI -- for specific MAC and/or IP (vty handler).
  * By definition, only matching type-2 route will be displayed.
@@ -2798,6 +3101,8 @@ static void evpn_show_route_vni_macip(struct vty *vty, struct bgp *bgp,
 	bgp_dest_unlock_node(dest);
 }
 
+/* 【函数】evpn_show_routes_esi —— 按 ESI 查找 ES(bgp_evpn_es_find)，找到则调用
+ * show_esi_routes 打印该 ES 的路由表；找不到报 "ESI not found"。 */
 /* Disaplay EVPN routes for a ESI - VTY handler */
 static void evpn_show_routes_esi(struct vty *vty, struct bgp *bgp,
 				 esi_t *esi, json_object *json)
@@ -2815,6 +3120,10 @@ static void evpn_show_routes_esi(struct vty *vty, struct bgp *bgp,
 	show_esi_routes(bgp, es, vty, json);
 }
 
+/* 【函数】evpn_show_routes_vni —— 按 VNI 打印路由（show ... vni <n> route 的处理）。
+ *   定位 VNI；把可选的 sockunion 形式 VTEP 过滤条件转成 struct ipaddr；
+ *   最终调用 show_vni_routes(bgp, vpn, vty, type, mac_table, &vtep_ip, json, 0)。
+ * type 非 0 只显示该类型；vtep_ip 非空只显示该 VTEP 后面的路由。 */
 /*
  * Display EVPN routes for a VNI - vty handler.
  * If 'type' is non-zero, only routes matching that type are shown.
@@ -2849,6 +3158,11 @@ static void evpn_show_routes_vni(struct vty *vty, struct bgp *bgp, vni_t vni,
 	show_vni_routes(bgp, vpn, vty, type, mac_table, &vtep_ip, json, 0);
 }
 
+/* 【函数】evpn_show_route_rd_macip —— 在**指定 RD 的全局 EVPN 表**里查一条 type-2
+ * （MAC/IP）路由并打印明细。与 evpn_show_route_vni_macip 的区别：这里查的是
+ * bgp->rib[AFI_L2VPN][SAFI_EVPN] 下按 RD 分组的“全局表”，不是 VNI 本地表。
+ *   用 build_evpn_type2_prefix 构造前缀 + bgp_safi_node_lookup(prd) 查表；
+ *   命中打印明细头 + 各路径明细；未命中报 “%% Network not in table”；用毕 unlock。 */
 /*
  * Display BGP EVPN routing table -- for specific RD and MAC and/or
  * IP (vty handler). By definition, only matching type-2 route will be
@@ -2918,6 +3232,11 @@ static void evpn_show_route_rd_macip(struct vty *vty, struct bgp *bgp,
 	bgp_dest_unlock_node(dest);
 }
 
+/* 【函数】evpn_show_route_rd —— 打印**指定 RD** 下的全部 EVPN 路由（可限定 type）。
+ *   bgp_node_lookup 找到该 RD 的二层表(RD→前缀)；遍历其下每个前缀与路径，
+ *   打印明细头 + 各路径明细(route_vty_out_detail)；图例仅文本模式打印一次。
+ *   末尾输出该 RD 下的前缀数/路径数；无则提示 “No prefixes exist with this RD”。
+ * JSON 以 RD 为键组织。 */
 /*
  * Display BGP EVPN routing table -- for specific RD (vty handler)
  * If 'type' is non-zero, only routes matching that type are shown.
@@ -3059,6 +3378,10 @@ static void evpn_show_route_rd(struct vty *vty, struct bgp *bgp,
 	}
 }
 
+/* 【函数】evpn_show_route_rd_all_macip —— 在**所有 RD** 下查找 MAC/IP(type-2)
+ * 匹配的路由。EVPN 表是“RD → 前缀”的两层结构，故此处外层遍历所有 RD，
+ *   内层用 build_evpn_type2_prefix(mac, ip) + bgp_safi_node_lookup(rd) 逐 RD 查表；
+ *   命中则打印该 RD 头 + 前缀明细。用于不带 rd 限定的 `show ... mac/ip`。 */
 /*
  * Display BGP EVPN routing table -- all RDs and MAC and/or IP
  * (vty handler).  Only matching type-2 routes will be displayed.
@@ -3183,6 +3506,12 @@ static void evpn_show_route_rd_all_macip(struct vty *vty, struct bgp *bgp,
 	}
 }
 
+/* 【函数】evpn_show_all_routes —— 打印**整个 EVPN 路由表**（所有 RD）的核心实现。
+ * bgp_evpn_vty.h 里导出的 bgp_evpn_show_all_routes 最终转到此处。
+ *   外层遍历 RD，内层遍历前缀与路径；type 非 0 只显示该类型；
+ *   self_orig=true 时只保留本机自己产生(peer == bgp->peer_self)的路径。
+ *   detail 时走 route_vty_out_detail（含属性明细），否则 route_vty_out（精简行）。
+ *   JSON 模式用 vty_json_no_pretty 逐 RD 拼接（首条不加逗号）。 */
 /*
  * Display BGP EVPN routing table - all routes (vty handler).
  * If 'type' is non-zero, only routes matching that type are shown.
@@ -3374,6 +3703,9 @@ static void evpn_show_all_routes(struct vty *vty, struct bgp *bgp, int type,
 	}
 }
 
+/* 【函数】bgp_evpn_show_all_routes —— 对外导出的“显示全部 EVPN 路由”入口
+ * （声明在 bgp_evpn_vty.h）；JSON 时自行包裹 “{ ... }”，内部交给
+ * evpn_show_all_routes(vty, bgp, type, json, detail, false)。 */
 int bgp_evpn_show_all_routes(struct vty *vty, struct bgp *bgp, int type,
 			     bool use_json, int detail)
 {
@@ -3394,6 +3726,10 @@ int bgp_evpn_show_all_routes(struct vty *vty, struct bgp *bgp, int type,
 	return CMD_SUCCESS;
 }
 
+/* 【函数】evpn_show_vni —— 按 VNI 号显示**单个 VNI 详情**（不分 L2/L3）：
+ *   先按 L2 查(bgp_evpn_lookup_vni)，命中则 display_vni；
+ *   否则遍历所有 bgp 实例找 l3vni == vni 的，命中则 display_l3vni。
+ *   都没找到且非 JSON 时报 "VNI not found"。 */
 /*
  * Display specified VNI (vty handler)
  */
@@ -3425,6 +3761,10 @@ static void evpn_show_vni(struct vty *vty, struct bgp *bgp, vni_t vni,
 	}
 }
 
+/* 【函数】evpn_show_all_vnis —— 显示**所有 VNI 的一行摘要表**（L2 + L3）。
+ *   文本模式先打印表头（Flags / VNI / Type / RD / Import RT / Export RT /
+ *   MAC-VRF Site-of-Origin / Tenant VRF）；然后 hash_iterate(bgp->vnihash,
+ *   show_vni_entry) 打 L2，再遍历所有 bgp 实例用 show_l3vni_entry 打 L3。 */
 /*
  * Display a VNI (upon user query).
  */
@@ -3455,6 +3795,11 @@ static void evpn_show_all_vnis(struct vty *vty, struct bgp *bgp,
 		show_l3vni_entry(vty, bgp_temp, json);
 }
 
+/* 【函数】evpn_set_advertise_svi_macip —— 开启/关闭“通告 SVI 的 MAC-IP”。
+ *   vpn==NULL 时设全局开关 bgp->evpn_info->advertise_svi_macip（id 传 0）；
+ *   否则设该 VNI 的 vpn->advertise_svi_macip（带 vpn->vni）。
+ *   值未变化则直接返回（避免重复下发）。改完调 bgp_zebra_advertise_svi_macip
+ *   通知 zebra。 */
 /*
  * evpn - enable advertisement of svi MAC-IP
  */
@@ -3482,6 +3827,9 @@ static void evpn_set_advertise_svi_macip(struct bgp *bgp, struct bgpevpn *vpn,
 	}
 }
 
+/* 【函数】evpn_set_advertise_default_gw —— 开启“通告默认网关的 MAC-IP”。
+ *   vpn==NULL 设全局 bgp->advertise_gw_macip（id 0）；否则设 vpn->advertise_gw_macip
+ *   （带 vni）。已开启则返回。改完调 bgp_zebra_advertise_gw_macip 通知 zebra。 */
 /*
  * evpn - enable advertisement of default g/w
  */
@@ -3504,6 +3852,9 @@ static void evpn_set_advertise_default_gw(struct bgp *bgp, struct bgpevpn *vpn)
 	return;
 }
 
+/* 【函数】evpn_unset_advertise_default_gw —— 关闭“通告默认网关的 MAC-IP”。
+ *   与 set 对称：未开启则返回；清对应标志（全局或按 VNI）后调
+ *   bgp_zebra_advertise_gw_macip 通知 zebra。 */
 /*
  * evpn - disable advertisement of default g/w
  */
@@ -3527,6 +3878,11 @@ static void evpn_unset_advertise_default_gw(struct bgp *bgp,
 	return;
 }
 
+/* 【函数】evpn_process_default_originate_cmd —— 处理 VRF 上的 default-originate
+ * （按 afi 即 ipv4/ipv6 区分）。add=true 时置对应
+ * BGP_L2VPN_EVPN_DEFAULT_ORIGINATE_IPV4 / _IPV6 标志；add=false 时清除。
+ * 若已处于目标状态则提前返回。最后若 L3VNI live，调
+ * bgp_evpn_install_uninstall_default_route 实际安装/撤销默认路由。 */
 /*
  * evpn - enable advertisement of default g/w
  */
@@ -3562,6 +3918,9 @@ static void evpn_process_default_originate_cmd(struct bgp *bgp_vrf,
 		bgp_evpn_install_uninstall_default_route(bgp_vrf, afi, safi, NULL, add);
 }
 
+/* 【函数】evpn_set_advertise_subnet —— 开启该 VNI 的 subnet 通告
+ * （vpn->advertise_subnet=1），并调 bgp_zebra_advertise_subnet 通知 zebra
+ * （id 带 vpn->vni）。已开启则返回。 */
 /*
  * evpn - enable advertisement of default g/w
  */
@@ -3575,6 +3934,9 @@ static void evpn_set_advertise_subnet(struct bgp *bgp,
 	bgp_zebra_advertise_subnet(bgp, vpn->advertise_subnet, vpn->vni);
 }
 
+/* 【函数】evpn_unset_advertise_subnet —— 关闭该 VNI 的 subnet 通告
+ * （vpn->advertise_subnet=0），并调 bgp_zebra_advertise_subnet 通知 zebra。
+ * 未开启则返回。 */
 /*
  * evpn - disable advertisement of default g/w
  */
@@ -3587,6 +3949,9 @@ static void evpn_unset_advertise_subnet(struct bgp *bgp, struct bgpevpn *vpn)
 	bgp_zebra_advertise_subnet(bgp, vpn->advertise_subnet, vpn->vni);
 }
 
+/* 【函数】evpn_set_advertise_all_vni —— 开启“通告所有本地 VNI”（EVPN 总开关）。
+ *   置 bgp->advertise_all_vni=1，bgp_set_evpn 登记本实例为 EVPN 实例，
+ *   再 bgp_zebra_advertise_all_vni 通知 zebra 开始上报本地 VNI。 */
 /*
  * EVPN (VNI advertisement) enabled. Register with zebra.
  */
@@ -3597,6 +3962,10 @@ static void evpn_set_advertise_all_vni(struct bgp *bgp)
 	bgp_zebra_advertise_all_vni(bgp, bgp->advertise_all_vni);
 }
 
+/* 【函数】evpn_unset_advertise_all_vni —— 关闭“通告所有本地 VNI”。
+ *   置 bgp->advertise_all_vni=0，把 EVPN 实例切回 default(bgp_set_evpn(bgp_get_default()))，
+ *   通知 zebra 停报，并 bgp_evpn_cleanup_on_disable 清理 VNI 缓存与 EVPN 路由
+ *   （删除并向对端撤销）。 */
 /*
  * EVPN (VNI advertisement) disabled. De-register with zebra. Cleanup VNI
  * cache, EVPN routes (delete and withdraw from peers).
@@ -3609,6 +3978,10 @@ static void evpn_unset_advertise_all_vni(struct bgp *bgp)
 	bgp_evpn_cleanup_on_disable(bgp);
 }
 
+/* 【函数】bgp_evpn_set_unset_resolve_overlay_index —— 设置/清除
+ * bgp->resolve_overlay_index（是否解析叠加层索引以确定下一跳）。
+ *   值未变化则返回；set 时置位并对每个 VNI 调
+ *   bgp_evpn_handle_resolve_overlay_index_set，否则先对每个 VNI 调 _unset 再清位。 */
 /* Set resolve overlay index flag */
 static void bgp_evpn_set_unset_resolve_overlay_index(struct bgp *bgp, bool set)
 {
@@ -3631,6 +4004,9 @@ static void bgp_evpn_set_unset_resolve_overlay_index(struct bgp *bgp, bool set)
 	}
 }
 
+/* 【函数】evpn_set_advertise_autort_rfc8365 —— 置 bgp->advertise_autort_rfc8365=1
+ * （按 RFC8365 自动派生 RT），随后 bgp_evpn_handle_autort_change 让所有 VNI
+ * 按新规则重算自动 RT。 */
 /*
  * EVPN - use RFC8365 to auto-derive RT
  */
@@ -3640,6 +4016,8 @@ static void evpn_set_advertise_autort_rfc8365(struct bgp *bgp)
 	bgp_evpn_handle_autort_change(bgp);
 }
 
+/* 【函数】evpn_unset_advertise_autort_rfc8365 —— 清 bgp->advertise_autort_rfc8365=0
+ * （不按 RFC8365 派生 RT），随后 bgp_evpn_handle_autort_change 让所有 VNI 重算自动 RT。 */
 /*
  * EVPN - don't use RFC8365 to auto-derive RT
  */
@@ -3649,6 +4027,10 @@ static void evpn_unset_advertise_autort_rfc8365(struct bgp *bgp)
 	bgp_evpn_handle_autort_change(bgp);
 }
 
+/* 【函数】write_vni_config —— 把一个 L2 VNI 的用户配置写入 running-config。
+ *   仅当 is_vni_configured(vpn) 时输出 "vni <n>" 块及其子项：rd、flooding 控制、
+ *   route-target import / export、advertise-default-gw / advertise-svi-ip /
+ *   advertise-subnet，最后 "exit-vni"。是 bgp_config_write_evpn_info 的组成部分。 */
 static void write_vni_config(struct vty *vty, struct bgpevpn *vpn)
 {
 	char *ecom_str;
@@ -3705,6 +4087,13 @@ static void write_vni_config(struct vty *vty, struct bgpevpn *vpn)
 
 #include "bgpd/bgp_evpn_vty_clippy.c"
 
+/* 【命令】[no] flooding <disable | head-end-replication>
+ * 语法：设置 EVPN 的 BUM（广播/未知单播/组播）泛洪方式。disable = 不泛洪；
+ *   head-end-replication = 头端复制；no = 恢复为头端复制。
+ * 行为：设 bgp->vxlan_flood_ctrl 为 VXLAN_FLOOD_DISABLED / VXLAN_FLOOD_HEAD_END_REPL，
+ *   值未变则直接成功；变更后 bgp_evpn_flood_control_change(bgp) 触发相应重建。
+ * 改配置结构：bgp->vxlan_flood_ctrl；触发 apply/重建：是。
+ * 注：文件上方 include 了 bgp_evpn_vty_clippy.c（clippy 生成物），供 DEFPY 使用。 */
 DEFPY(bgp_evpn_flood_control,
       bgp_evpn_flood_control_cmd,
       "[no$no] flooding <disable$disable|head-end-replication$her>",
@@ -3735,6 +4124,10 @@ DEFPY(bgp_evpn_flood_control,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】advertise-default-gw（VNI 子模式）
+ * 语法：在 `vni <n>` 上下文里开启“通告默认网关 MAC-IP”。
+ * 行为：VTY_DECLVAR_CONTEXT_SUB 取当前 VNI(vpn)，调 evpn_set_advertise_default_gw(bgp, vpn)。
+ * 改配置结构：vpn->advertise_gw_macip；触发 apply/重建：通知 zebra。 */
 DEFUN (bgp_evpn_advertise_default_gw_vni,
        bgp_evpn_advertise_default_gw_vni_cmd,
        "advertise-default-gw",
@@ -3751,6 +4144,10 @@ DEFUN (bgp_evpn_advertise_default_gw_vni,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】no advertise-default-gw（VNI 子模式）
+ * 语法：在 `vni <n>` 上下文里关闭“通告默认网关 MAC-IP”。
+ * 行为：调 evpn_unset_advertise_default_gw(bgp, vpn)。
+ * 改配置结构：vpn->advertise_gw_macip；触发 apply/重建：通知 zebra。 */
 DEFUN (no_bgp_evpn_advertise_default_vni_gw,
        no_bgp_evpn_advertise_default_gw_vni_cmd,
        "no advertise-default-gw",
@@ -3769,6 +4166,12 @@ DEFUN (no_bgp_evpn_advertise_default_vni_gw,
 }
 
 
+/* 【命令】advertise-default-gw（EVPN 全局模式）
+ * 语法：全局开启“通告所有默认网关 MAC-IP”。
+ * 行为：须在 EVPN VRF 下(EVPN_ENABLED(bgp))，否则提示
+ *   "This command is only supported under the EVPN VRF"；调
+ *   evpn_set_advertise_default_gw(bgp, NULL)。
+ * 改配置结构：bgp->advertise_gw_macip；触发 apply/重建：通知 zebra。 */
 DEFUN (bgp_evpn_advertise_default_gw,
        bgp_evpn_advertise_default_gw_cmd,
        "advertise-default-gw",
@@ -3790,6 +4193,10 @@ DEFUN (bgp_evpn_advertise_default_gw,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】no advertise-default-gw（EVPN 全局模式）
+ * 语法：全局关闭“通告所有默认网关 MAC-IP”。
+ * 行为：调 evpn_unset_advertise_default_gw(bgp, NULL)。
+ * 改配置结构：bgp->advertise_gw_macip；触发 apply/重建：通知 zebra。 */
 DEFUN (no_bgp_evpn_advertise_default_gw,
        no_bgp_evpn_advertise_default_gw_cmd,
        "no advertise-default-gw",
@@ -3806,6 +4213,12 @@ DEFUN (no_bgp_evpn_advertise_default_gw,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】advertise-all-vni
+ * 语法：开启 EVPN 并通告所有本地 VNI（EVPN 功能总开关）。
+ * 行为：若已有别的 EVPN 实例且不是本实例，则提示
+ *   "%% Please unconfigure EVPN in <name>"；否则调 evpn_set_advertise_all_vni(bgp)。
+ * 改配置结构：bgp->advertise_all_vni，并把本实例登记为 EVPN 实例；
+ *   触发 apply/重建：是（向 zebra 注册 VNI 上报）。 */
 DEFUN (bgp_evpn_advertise_all_vni,
        bgp_evpn_advertise_all_vni_cmd,
        "advertise-all-vni",
@@ -3828,6 +4241,11 @@ DEFUN (bgp_evpn_advertise_all_vni,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】no advertise-all-vni
+ * 语法：关闭 EVPN（停止通告所有本地 VNI）。
+ * 行为：调 evpn_unset_advertise_all_vni(bgp)：撤销 EVPN 实例登记、通知 zebra、
+ *   清理 VNI 缓存并删除/撤销 EVPN 路由。
+ * 改配置结构：bgp->advertise_all_vni；触发 apply/重建：是（大量清理）。 */
 DEFUN (no_bgp_evpn_advertise_all_vni,
        no_bgp_evpn_advertise_all_vni_cmd,
        "no advertise-all-vni",
@@ -3842,6 +4260,10 @@ DEFUN (no_bgp_evpn_advertise_all_vni,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】autort rfc8365-compatible
+ * 语法：按 RFC8365 方式自动派生 RT。
+ * 行为：调 evpn_set_advertise_autort_rfc8365(bgp)。
+ * 改配置结构：bgp->advertise_autort_rfc8365；触发 apply/重建：是（所有 VNI 重算自动 RT）。 */
 DEFUN (bgp_evpn_advertise_autort_rfc8365,
        bgp_evpn_advertise_autort_rfc8365_cmd,
        "autort rfc8365-compatible",
@@ -3856,6 +4278,10 @@ DEFUN (bgp_evpn_advertise_autort_rfc8365,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】no autort rfc8365-compatible
+ * 语法：取消 RFC8365 方式的 RT 自动派生（回到默认派生）。
+ * 行为：调 evpn_unset_advertise_autort_rfc8365(bgp)。
+ * 改配置结构：bgp->advertise_autort_rfc8365；触发 apply/重建：是（所有 VNI 重算自动 RT）。 */
 DEFUN (no_bgp_evpn_advertise_autort_rfc8365,
        no_bgp_evpn_advertise_autort_rfc8365_cmd,
        "no autort rfc8365-compatible",
@@ -3871,6 +4297,11 @@ DEFUN (no_bgp_evpn_advertise_autort_rfc8365,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】default-originate <ipv4 | ipv6>
+ * 语法：在 VRF（L3VNI）上通告一条默认路由。
+ * 行为：解析 afi 后调 evpn_process_default_originate_cmd(bgp_vrf, afi, true)。
+ * 改配置结构：BGP_L2VPN_EVPN_DEFAULT_ORIGINATE_IPV4 / _IPV6 标志；
+ *   触发 apply/重建：是（L3VNI live 时安装默认路由）。 */
 DEFUN (bgp_evpn_default_originate,
        bgp_evpn_default_originate_cmd,
        "default-originate <ipv4 | ipv6>",
@@ -3889,6 +4320,11 @@ DEFUN (bgp_evpn_default_originate,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】no default-originate <ipv4 | ipv6>
+ * 语法：撤销 VRF 上的默认路由通告。
+ * 行为：解析 afi 后调 evpn_process_default_originate_cmd(bgp_vrf, afi, false)。
+ * 改配置结构：清 BGP_L2VPN_EVPN_DEFAULT_ORIGINATE_IPV4 / _IPV6 标志；
+ *   触发 apply/重建：是（L3VNI live 时撤销默认路由）。 */
 DEFUN (no_bgp_evpn_default_originate,
        no_bgp_evpn_default_originate_cmd,
        "no default-originate <ipv4 | ipv6>",
@@ -3908,6 +4344,12 @@ DEFUN (no_bgp_evpn_default_originate,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】dup-addr-detection [max-moves (2-1000) time (2-1800)]
+ * 语法：开启 MAC/IP 重复地址检测(DAD)，可选最大移动次数与时间窗口。
+ * 行为：须在 EVPN VRF 下；置 evpn_info->dup_addr_detect=true，并按需设
+ *   dad_time / dad_max_moves（缺省则保持默认）；最后 bgp_zebra_dup_addr_detection
+ *   通知 zebra 生效。
+ * 改配置结构：bgp_vrf->evpn_info 的 DAD 参数；触发 apply/重建：通知 zebra。 */
 DEFPY (dup_addr_detection,
        dup_addr_detection_cmd,
        "dup-addr-detection [max-moves (2-1000)$max_moves_val time (2-1800)$time_val]",
@@ -3940,6 +4382,11 @@ DEFPY (dup_addr_detection,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】dup-addr-detection freeze <permanent | 30-3600>
+ * 语法：配置 DAD 命中后的“冻结”方式：永久冻结，或冻结指定秒数后自动恢复。
+ * 行为：置 dup_addr_detect=true、dad_freeze=true、dad_freeze_time=freeze_time；
+ *   bgp_zebra_dup_addr_detection 通知 zebra。
+ * 改配置结构：bgp_vrf->evpn_info 的 DAD freeze 参数；触发 apply/重建：通知 zebra。 */
 DEFPY (dup_addr_detection_auto_recovery,
        dup_addr_detection_auto_recovery_cmd,
        "dup-addr-detection freeze <permanent |(30-3600)$freeze_time_val>",
@@ -3969,6 +4416,12 @@ DEFPY (dup_addr_detection_auto_recovery,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】no dup-addr-detection [max-moves ... time ... | freeze ...]
+ * 语法：关闭 DAD，或按给定值与当前配置**匹配校验后**回退单项到默认。
+ * 行为：argc==2 时（无参数）整体关闭并全部复位默认；
+ *   否则对给出的 max-moves / time / freeze 项：若与当前配置不一致则报
+ *   "%% Value does not match with config"（返回 SUCCESS 但不改），一致则复位默认。
+ * 改配置结构：bgp_vrf->evpn_info 的 DAD 参数；触发 apply/重建：通知 zebra。 */
 DEFPY (no_dup_addr_detection,
        no_dup_addr_detection_cmd,
        "no dup-addr-detection [max-moves (2-1000)$max_moves_val time (2-1800)$time_val | freeze <permanent$permanent_val | (30-3600)$freeze_time_val>]",
@@ -4050,6 +4503,11 @@ DEFPY (no_dup_addr_detection,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】[no] advertise-svi-ip（EVPN 全局模式）
+ * 语法：全局开启/关闭“通告 SVI 的 MAC-IP”。
+ * 行为：no 时 evpn_set_advertise_svi_macip(bgp, NULL, 0)；
+ *   否则须在 EVPN VRF 下，调 evpn_set_advertise_svi_macip(bgp, NULL, 1)。
+ * 改配置结构：bgp->evpn_info->advertise_svi_macip；触发 apply/重建：通知 zebra。 */
 DEFPY(bgp_evpn_advertise_svi_ip,
       bgp_evpn_advertise_svi_ip_cmd,
       "[no$no] advertise-svi-ip",
@@ -4075,6 +4533,10 @@ DEFPY(bgp_evpn_advertise_svi_ip,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】[no] advertise-svi-ip（VNI 子模式）
+ * 语法：在 `vni <n>` 上下文里开启/关闭“通告 SVI 的 MAC-IP”。
+ * 行为：VTY_DECLVAR_CONTEXT_SUB 取 vpn，调 evpn_set_advertise_svi_macip(bgp, vpn, no?0:1)。
+ * 改配置结构：vpn->advertise_svi_macip；触发 apply/重建：通知 zebra。 */
 DEFPY(bgp_evpn_advertise_svi_ip_vni,
       bgp_evpn_advertise_svi_ip_vni_cmd,
       "[no$no] advertise-svi-ip",
@@ -4095,6 +4557,13 @@ DEFPY(bgp_evpn_advertise_svi_ip_vni,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】mac-vrf soo <ASN:NN | IP:NN>
+ * 语法：配置全局 MAC-VRF Site-of-Origin(SoO) 扩展团体（用于防环）。
+ * 行为：须在 EVPN underlay 实例下配置（否则提示到 EVPN underlay 去配）；
+ *   把 SoO 字符串转成 ecommunity(ECOMMUNITY_SITE_ORIGIN)，失败报
+ *   "%% Malformed SoO extended community"；再 bgp_evpn_handle_global_macvrf_soo_change
+ *   应用（会用到各 VNI 上）。
+ * 改配置结构：EVPN 全局 SoO(ecommunity)；触发 apply/重建：是。 */
 DEFPY(macvrf_soo_global, macvrf_soo_global_cmd,
       "mac-vrf soo ASN:NN_OR_IP-ADDRESS:NN$soo",
       "EVPN MAC-VRF\n"
@@ -4127,6 +4596,10 @@ DEFPY(macvrf_soo_global, macvrf_soo_global_cmd,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】no mac-vrf soo [<SoO>]
+ * 语法：删除全局 MAC-VRF Site-of-Origin。可选带原值（本实现不校验原值）。
+ * 行为：调 bgp_evpn_handle_global_macvrf_soo_change(bgp_evpn, NULL) 清空并应用。
+ * 改配置结构：EVPN 全局 SoO；触发 apply/重建：是。 */
 DEFPY(no_macvrf_soo_global, no_macvrf_soo_global_cmd,
       "no mac-vrf soo [ASN:NN_OR_IP-ADDRESS:NN$soo]",
       NO_STR
@@ -4147,6 +4620,11 @@ DEFPY(no_macvrf_soo_global, no_macvrf_soo_global_cmd,
 	return CMD_SUCCESS;
 }
 
+/* 【命令（隐藏）】advertise-subnet（VNI 子模式）
+ * 语法：通告该 VNI 对应的子网（隐藏命令）。
+ * 行为：VTY_DECLVAR_CONTEXT_SUB 取 vpn，查其租户 VRF(bgp_lookup_by_vrf_id)，
+ *   调 evpn_set_advertise_subnet(bgp, vpn)。
+ * 改配置结构：vpn->advertise_subnet；触发 apply/重建：通知 zebra。 */
 DEFUN_HIDDEN (bgp_evpn_advertise_vni_subnet,
 	      bgp_evpn_advertise_vni_subnet_cmd,
 	      "advertise-subnet",
@@ -4167,6 +4645,10 @@ DEFUN_HIDDEN (bgp_evpn_advertise_vni_subnet,
 	return CMD_SUCCESS;
 }
 
+/* 【命令（隐藏）】no advertise-subnet（VNI 子模式）
+ * 语法：取消该 VNI 的子网通告（隐藏命令）。
+ * 行为：调 evpn_unset_advertise_subnet(bgp, vpn)。
+ * 改配置结构：vpn->advertise_subnet；触发 apply/重建：通知 zebra。 */
 DEFUN_HIDDEN (no_bgp_evpn_advertise_vni_subnet,
 	      no_bgp_evpn_advertise_vni_subnet_cmd,
 	      "no advertise-subnet",
@@ -4183,6 +4665,21 @@ DEFUN_HIDDEN (no_bgp_evpn_advertise_vni_subnet,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】advertise <ipv4|ipv6> unicast [gateway-ip] [route-map RMAP_NAME]
+ * 语法：在 VRF（L3VNI）上把 IPv4/IPv6 单播前缀作为 EVPN **type-5** 通告；
+ *   gateway-ip 表示叠加层索引用网关 IP；route-map 可过滤/改写属性。
+ * 行为（较复杂）：
+ *   - 解析 afi/safi/overlay-index/route-map，只支持 unicast；
+ *   - 计算两个“通告方向”标志：flag_oi_none(无叠加索引) 与 flag_oi_gw_ip(网关IP)；
+ *     据此判断本次命令是否真正改变了通告方式(adv_flag_changed)或 route-map(rmap_changed)，
+ *     若都未变则返回 CMD_WARNING；
+ *   - 若需变更：先 bgp_evpn_withdraw_type5_routes 撤销旧 type-5（必须在改标志前，
+ *     以配合 addpath 的撤销逻辑），必要时释放旧 route-map 引用；
+ *   - 按情况 SET/UNSET af_flags[AFI_L2VPN][SAFI_EVPN] 对应的 ADV_* 标志；
+ *   - adv_flag_changed 时 bgp_addpath_type_changed 重算 addpath id；
+ *   - 更新 adv_cmd_rmap[afi][safi]（name+map 引用计数）；
+ *   - 最后按 bestpath 或 multipath 情况调 bgp_evpn_advertise_type5_routes 通告。
+ * 改配置结构：af_flags 的 ADV 标志、adv_cmd_rmap；触发 apply/重建：是（撤销+重通告 type-5）。 */
 DEFUN (bgp_evpn_advertise_type5,
        bgp_evpn_advertise_type5_cmd,
        "advertise " BGP_AFI_CMD_STR "" BGP_SAFI_CMD_STR " [gateway-ip] [route-map RMAP_NAME]",
@@ -4331,6 +4828,13 @@ DEFUN (bgp_evpn_advertise_type5,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】no advertise <ipv4|ipv6> unicast [route-map WORD]
+ * 语法：停止把 IPv4/IPv6 单播前缀作为 EVPN type-5 通告。
+ * 行为：解析 afi/safi（只支持 unicast）；若当前正在通告(有 ADV 标志)，
+ *   先 bgp_evpn_withdraw_type5_routes 撤销，再清 flag_oi_none / flag_oi_gw_ip，
+ *   并在原为 gateway-ip 时 bgp_addpath_type_changed 清理 addpath id；
+ *   最后清 adv_cmd_rmap 的 route-map 信息。
+ * 改配置结构：af_flags 的 ADV 标志、adv_cmd_rmap；触发 apply/重建：是（撤销 type-5）。 */
 DEFUN (no_bgp_evpn_advertise_type5,
        no_bgp_evpn_advertise_type5_cmd,
        "no advertise " BGP_AFI_CMD_STR "" BGP_SAFI_CMD_STR " [route-map WORD]",
@@ -4399,6 +4903,10 @@ DEFUN (no_bgp_evpn_advertise_type5,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】[no] use-es-l3nhg
+ * 语法：是否对“目的为 ES 的主机路由”使用 L3 nexthop group。
+ * 行为：直接置 bgp_mh_info->host_routes_use_l3nhg = no ? false : true。
+ * 改配置结构：bgp_mh_info->host_routes_use_l3nhg；触发 apply/重建：由 MH 侧后续处理。 */
 DEFPY (bgp_evpn_use_es_l3nhg,
        bgp_evpn_use_es_l3nhg_cmd,
        "[no$no] use-es-l3nhg",
@@ -4409,6 +4917,11 @@ DEFPY (bgp_evpn_use_es_l3nhg,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】[no] disable-ead-evi-rx
+ * 语法：配置“即使未收到 EAD-EVI 也在 EAD-ES 上激活 PE”（EAD-EVI 接收行为）。
+ * 行为：no 表示恢复接收(true)，否则禁用接收(false)；仅在值变化时更新
+ *   bgp_mh_info->enable_ead_evi_rx 并 bgp_evpn_switch_ead_evi_rx 应用。
+ * 改配置结构：bgp_mh_info->enable_ead_evi_rx；触发 apply/重建：是（切换 EAD-EVI rx）。 */
 DEFPY (bgp_evpn_ead_evi_rx_disable,
        bgp_evpn_ead_evi_rx_disable_cmd,
        "[no$no] disable-ead-evi-rx",
@@ -4425,6 +4938,11 @@ DEFPY (bgp_evpn_ead_evi_rx_disable,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】[no] disable-ead-evi-tx
+ * 语法：配置“不为本地 ES 通告 EAD-EVI”（EAD-EVI 发送行为）。
+ * 行为：no 表示恢复发送(true)，否则禁止发送(false)；仅在值变化时更新
+ *   bgp_mh_info->enable_ead_evi_tx 并 bgp_evpn_switch_ead_evi_tx 应用。
+ * 改配置结构：bgp_mh_info->enable_ead_evi_tx；触发 apply/重建：是（切换 EAD-EVI tx）。 */
 DEFPY (bgp_evpn_ead_evi_tx_disable,
        bgp_evpn_ead_evi_tx_disable_cmd,
        "[no$no] disable-ead-evi-tx",
@@ -4441,6 +4959,10 @@ DEFPY (bgp_evpn_ead_evi_tx_disable,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】[no] enable-resolve-overlay-index
+ * 语法：开启/关闭 type-5 路由叠加层索引(overlay index)的递归解析。
+ * 行为：须在 EVPN VRF 下；调 bgp_evpn_set_unset_resolve_overlay_index(bgp, no?false:true)。
+ * 改配置结构：bgp->resolve_overlay_index；触发 apply/重建：是（对每个 VNI 重解析下一跳）。 */
 DEFPY (bgp_evpn_enable_resolve_overlay_index,
        bgp_evpn_enable_resolve_overlay_index_cmd,
        "[no$no] enable-resolve-overlay-index",
@@ -4461,6 +4983,17 @@ DEFPY (bgp_evpn_enable_resolve_overlay_index,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】[no] advertise-pip [ip <A.B.C.D> [mac <MAC>]]
+ * 语法：配置“通告 primary IP(PIP)”，即本 PE 作为 VTEP 的系统 IP/MAC（用于多活场景）。
+ * 行为：须在 **L3VNI 的 VRF** 下(非 EVPN underlay 实例)。
+ *   set：置 evpn_info->advertise_pip=true；ip 非 0 时记 pip_ip_static 与 pip_ip，
+ *     否则 pip_ip 取 EVPN 实例 router-id；mac 非 0 记 pip_rmac_static/pip_rmac，
+ *     否则用 zebra 上报的系统 MAC。已配同值则直接成功。
+ *   no：argc==2 时整体关闭 advertise_pip 并把 pip_rmac 复位为本机 rmac；
+ *     否则仅回退静态 IP/MAC 到默认（保留 PIP 开关），并对不匹配的输入报错。
+ *   最后若 EVPN 启用：update_advertise_vrf_routes 更新 VRF 相关路由，
+ *     并对启用了 svi macip 的 L2 VNI 调 update_routes_for_vni 刷新 type-2 路由。
+ * 改配置结构：bgp_vrf->evpn_info 的 advertise_pip/pip_ip/pip_rmac 等；触发 apply/重建：是。 */
 DEFPY (bgp_evpn_advertise_pip_ip_mac,
        bgp_evpn_advertise_pip_ip_mac_cmd,
        "[no$no] advertise-pip [ip <A.B.C.D> [mac <X:X:X:X:X:X|X:X:X:X:X:X/M>]]",
@@ -4596,6 +5129,12 @@ DEFPY (bgp_evpn_advertise_pip_ip_mac,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】show bgp l2vpn evpn vni [<vni>] [json]
+ * 语法：显示所有 VNI 的汇总（含 L2/L3 计数与全局开关状态），或单个 VNI 的详情。
+ * 行为：无 vni 参数时输出全局状态（Advertise Gateway Macip / SVI Macip / All VNI /
+ *   BUM flooding / VXLAN flooding，及 L2/L3 VNI 计数）再 evpn_show_all_vnis；
+ *   带 vni 参数时 strtoul 解析并 evpn_show_vni。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 /*
  * Display VNI information - for all or a specific VNI
  */
@@ -4710,6 +5249,10 @@ DEFUN(show_bgp_l2vpn_evpn_vni,
 	return CMD_SUCCESS;
 }
 
+/* 【命令（隐藏）】show bgp l2vpn evpn vni remote-ip-hash
+ * 语法：dump 各 VNI 的远端 IP 哈希表（调试用）。
+ * 行为：hash_iterate(bgp_evpn->vnihash, bgp_evpn_show_remote_ip_hash)。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 DEFUN_HIDDEN(show_bgp_l2vpn_evpn_vni_remote_ip_hash,
 	     show_bgp_l2vpn_evpn_vni_remote_ip_hash_cmd,
 	     "show bgp l2vpn evpn vni remote-ip-hash",
@@ -4738,6 +5281,10 @@ DEFUN_HIDDEN(show_bgp_l2vpn_evpn_vni_remote_ip_hash,
 	return CMD_SUCCESS;
 }
 
+/* 【命令（隐藏）】show bgp l2vpn evpn vni-svi-hash
+ * 语法：dump VNI→SVI 哈希表（调试用）。
+ * 行为：hash_iterate(bgp_evpn->vni_svi_hash, bgp_evpn_show_vni_svi_hash)。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 DEFUN_HIDDEN(show_bgp_l2vpn_evpn_vni_svi_hash,
 	     show_bgp_l2vpn_evpn_vni_svi_hash_cmd,
 	     "show bgp l2vpn evpn vni-svi-hash",
@@ -4765,6 +5312,10 @@ DEFUN_HIDDEN(show_bgp_l2vpn_evpn_vni_svi_hash,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】show bgp l2vpn evpn es-evi [vni <v>] [json] [detail]
+ * 语法：显示“每个 EVI(VNI) 下的 ES”信息，可限定单个 VNI。
+ * 行为：带 vni → bgp_evpn_es_evi_show_vni，否则 bgp_evpn_es_evi_show（均在 MH 模块）。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 DEFPY(show_bgp_l2vpn_evpn_es_evi,
       show_bgp_l2vpn_evpn_es_evi_cmd,
       "show bgp l2vpn evpn es-evi [vni (1-16777215)$vni] [json$uj] [detail$detail]",
@@ -4786,6 +5337,11 @@ DEFPY(show_bgp_l2vpn_evpn_es_evi,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】show bgp l2vpn evpn es [<ESI> | detail] [json]
+ * 语法：显示所有 ES，或指定 ESI 的 ES 详情。
+ * 行为：给了 esi_str 则 str_to_esi 校验后 bgp_evpn_es_show_esi（格式错误报
+ *   "%% Malformed ESI"），否则 bgp_evpn_es_show（MH 模块）。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 DEFPY(show_bgp_l2vpn_evpn_es,
       show_bgp_l2vpn_evpn_es_cmd,
       "show bgp l2vpn evpn es [NAME$esi_str|detail$detail] [json$uj]",
@@ -4814,6 +5370,10 @@ DEFPY(show_bgp_l2vpn_evpn_es,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】show bgp l2vpn evpn es-vrf [<ESI>] [json]
+ * 语法：显示 ES 与 VRF 的对应关系，可限定某个 ESI。
+ * 行为：给了 esi_str 则校验后 bgp_evpn_es_vrf_show_esi，否则 bgp_evpn_es_vrf_show。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 DEFPY(show_bgp_l2vpn_evpn_es_vrf, show_bgp_l2vpn_evpn_es_vrf_cmd,
       "show bgp l2vpn evpn es-vrf [NAME$esi_str] [json$uj]",
       SHOW_STR BGP_STR L2VPN_HELP_STR EVPN_HELP_STR
@@ -4836,6 +5396,10 @@ DEFPY(show_bgp_l2vpn_evpn_es_vrf, show_bgp_l2vpn_evpn_es_vrf_cmd,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】show bgp l2vpn evpn next-hops [json]
+ * 语法：显示 EVPN 的下一跳(nexthop)表。
+ * 行为：调 bgp_evpn_nh_show(vty, uj)。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 DEFPY(show_bgp_l2vpn_evpn_nh,
       show_bgp_l2vpn_evpn_nh_cmd,
       "show bgp l2vpn evpn next-hops [json$uj]",
@@ -4851,6 +5415,13 @@ DEFPY(show_bgp_l2vpn_evpn_nh,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】show bgp [vrf VRFNAME] l2vpn evpn summary [established|failed]
+ *   [<neighbor <addr>|remote-as <AS|internal|external>>] [terse] [wide] [json]
+ * 语法：显示 EVPN 地址族的邻居汇总（BGP summary 的 EVPN 版）。
+ * 行为：解析 vrf / established|failed / neighbor / remote-as / terse / wide / json，
+ *   转成 show_flags 位后调 bgp_show_summary_vty(vty, vrf, AFI_L2VPN, SAFI_EVPN, ...)
+ *   （汇总本身在 bgp_vty.c，此处只是参数搬运）。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 /*
  * Display EVPN neighbor summary.
  */
@@ -4916,6 +5487,13 @@ DEFUN(show_bgp_l2vpn_evpn_summary, show_bgp_l2vpn_evpn_summary_cmd,
 				    as_type, as, show_flags);
 }
 
+/* 【函数】bgp_evpn_cli_parse_type_cmp —— 把 “type” 关键字后的字符串映射为 EVPN 路由类型：
+ *   "ma*"/"2" → BGP_EVPN_MAC_IP_ROUTE   (type-2)
+ *   "mu*"/"3" → BGP_EVPN_IMET_ROUTE     (type-3)
+ *   "es*"/"4" → BGP_EVPN_ES_ROUTE       (type-4)
+ *   "ea*"/"1" → BGP_EVPN_AD_ROUTE       (type-1)
+ *   "p*" /"5" → BGP_EVPN_IP_PREFIX_ROUTE(type-5)
+ *   未识别返回 -1。注意匹配用的是前缀首字母缩写（ma/mu/es/ea/p）。 */
 static int bgp_evpn_cli_parse_type_cmp(int *type, const char *type_str)
 {
 	if ((strncmp(type_str, "ma", 2) == 0) || (strmatch(type_str, "2")))
@@ -4934,6 +5512,9 @@ static int bgp_evpn_cli_parse_type_cmp(int *type, const char *type_str)
 	return 0;
 }
 
+/* 【函数】bgp_evpn_cli_parse_type —— 从命令行里找 “type <x>” 并解析出路由类型
+ * （声明见 bgp_evpn_vty.h）。未出现 type 关键字则 type 保持 0（不限类型）；
+ * 出现则交给 bgp_evpn_cli_parse_type_cmp，失败返回 -1。 */
 int bgp_evpn_cli_parse_type(int *type, struct cmd_token **argv, int argc)
 {
 	int type_idx = 0;
@@ -4948,6 +5529,11 @@ int bgp_evpn_cli_parse_type(int *type, struct cmd_token **argv, int argc)
 	return 0;
 }
 
+/* 【命令】show bgp l2vpn evpn route [detail] [type <t>] [self-originate] [json]
+ * 语法：显示**全局 EVPN 路由表**，可选 detail、按类型过滤、只看本机自身产生。
+ * 行为：bgp_evpn_cli_parse_type 解析 type（失败返回 CMD_WARNING）；解析 detail /
+ *   self-originate；调 evpn_show_all_routes(vty, bgp, type, json, detail, self_orig)。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 /*
  * Display global EVPN routing table.
  */
@@ -5003,6 +5589,11 @@ DEFUN(show_bgp_l2vpn_evpn_route,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】show bgp l2vpn evpn route rd <RD|all> [type <t>] [json]
+ * 语法：显示**指定 RD** 的 EVPN 路由表。
+ * 行为：解析 RD(失败报 "%% Malformed Route Distinguisher") 与 type；all 时以
+ *   evpn_show_all_routes(detail=1) 展示全部，否则 evpn_show_route_rd 展示该 RD。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 /*
  * Display global EVPN routing table for specific RD.
  */
@@ -5077,6 +5668,11 @@ DEFUN(show_bgp_l2vpn_evpn_route_rd,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】show bgp l2vpn evpn route rd <RD|all> mac <MAC> [ip <IP>] [json]
+ * 语法：在指定 RD（或全部 RD）下按 MAC（可选带 IP）查 type-2 路由。
+ * 行为：解析 RD、MAC(prefix_str2mac，失败报错)、可选 IP(str2ipaddr)；
+ *   all → evpn_show_route_rd_all_macip，否则 evpn_show_route_rd_macip。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 /*
  * Display global EVPN routing table for specific RD and MACIP.
  */
@@ -5162,6 +5758,10 @@ DEFUN(show_bgp_l2vpn_evpn_route_rd_macip,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】show bgp l2vpn evpn route esi <ESI> [json]
+ * 语法：显示指定 ESI 的 EVPN 路由表（该 ES 自有的路由）。
+ * 行为：str_to_esi 校验(失败报 "%% Malformed ESI")，调 evpn_show_routes_esi。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 /* Display per ESI routing table */
 DEFUN(show_bgp_l2vpn_evpn_route_esi,
       show_bgp_l2vpn_evpn_route_esi_cmd,
@@ -5205,6 +5805,10 @@ DEFUN(show_bgp_l2vpn_evpn_route_esi,
 }
 
 
+/* 【命令】show bgp l2vpn evpn route vni <vni> [type <ead|1|macip|2|multicast|3> | vtep <ip>] [json]
+ * 语法：显示指定 VNI 的 EVPN 路由表，可按 type 过滤或按远端 vtep 过滤。
+ * 行为：解析 type；调 evpn_show_routes_vni(vty, bgp, vni, type, false, vtep_ip, json)。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 /*
  * Display per-VNI EVPN routing table.
  */
@@ -5259,6 +5863,11 @@ DEFPY(show_bgp_l2vpn_evpn_route_vni, show_bgp_l2vpn_evpn_route_vni_cmd,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】show bgp l2vpn evpn route vni <vni> mac <MAC> [ip <IP>] [json]
+ * 语法：在指定 VNI 里按 MAC（可选带 IP）查 type-2 路由。
+ * 行为：解析 vni / mac(prefix_str2mac) / 可选 ip(str2ipaddr)，
+ *   调 evpn_show_route_vni_macip。这里的 argv 索引是写死的(idx+3 / idx+5 / idx+7)。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 /*
  * Display per-VNI EVPN routing table for specific MACIP.
  */
@@ -5327,6 +5936,11 @@ DEFUN(show_bgp_l2vpn_evpn_route_vni_macip,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】show bgp l2vpn evpn route vni <vni> multicast <A.B.C.D> [json]
+ * 语法：在指定 VNI 里查一条 type-3(组播/IMET) 路由，按 originator IP 定位。
+ * 行为：解析 vni 与 orig_ip(inet_aton，失败报 "%% Malformed Originating Router IP address")，
+ *   调 evpn_show_route_vni_multicast。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 /*
  * Display per-VNI EVPN routing table for specific multicast IP (remote VTEP).
  */
@@ -5384,6 +5998,10 @@ DEFUN(show_bgp_l2vpn_evpn_route_vni_multicast,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】show bgp l2vpn evpn route vni all [detail] [vtep <ip>] [json]
+ * 语法：显示**所有 VNI** 的 EVPN 路由表，可选 detail、按远端 vtep 过滤。
+ * 行为：调 evpn_show_routes_vni_all(vty, bgp, 0(不限类型), false, vtep_ip, json, da)。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 /*
  * Display per-VNI EVPN routing table - for all VNIs.
  */
@@ -5436,6 +6054,10 @@ DEFPY(show_bgp_l2vpn_evpn_route_vni_all,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】show bgp vni all [vtep <ip>] [detail] [json]
+ * 语法：显示所有 VNI 的**全部**路由表（IP 表与 MAC 表都打）。
+ * 行为：调 evpn_show_routes_vni_all_type_all(vty, bgp, addr, json, !!detail)。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 /*
  * Display per-VNI EVPN ALL routing tables - for all VNIs.
  */
@@ -5471,6 +6093,10 @@ DEFPY(show_bgp_vni_all,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】show bgp vni all type <1|ead> [vtep <ip>] [detail|json]
+ * 语法：显示所有 VNI 的 type-1(EAD) 路由表。
+ * 行为：调 evpn_show_routes_vni_all(vty, bgp, BGP_EVPN_AD_ROUTE, false, addr, json, !!detail)。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 /*
  * Display per-VNI EVPN EAD routing table - for all VNIs.
  */
@@ -5510,6 +6136,10 @@ DEFPY(show_bgp_vni_all_ead,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】show bgp vni all type <2|macip> mac [vtep <ip>] [detail|json]
+ * 语法：显示所有 VNI 的 type-2(0 MAC-IP) 的 **MAC 表**。
+ * 行为：调 evpn_show_routes_vni_all(...BGP_EVPN_MAC_IP_ROUTE, mac_table=true...)。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 /*
  * Display per-VNI EVPN MAC routing table - for all VNIs.
  */
@@ -5550,6 +6180,11 @@ DEFPY(show_bgp_vni_all_macip_mac,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】show bgp vni all type <2|macip> ip [vtep <ip>] [detail|json]
+ * 语法：显示所有 VNI 的 type-2(MAC-IP) 的 **IP 表**（远端 MAC-IP 前缀视图）。
+ * 行为：调 evpn_show_routes_vni_all(...BGP_EVPN_MAC_IP_ROUTE, mac_table=false...)，
+ *   即用 type 过滤 MAC-IP 路由、并展示 IP 表那一侧。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 /*
  * Display per-VNI EVPN IP routing table - for all VNIs.
  */
@@ -5590,6 +6225,10 @@ DEFPY(show_bgp_vni_all_macip_ip,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】show bgp vni all type <3|multicast> [vtep <ip>] [detail|json]
+ * 语法：显示所有 VNI 的 type-3(组播/IMET) 路由表。
+ * 行为：调 evpn_show_routes_vni_all(...BGP_EVPN_IMET_ROUTE...)。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 /*
  * Display per-VNI EVPN Multicast routing table - for all VNIs.
  */
@@ -5629,6 +6268,11 @@ DEFPY(show_bgp_vni_all_imet,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】show bgp vni <vni> [vtep <ip>] [json]
+ * 语法：显示**指定 VNI** 的全部路由表：先 IP 表，再 MAC 表。
+ * 行为：evpn_show_routes_vni(mac_table=false) 打 IP 表；文本时插入 "MAC Table:" 标题；
+ *   再 evpn_show_routes_vni(mac_table=true) 打 MAC 表（JSON 时挂在 "macTable")。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 /*
  * Display per-VNI EVPN ALL routing tables - for select VNI
  */
@@ -5673,6 +6317,10 @@ DEFPY(show_bgp_vni,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】show bgp vni <vni> type <1|ead> [vtep <ip>] [json]
+ * 语法：显示指定 VNI 的 type-1(EAD) 路由表。
+ * 行为：evpn_show_routes_vni(vty, bgp, vni, BGP_EVPN_AD_ROUTE, false, addr, json)。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 /*
  * Display per-VNI EVPN EAD routing table - for select VNI
  */
@@ -5711,6 +6359,10 @@ DEFPY(show_bgp_vni_ead,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】show bgp vni <vni> type <2|macip> mac [vtep <ip>] [json]
+ * 语法：显示指定 VNI 的 type-2(MAC-IP) 的 MAC 表。
+ * 行为：evpn_show_routes_vni(vty, bgp, vni, BGP_EVPN_MAC_IP_ROUTE, mac_table=true, addr, json)。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 /*
  * Display per-VNI EVPN MAC-IP MAC routing table - for select VNI
  */
@@ -5750,6 +6402,10 @@ DEFPY(show_bgp_vni_macip_mac,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】show bgp vni <vni> type <2|macip> ip [vtep <ip>] [json]
+ * 语法：显示指定 VNI 的 type-2(MAC-IP) 的 IP 表。
+ * 行为：evpn_show_routes_vni(vty, bgp, vni, BGP_EVPN_MAC_IP_ROUTE, mac_table=false, addr, json)。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 /*
  * Display per-VNI EVPN MAC-IP IP routing table - for select VNI
  */
@@ -5789,6 +6445,10 @@ DEFPY(show_bgp_vni_macip_ip,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】show bgp vni <vni> type <3|multicast> [vtep <ip>] [json]
+ * 语法：显示指定 VNI 的 type-3(组播/IMET) 路由表。
+ * 行为：evpn_show_routes_vni(vty, bgp, vni, BGP_EVPN_IMET_ROUTE, false, addr, json)。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 /*
  * Display per-VNI EVPN Multicast routing table - for select VNI
  */
@@ -5827,6 +6487,10 @@ DEFPY(show_bgp_vni_imet,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】show bgp vni <vni> type <2|macip> mac <MAC> [json]
+ * 语法：在指定 VNI 里按 MAC 精确查一条 type-2 路由。
+ * 行为：evpn_show_route_vni_macip(vty, bgp, vni, &mac->eth_addr, NULL, json)（ip 传 NULL）。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 /*
  * Display per-VNI EVPN MACIP MAC routing table - for select VNI & MAC
  */
@@ -5863,6 +6527,10 @@ DEFPY(show_bgp_vni_macip_mac_addr,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】show bgp vni <vni> type <2|macip> ip <IP> [json]
+ * 语法：在指定 VNI 里按 IP 精确查一条 type-2 路由。
+ * 行为：把 sockunion 形式的 IP 转成 struct ipaddr，evpn_show_route_vni_macip(...NULL, &ip_addr, json)。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 /*
  * Display per-VNI EVPN MACIP IP routing table - for select VNI & IP
  */
@@ -5902,6 +6570,10 @@ DEFPY(show_bgp_vni_macip_ip_addr, show_bgp_vni_macip_ip_addr_cmd,
 	return CMD_SUCCESS;
 }
 
+/* 【命令（隐藏）】show bgp l2vpn evpn route mac-ip-evi-es [<ESI>|detail] [json]
+ * 语法：显示 EVI 表里链接到 ES 的 MAC-IP 路由（隐藏，调试用）。
+ * 行为：可选 ESI(str_to_esi)；调 bgp_evpn_show_routes_mac_ip_evi_es。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 DEFPY_HIDDEN(
 	show_bgp_l2vpn_evpn_route_mac_ip_evi_es,
 	show_bgp_l2vpn_evpn_route_mac_ip_evi_es_cmd,
@@ -5935,6 +6607,10 @@ DEFPY_HIDDEN(
 	return CMD_SUCCESS;
 }
 
+/* 【命令（隐藏）】show bgp l2vpn evpn route mac-ip-global-es [<ESI>|detail] [json]
+ * 语法：显示全局表里链接到 ES 的 MAC-IP 路由（隐藏，调试用）。
+ * 行为：可选 ESI(str_to_esi)；调 bgp_evpn_show_routes_mac_ip_global_es。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 DEFPY_HIDDEN(
 	show_bgp_l2vpn_evpn_route_mac_ip_global_es,
 	show_bgp_l2vpn_evpn_route_mac_ip_global_es_cmd,
@@ -5968,6 +6644,10 @@ DEFPY_HIDDEN(
 	return CMD_SUCCESS;
 }
 
+/* 【命令】show bgp l2vpn evpn vrf-import-rt [json]
+ * 语法：显示 VRF 导入 RT 哈希表（哪些 VRF 导入了哪些 RT）。
+ * 行为：调 evpn_show_vrf_import_rts(vty, bgp_evpn, json)。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 /*
  * Display EVPN import route-target hash table
  */
@@ -6001,6 +6681,10 @@ DEFUN(show_bgp_l2vpn_evpn_vrf_import_rt,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】show bgp l2vpn evpn import-rt [json]
+ * 语法：显示 VNI 导入 RT 哈希表（哪些 VNI 导入了哪些 RT）。
+ * 行为：调 evpn_show_import_rts(vty, bgp, json)。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 /*
  * Display EVPN import route-target hash table
  */
@@ -6034,6 +6718,12 @@ DEFUN(show_bgp_l2vpn_evpn_import_rt,
 	return CMD_SUCCESS;
 }
 
+/* 【命令（隐藏，仅供测试）】[no] test es <ESI> [state up|down]
+ * 语法：手工在本机添加/删除一个以太网段(ES)。
+ * 行为：str_to_esi 解析 ESI；no 走 bgp_evpn_local_es_del，
+ *   否则 bgp_evpn_local_es_add（vtep 用 router_id，oper_up 依 state 关键字）。
+ * 改配置结构：直接操作本地 ES 数据库（bgp_evpn_es），非配置树。
+ * 触发 apply/重建：会触发 ES 相关的本地处理与通告。 */
 DEFPY_HIDDEN(test_es_add,
       test_es_add_cmd,
       "[no$no] test es NAME$esi_str [state NAME$state_str]",
@@ -6086,6 +6776,12 @@ DEFPY_HIDDEN(test_es_add,
 	return CMD_SUCCESS;
 }
 
+/* 【命令（隐藏，仅供测试）】[no] test es <ESI> vni <vni>
+ * 语法：手工把某 ES 与某 VNI 关联/解除关联。
+ * 行为：str_to_esi 解析 ESI；no 走 bgp_evpn_local_es_evi_del，
+ *   否则 bgp_evpn_local_es_evi_add。
+ * 改配置结构：直接操作本地 ES-VNI 关联，非配置树。
+ * 触发 apply/重建：会触发 ES-EVI 相关处理与通告。 */
 DEFPY_HIDDEN(test_es_vni_add,
       test_es_vni_add_cmd,
       "[no$no] test es NAME$esi_str vni (1-16777215)$vni",
@@ -6128,6 +6824,9 @@ DEFPY_HIDDEN(test_es_vni_add,
 	return CMD_SUCCESS;
 }
 
+/* 【隐藏别名组】以下 ALIAS_HIDDEN 都是 `show bgp l2vpn evpn ...` 系列的
+ * 隐藏别名，令用户可直接输入更短的 `show bgp evpn ...`（同样功能，help 里不显示）。
+ * ALIAS_HIDDEN 只是把新命令名映射到已存在的命令函数上，不产生新实现。 */
 ALIAS_HIDDEN(show_bgp_l2vpn_evpn_vni, show_bgp_evpn_vni_cmd,
 	     "show bgp evpn vni [" CMD_VNI_RANGE "]", SHOW_STR BGP_STR EVPN_HELP_STR
 	     "Show VNI\n"
@@ -6224,6 +6923,13 @@ ALIAS_HIDDEN(show_bgp_l2vpn_evpn_import_rt, show_bgp_evpn_import_rt_cmd,
 	     "show bgp evpn import-rt",
 	     SHOW_STR BGP_STR EVPN_HELP_STR "Show import route target\n")
 
+/* 【命令】[no] flooding <disable|head-end-replication>（BGP EVPN VNI 节点下）
+ * 语法：为**当前 VNI** 指定 BUM（广播/未知单播/组播）报文处理方式。
+ * 行为：no 则回落到继承全局（VXLAN_FLOOD_INHERIT_GLOBAL）；否则设
+ *   disable=VXLAN_FLOOD_DISABLED 或 her=VXLAN_FLOOD_HEAD_END_REPL。
+ *   值变化时写 evpn->vxlan_flood_ctrl 并调 bgp_evpn_flood_control_change(bgp)。
+ * 改配置结构：struct bgpevpn 的 vxlan_flood_ctrl。
+ * 触发 apply/重建：是，触发本 VNI 的洪泛处理调整与相关通告。 */
 DEFPY(bgp_evpn_flood_control_vni,
       bgp_evpn_flood_control_vni_cmd,
       "[no$no] flooding <disable$disable|head-end-replication$her>",
@@ -6263,6 +6969,13 @@ DEFPY(bgp_evpn_flood_control_vni,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】vni <vni>（BGP EVPN 节点下，进入 VNI 子节点）
+ * 语法：创建一个 VNI 并进入其配置子节点（BGP_EVPN_VNI_NODE）。
+ * 行为：evpn_create_update_vni(bgp, vni) 创建或标记为“已配置”；
+ *   成功则 VTY_PUSH_CONTEXT_SUB 把该 bgpevpn 压入上下文。
+ * 改配置结构：创建/更新 struct bgpevpn 并标记 configured。
+ * 触发 apply/重建：是（首次创建会触发 VNI 初始化）。
+ * 注：用 DEFUN_NOSH 注册，不出现在 help 中（配置节点专用）。 */
 DEFUN_NOSH (bgp_evpn_vni,
             bgp_evpn_vni_cmd,
             "vni " CMD_VNI_RANGE,
@@ -6289,6 +7002,12 @@ DEFUN_NOSH (bgp_evpn_vni,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】no vni <vni>（BGP EVPN 节点下）
+ * 语法：删除一个已配置的 VNI。
+ * 行为：bgp_evpn_lookup_vni 查表；不存在报错；用 is_vni_configured 判断是否
+ *   为“已配置”，未配置报错；最后 evpn_delete_vni(bgp, vpn)。
+ * 改配置结构：删除 struct bgpevpn。
+ * 触发 apply/重建：是（拆除 VNI 相关状态与通告）。 */
 DEFUN (no_bgp_evpn_vni,
        no_bgp_evpn_vni_cmd,
        "no vni " CMD_VNI_RANGE,
@@ -6320,6 +7039,10 @@ DEFUN (no_bgp_evpn_vni,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】exit-vni（BGP EVPN VNI 节点下）
+ * 语法：从 VNI 子节点退出，回到 BGP EVPN 父节点。
+ * 行为：把 vty->node 由 BGP_EVPN_VNI_NODE 改为 BGP_EVPN_NODE。
+ * 改配置结构：无（只切换 CLI 节点）。触发 apply/重建：无。 */
 DEFUN_NOSH (exit_vni,
             exit_vni_cmd,
             "exit-vni",
@@ -6330,6 +7053,11 @@ DEFUN_NOSH (exit_vni,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】rd ASN:NN_OR_IP-ADDRESS:NN（BGP VRF 节点下）
+ * 语法：为当前 VRF 配置 EVPN 的 RD（Route Distinguisher）。
+ * 行为：str2prefix_rd 解析；若与现有一致则直接返回；否则 evpn_configure_vrf_rd。
+ * 改配置结构：VRF 的 EVPN RD（bgp->evpn_info）。
+ * 触发 apply/重建：是（会影响该 VRF 的 EVPN 路由区分与重通告）。 */
 DEFUN (bgp_evpn_vrf_rd,
        bgp_evpn_vrf_rd_cmd,
        "rd ASN:NN_OR_IP-ADDRESS:NN",
@@ -6358,6 +7086,12 @@ DEFUN (bgp_evpn_vrf_rd,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】no rd ASN:NN_OR_IP-ADDRESS:NN（BGP VRF 节点下）
+ * 语法：删除当前 VRF 的 EVPN RD。
+ * 行为：str2prefix_rd 解析；is_vrf_rd_configured 确认已配置；
+ *   bgp_evpn_vrf_rd_matches_existing 校验给出的 RD 与现有一致；最后 evpn_unconfigure_vrf_rd。
+ * 改配置结构：清除 VRF 的 EVPN RD。
+ * 触发 apply/重建：是。 */
 DEFUN (no_bgp_evpn_vrf_rd,
        no_bgp_evpn_vrf_rd_cmd,
        "no rd ASN:NN_OR_IP-ADDRESS:NN",
@@ -6394,6 +7128,10 @@ DEFUN (no_bgp_evpn_vrf_rd,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】no rd（无参数形式，BGP VRF 节点下）
+ * 语法：不带 RD 值直接删除当前 VRF 的 EVPN RD（便捷写法）。
+ * 行为：is_vrf_rd_configured 确认已配置，然后 evpn_unconfigure_vrf_rd。
+ * 改配置结构：清除 VRF 的 EVPN RD。触发 apply/重建：是。 */
 DEFUN (no_bgp_evpn_vrf_rd_without_val,
        no_bgp_evpn_vrf_rd_without_val_cmd,
        "no rd",
@@ -6415,6 +7153,12 @@ DEFUN (no_bgp_evpn_vrf_rd_without_val,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】rd ASN:NN_OR_IP-ADDRESS:NN（BGP EVPN VNI 节点下）
+ * 语法：为**当前 VNI**配置 RD（L2 VNI / MAC-VRF 的 RD）。
+ * 行为：EVPN_ENABLED 检查；str2prefix_rd 解析；与现有一致则返回；
+ *   否则 evpn_configure_rd(bgp, vpn, &prd, str)。
+ * 改配置结构：struct bgpevpn 的 RD。
+ * 触发 apply/重建：是（影响该 VNI 的 EVPN 路由重通告）。 */
 DEFUN (bgp_evpn_vni_rd,
        bgp_evpn_vni_rd_cmd,
        "rd ASN:NN_OR_IP-ADDRESS:NN",
@@ -6450,6 +7194,11 @@ DEFUN (bgp_evpn_vni_rd,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】no rd ASN:NN_OR_IP-ADDRESS:NN（BGP EVPN VNI 节点下）
+ * 语法：删除当前 VNI 的 RD（需给出与现有一致的值）。
+ * 行为：is_rd_configured 确认已配置；bgp_evpn_rd_matches_existing 校验一致；
+ *   evpn_unconfigure_rd(bgp, vpn)。
+ * 改配置结构：清除 struct bgpevpn 的 RD。触发 apply/重建：是。 */
 DEFUN (no_bgp_evpn_vni_rd,
        no_bgp_evpn_vni_rd_cmd,
        "no rd ASN:NN_OR_IP-ADDRESS:NN",
@@ -6493,6 +7242,10 @@ DEFUN (no_bgp_evpn_vni_rd,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】no rd（无参数形式，BGP EVPN VNI 节点下）
+ * 语法：不带 RD 值直接删除当前 VNI 的 RD（便捷写法）。
+ * 行为：EVPN_ENABLED 检查；is_rd_configured 确认已配置；evpn_unconfigure_rd。
+ * 改配置结构：清除 struct bgpevpn 的 RD。触发 apply/重建：是。 */
 DEFUN (no_bgp_evpn_vni_rd_without_val,
        no_bgp_evpn_vni_rd_without_val_cmd,
        "no rd",
@@ -6521,6 +7274,9 @@ DEFUN (no_bgp_evpn_vni_rd_without_val,
 	return CMD_SUCCESS;
 }
 
+/* 【函数】bgp_evpn_rt_matches_existing —— 在 RT 列表 rtl 中查找是否已有
+ * ecomtarget（用于 L2VNI 场景）。遍历列表逐个 ecommunity_match，命中返回 true。
+ * rtl 的元素是 struct ecommunity。 */
 /*
  * Loop over all extended-communities in the route-target list rtl and
  * return 1 if we find ecomtarget
@@ -6539,6 +7295,8 @@ static bool bgp_evpn_rt_matches_existing(struct list *rtl,
 	return false;
 }
 
+/* 【函数】bgp_evpn_vrf_rt_matches_existing —— 上面函数的 L3VNI/VRF 版本。
+ * 区别：rtl 的元素是 struct vrf_route_target（内嵌 ecom），故比较 l3rt->ecom。 */
 /*
  * L3 RT version of above.
  */
@@ -6556,6 +7314,13 @@ static bool bgp_evpn_vrf_rt_matches_existing(struct list *rtl,
 	return false;
 }
 
+/* 【命令】show bgp vrf <VRFNAME> vni [json]
+ * 语法：显示指定 VRF 的 L3VNI 相关信息。
+ * 输出：Local-Ip、L3-VNI、Rmac、VNI Filter(prefix-routes-only|none)、
+ *   L2-VNI List、Export-RTs、Import-RTs、RD；JSON 时对应到各键。
+ * 行为：bgp_lookup_by_name 查 BGP 实例（VRF_DEFAULT_NAME 用 bgp_get_default），
+ *   遍历 bgp->l2vnis / vrf_export_rtl / vrf_import_rtl 打印。
+ * 改配置结构：无（只读 show）。触发 apply/重建：无。 */
 /* display L3VNI related info for a VRF instance */
 DEFUN (show_bgp_vrf_l3vni_info,
        show_bgp_vrf_l3vni_info_cmd,
@@ -6681,6 +7446,11 @@ DEFUN (show_bgp_vrf_l3vni_info,
 	return CMD_SUCCESS;
 }
 
+/* 【函数】add_rt —— 给 VRF 增加一条 RT（import 或 export）。
+ *   若对应方向已配置且列表里已有该 RT，返回 -1（表示重复，调用方报错）。
+ *   否则调 bgp_evpn_configure_import_rt_for_vrf /
+ *   bgp_evpn_configure_export_rt_for_vrf。成功返回 0。
+ * is_wildcard 用于 import 的 `*:NN` 通配 RT。 */
 static int add_rt(struct bgp *bgp, struct ecommunity *ecom, bool is_import,
 		  bool is_wildcard)
 {
@@ -6702,6 +7472,10 @@ static int add_rt(struct bgp *bgp, struct ecommunity *ecom, bool is_import,
 	return 0;
 }
 
+/* 【函数】del_rt —— 从 VRF 删除一条 RT（import 或 export）。
+ *   若列表里没有该 RT，返回 -1（调用方报错）；否则调
+ *   bgp_evpn_unconfigure_import_rt_for_vrf / bgp_evpn_unconfigure_export_rt_for_vrf。
+ * 成功返回 0。与 add_rt 对称。 */
 static int del_rt(struct bgp *bgp, struct ecommunity *ecom, bool is_import)
 {
 	/* Verify we already have this route-target */
@@ -6722,6 +7496,10 @@ static int del_rt(struct bgp *bgp, struct ecommunity *ecom, bool is_import)
 	return 0;
 }
 
+/* 【函数】parse_rtlist —— 解析命令行从 rt_idx 起的 RT 列表并逐条增/删。
+ *   对 `*` 开头（通配）特殊处理：临时把首字符换成 '0' 交给 ecommunity 解析，
+ *   解析完再还原，并置 is_wildcard=true。
+ *   is_add=true 调 add_rt，否则 del_rt；任何一条失败即返回 CMD_WARNING。 */
 static int parse_rtlist(struct bgp *bgp, struct vty *vty, int argc,
 			struct cmd_token **argv, int rt_idx, bool is_add,
 			bool is_import)
@@ -6783,6 +7561,12 @@ static int parse_rtlist(struct bgp *bgp, struct vty *vty, int argc,
 	return ret;
 }
 
+/* 【命令】route-target <both|import|export> RTLIST...（L3VNI VRF 节点下）
+ * 语法：为 L3VNI 的 VRF 配置一批 route-target。
+ * 行为：解析 both/import/export 得 rt_type；`auto` 不允许走此命令（用 ... auto）；
+ *   通配 `*` 只允许用于 import；随后按类型调 parse_rtlist(is_add=true)。
+ * 改配置结构：VRF 的 vrf_import_rtl / vrf_export_rtl 及对应 CfgD 标志位。
+ * 触发 apply/重建：是（影响 L3VNI 前缀路由的导入/导出）。 */
 /* import/export rt for l3vni-vrf */
 DEFUN (bgp_evpn_vrf_rt,
        bgp_evpn_vrf_rt_cmd,
@@ -6843,6 +7627,12 @@ DEFUN (bgp_evpn_vrf_rt,
 	return ret;
 }
 
+/* 【命令】route-target <both|import|export> auto（L3VNI VRF 节点下）
+ * 语法：为 L3VNI 的 VRF 自动推导 route-target。
+ * 行为：按类型调 bgp_evpn_configure_import_auto_rt_for_vrf /
+ *   bgp_evpn_configure_export_auto_rt_for_vrf。
+ * 改配置结构：VRF 的 vrf_import_rtl / vrf_export_rtl（自动值）。
+ * 触发 apply/重建：是。 */
 DEFPY (bgp_evpn_vrf_rt_auto,
        bgp_evpn_vrf_rt_auto_cmd,
        "route-target <both|import|export>$type auto",
@@ -6878,6 +7668,10 @@ DEFPY (bgp_evpn_vrf_rt_auto,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】no route-target <both|import|export> RTLIST...（L3VNI VRF 节点下）
+ * 语法：删除 VRF 上的一批 route-target。
+ * 行为：解析类型后按类型调 parse_rtlist(is_add=false)。
+ * 改配置结构：VRF 的 vrf_import_rtl / vrf_export_rtl。触发 apply/重建：是。 */
 DEFUN (no_bgp_evpn_vrf_rt,
        no_bgp_evpn_vrf_rt_cmd,
        "no route-target <both|import|export> RTLIST...",
@@ -6958,6 +7752,11 @@ DEFUN (no_bgp_evpn_vrf_rt,
 	return ret;
 }
 
+/* 【命令】no route-target <both|import|export> auto（L3VNI VRF 节点下）
+ * 语法：取消 VRF 上自动推导的 route-target。
+ * 行为：按类型检查 AUTO_RT 的 CfgD 标志，再调
+ *   bgp_evpn_unconfigure_import_auto_rt_for_vrf / ..._export_auto_rt_for_vrf。
+ * 改配置结构：VRF 的 vrf_import_rtl / vrf_export_rtl。触发 apply/重建：是。 */
 DEFPY (no_bgp_evpn_vrf_rt_auto,
        no_bgp_evpn_vrf_rt_auto_cmd,
        "no route-target <both|import|export>$type auto",
@@ -7015,6 +7814,11 @@ DEFPY (no_bgp_evpn_vrf_rt_auto,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】[no] ead-es-frag evi-limit (1-1000)
+ * 语法：设置每个 EAD-ES 分片容纳的 EVI 上限（MH 相关）。
+ * 行为：写 bgp_mh_info->evi_per_es_frag；no 则恢复默认 BGP_EVPN_MAX_EVI_PER_ES_FRAG。
+ * 改配置结构：全局 bgp_mh_info->evi_per_es_frag。
+ * 触发 apply/重建：是（影响 EAD-ES 分片通告策略）。 */
 DEFPY(bgp_evpn_ead_ess_frag_evi_limit, bgp_evpn_ead_es_frag_evi_limit_cmd,
       "[no$no] ead-es-frag evi-limit (1-1000)$limit",
       NO_STR
@@ -7028,6 +7832,11 @@ DEFPY(bgp_evpn_ead_ess_frag_evi_limit, bgp_evpn_ead_es_frag_evi_limit_cmd,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】ead-es-route-target export RT
+ * 语法：为 EAD-ES 路由设置供导出的 route-target（MH 相关）。
+ * 行为：EVPN_ENABLED 检查；ecommunity_str2com 解析 RT；若列表里没有则调
+ *   bgp_evpn_mh_config_ead_export_rt(bgp, ecomadd, false)（false=添加/更新）。
+ * 改配置结构：bgp_mh_info->ead_es_export_rtl。触发 apply/重建：是。 */
 DEFUN(bgp_evpn_ead_es_rt, bgp_evpn_ead_es_rt_cmd,
       "ead-es-route-target export RT",
       "EAD ES Route Target\n"
@@ -7063,6 +7872,11 @@ DEFUN(bgp_evpn_ead_es_rt, bgp_evpn_ead_es_rt_cmd,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】no ead-es-route-target export RT
+ * 语法：删除 EAD-ES 路由导出的 route-target。
+ * 行为：EVPN_ENABLED 检查；ecommunity_str2com 解析；列表里必须有（否则报错）；
+ *   调 bgp_evpn_mh_config_ead_export_rt(bgp, ecomdel, true)（true=删除）。
+ * 改配置结构：bgp_mh_info->ead_es_export_rtl。触发 apply/重建：是。 */
 DEFUN(no_bgp_evpn_ead_es_rt, no_bgp_evpn_ead_es_rt_cmd,
       "no ead-es-route-target export RT",
       NO_STR
@@ -7100,6 +7914,14 @@ DEFUN(no_bgp_evpn_ead_es_rt, no_bgp_evpn_ead_es_rt_cmd,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】route-target <both|import|export> RT（BGP EVPN VNI 节点下）
+ * 语法：为当前 VNI 配置一条 route-target（L2 VNI）。
+ * 行为：EVPN_ENABLED 检查；解析类型；分别走 import（"both" 时第一条）与
+ *   export（"both" 时第二条）分支——各自 ecommunity_str2com 解析，
+ *   若 VNI 已配置且列表已有则该 RT 则跳过，否则 evpn_configure_import_rt /
+ *   evpn_configure_export_rt。
+ * 改配置结构：struct bgpevpn 的 import_rtl / export_rtl 与 VNI_FLAG_IMPRT/EXPRT_CFGD。
+ * 触发 apply/重建：是（影响该 VNI 路由的导入/导出）。 */
 DEFUN (bgp_evpn_vni_rt,
        bgp_evpn_vni_rt_cmd,
        "route-target <both|import|export> RT",
@@ -7175,6 +7997,12 @@ DEFUN (bgp_evpn_vni_rt,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】no route-target <both|import|export> RT（BGP EVPN VNI 节点下）
+ * 语法：删除当前 VNI 上的一条 route-target。
+ * 行为：EVPN_ENABLED 检查；解析类型并确认对应方向已配置；解析 RT；
+ *   按 import/export/both 分别校验列表里存在后调 evpn_unconfigure_import_rt /
+ *   evpn_unconfigure_export_rt（both 时任一方向命中即可）。
+ * 改配置结构：struct bgpevpn 的 import_rtl / export_rtl。触发 apply/重建：是。 */
 DEFUN (no_bgp_evpn_vni_rt,
        no_bgp_evpn_vni_rt_cmd,
        "no route-target <both|import|export> RT",
@@ -7281,6 +8109,11 @@ DEFUN (no_bgp_evpn_vni_rt,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】no route-target <import|export>（无 RT 值，BGP EVPN VNI 节点下）
+ * 语法：不带具体 RT 值，直接清空当前 VNI 的某方向 RT 列表（便捷写法）。
+ * 行为：EVPN_ENABLED 检查；解析 import/export 类型并确认已配置；
+ *   随后清空对应方向的 RT 列表（详见函数后半）。
+ * 改配置结构：struct bgpevpn 的 import_rtl / export_rtl。触发 apply/重建：是。 */
 DEFUN (no_bgp_evpn_vni_rt_without_val,
        no_bgp_evpn_vni_rt_without_val_cmd,
        "no route-target <import|export>",
@@ -7334,6 +8167,9 @@ DEFUN (no_bgp_evpn_vni_rt_without_val,
 	return CMD_SUCCESS;
 }
 
+/* 【函数】vni_cmp —— list_sort 的比较函数：按 VNI 从大到小排序。
+ * 注意返回值是 secnd->vni - first->vni（降序），用于 show running-config
+ * 时让 VNI 输出顺序稳定、可复现。 */
 static int vni_cmp(const void **a, const void **b)
 {
 	const struct bgpevpn *first = *a;
@@ -7342,6 +8178,21 @@ static int vni_cmp(const void **a, const void **b)
 	return secnd->vni - first->vni;
 }
 
+/* 【函数】bgp_config_write_evpn_info —— 把某 bgp 实例的 EVPN 全局配置写进
+ * vty（供 `show running-config` 使用）。由 bgp_config_write 类入口调用。
+ * 顺序要点：
+ *   1) advertise-all-vni；
+ *   2) 若 vnihash 非空，转 list 并按 vni_cmp 排序后逐条 write_vni_config
+ *      （各 VNI 自身的子配置由 write_vni_config 负责）；
+ *   3) 其余全局开关：autort rfc8365-compatible、advertise-default-gw、
+ *      advertise-svi-ip、mac-vrf soo、enable-resolve-overlay-index、
+ *      ead-es-frag evi-limit、use-es-l3nhg、disable-ead-evi-rx/tx、
+ *      dup-addr-detection（含 max-moves/time/freeze）、flooding、
+ *      advertise ipv4/ipv6 unicast [gateway-ip] [route-map]、EAD-ES 导出 RT、
+ *      default-originate ipv4/ipv6；
+ *   4) VRF 专属：advertise-pip(ip/mac)、rd、import/export route-target(含 auto)。
+ * 说明：此函数只“输出”配置文本，不改变任何状态。
+ */
 /*
  * Output EVPN configuration information.
  */
@@ -7585,6 +8436,15 @@ void bgp_config_write_evpn_info(struct vty *vty, struct bgp *bgp, afi_t afi,
 		vty_out(vty, "  route-target export auto\n");
 }
 
+/* 【函数】bgp_ethernetvpn_init —— EVPN 的 CLI 命令注册入口。
+ * bgpd 启动时调用一次，用 install_element(节点, &命令) 把上面 DEFUN/DEFPY
+ * 注册的命令挂到对应 CLI 节点，例如 VIEW_NODE、BGP_EVPN_NODE、
+ * BGP_EVPN_VNI_NODE、BGP_NODE、BGP_VRF_NODE 等。
+ * 注意：install_element 的参数（节点与命令变量）**绝不可改动**，否则命令
+ * 会注册到错误节点或消失；本注释只在其上方补充说明，不触碰这些调用。
+ * 分块：show 命令(VIEW_NODE) / EVPN AF 配置(BGP_EVPN_NODE) / VNI 子节点
+ * (BGP_EVPN_VNI_NODE) / 测试命令 / `show bgp l2vpn evpn` 与
+ * `show bgp vni` / `show bgp evpn` 系列。 */
 void bgp_ethernetvpn_init(void)
 {
 	install_element(VIEW_NODE, &show_ip_bgp_l2vpn_evpn_cmd);
@@ -7629,10 +8489,13 @@ void bgp_ethernetvpn_init(void)
 	install_element(BGP_EVPN_NODE,
 			&bgp_evpn_enable_resolve_overlay_index_cmd);
 
+	/* 【注册】EVPN 测试命令（test_es_add / test_es_vni_add，隐藏命令）。 */
 	/* test commands */
 	install_element(BGP_EVPN_NODE, &test_es_add_cmd);
 	install_element(BGP_EVPN_NODE, &test_es_vni_add_cmd);
 
+	/* 【注册】`show bgp l2vpn evpn ...` 系列 show 命令（ES / VNI / summary /
+	 * route / import-rt 等），挂在 VIEW_NODE。 */
 	/* "show bgp l2vpn evpn" commands. */
 	install_element(VIEW_NODE, &show_bgp_l2vpn_evpn_es_cmd);
 	install_element(VIEW_NODE, &show_bgp_l2vpn_evpn_es_evi_cmd);
@@ -7658,6 +8521,8 @@ void bgp_ethernetvpn_init(void)
 	install_element(VIEW_NODE, &show_bgp_l2vpn_evpn_import_rt_cmd);
 	install_element(VIEW_NODE, &show_bgp_l2vpn_evpn_vrf_import_rt_cmd);
 
+	/* 【注册】`show bgp vni ...` 系列 show 命令（all / type / mac / ip 等），
+	 * 挂在 VIEW_NODE。 */
 	/* "show bgp vni" commands. */
 	install_element(VIEW_NODE, &show_bgp_vni_all_cmd);
 	install_element(VIEW_NODE, &show_bgp_vni_all_ead_cmd);
@@ -7672,6 +8537,7 @@ void bgp_ethernetvpn_init(void)
 	install_element(VIEW_NODE, &show_bgp_vni_macip_mac_addr_cmd);
 	install_element(VIEW_NODE, &show_bgp_vni_macip_ip_addr_cmd);
 
+	/* 【注册】`show bgp evpn ...` 系列隐藏别名 show 命令，挂在 VIEW_NODE。 */
 	/* "show bgp evpn" commands. */
 	install_element(VIEW_NODE, &show_bgp_evpn_vni_cmd);
 	install_element(VIEW_NODE, &show_bgp_evpn_summary_cmd);

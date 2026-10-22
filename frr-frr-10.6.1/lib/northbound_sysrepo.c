@@ -4,6 +4,34 @@
  *                     Renato Westphal
  */
 
+/* ============================================================================
+ * 【文件导读】northbound_sysrepo.c —— 北向的 sysrepo 后端
+ * ============================================================================
+ * 【它在 FRR 里干什么】本文件把 FRR 的北向层(northbound)接到 sysrepo：sysrepo 是基于
+ * YANG 的配置 / 状态数据库与订阅服务。这里注册各类回调，使外部客户端对运行配置的修改
+ * 能落到 FRR，FRR 的运维状态 / RPC 也能被查询与调用，并能把通知发回 sysrepo。
+ *
+ * 【三种订阅】
+ *   1) 配置变更：sr_module_change_subscribe 订阅模块 running 配置的变化，在 prepare /
+ *      apply / abort 三个阶段分别回调，把变更转成 nb_candidate_edit 编辑候选配置并走
+ *      nb_candidate_commit_* 两阶段事务。
+ *   2) 状态获取：sr_oper_get_subscribe 订阅需要 FRR 提供数据的 state(non-config)子树。
+ *   3) RPC：sr_rpc_subscribe_tree 订阅 RPC 节点，转发到 nb_callback_rpc。
+ *
+ * 【核心数据结构】模块级静态：master(事件循环)、session(当前 sr 会话)、connection(sr
+ * 连接)、transaction(正在进行的两阶段提交事务)。
+ *
+ * 【数据流】sysrepo 变更 → frr_sr_config_change_cb（按事件分派）→ candidate 编辑 / 事务
+ * → 应用或回滚。另有 frr_sr_read_cb 经事件管道异步驱动 sysrepo 事件处理。
+ *
+ * 【阅读顺序】全局状态与数据转换(yang_data_frr2sr) → 配置变更回调(prepare/apply/abort)
+ * → 状态 / RPC / 通知 → 订阅注册 → CLI 与初始化(frr_sr_init / finish) → 模块注册。
+ * ============================================================================
+ */
+
+/* FRR 基础头：log / lib_errors 提供日志与错误码；command / debug 提供 CLI 与调试开关；
+ * northbound.h 是北向核心接口。随后是 sysrepo 客户端库及其 values / xpath 头。
+ */
 #include <zebra.h>
 
 #include "log.h"
@@ -19,19 +47,32 @@
 #include <sysrepo/values.h>
 #include <sysrepo/xpath.h>
 
+/* 【全局】sysrepo 北向客户端的调试开关（供 "debug northbound client sysrepo" 控制）。 */
 static struct debug nb_dbg_client_sysrepo = { 0,
 					      "debug northbound client sysrepo",
 					      "Northbound client: Sysrepo" };
 
+/* 【全局状态】
+ *   master       : FRR 主事件循环，用于注册读事件与定时器。
+ *   session      : 当前 sysrepo 会话（running 数据）。
+ *   connection   : 到 sysrepo 的连接。
+ *   transaction  : 正在进行的两阶段提交事务（prepare 阶段产生，apply / abort 阶段消费）。
+ */
 static struct event_loop *master;
 static sr_session_ctx_t *session;
 static sr_conn_ctx_t *connection;
 static struct nb_transaction *transaction;
 
+/* 【函数原型】前置声明：frr_sr_read_cb 事件管道读回调；frr_sr_finish 关闭清理。 */
 static void frr_sr_read_cb(struct event *event);
 static int frr_sr_finish(void);
 
 /* Convert FRR YANG data value to sysrepo YANG data value. */
+/* 【函数】yang_data_frr2sr —— 把 FRR 的 yang_data（xpath + 字符串值）转换为 sysrepo 的
+ * sr_val_t。先按 xpath 找到北向节点以判定容器 / 列表 / 叶子类别，再依叶子基础 LY_TYPE
+ * 把字符串解析为对应 sr 类型。非 presence 容器返回 -1，无法识别的类型返回 -1。
+ * 返回 0 成功、-1 失败。
+ */
 static int yang_data_frr2sr(struct yang_data *frr_data, sr_val_t *sr_data)
 {
 	struct nb_node *nb_node;
@@ -152,6 +193,12 @@ static int yang_data_frr2sr(struct yang_data *frr_data, sr_val_t *sr_data)
 	return 0;
 }
 
+/* 【函数】frr_sr_process_change —— 处理 sysrepo 报出的单条配置变更：把 sr 操作(CREATED /
+ * MODIFIED / DELETED / MOVED)映射为北向操作(CREATE / MODIFY / DESTROY / MOVE)，再经
+ * nb_candidate_edit 编辑进候选配置 candidate。返回 NB_OK / NB_ERR。
+ * 易踩的坑：非 presence 容器无需处理；MODIFY 若不允许（如列表键的修改）应忽略；列表或
+ * 其键被删时会连带收到其叶子的删除通知，需按 NB_OP_DESTROY 是否允许来过滤。
+ */
 static int frr_sr_process_change(struct nb_config *candidate,
 				 sr_change_oper_t sr_op, sr_val_t *sr_old_val,
 				 sr_val_t *sr_new_val)
@@ -228,6 +275,13 @@ static int frr_sr_process_change(struct nb_config *candidate,
 	return NB_OK;
 }
 
+/* 【函数】frr_sr_config_change_cb_prepare —— 配置变更回调的 prepare 阶段：复制 running
+ * 配置为 candidate，遍历本次变更逐条编辑，然后 nb_candidate_commit_prepare 做校验并分配
+ * 应用所需资源（两阶段提交的第一阶段）。成功后把事务存入全局 transaction；失败则经
+ * sr_session_set_error_message 把错误回传给 sysrepo。返回映射后的 sysrepo 错误码：
+ * NB_OK / NB_ERR_NO_CHANGES → SR_ERR_OK，锁定 → SR_ERR_LOCKED，资源 → SR_ERR_NO_MEMORY，
+ * 其它 → SR_ERR_VALIDATION_FAILED。
+ */
 static int frr_sr_config_change_cb_prepare(sr_session_ctx_t *session,
 					   const char *module_name)
 {
@@ -300,6 +354,10 @@ static int frr_sr_config_change_cb_prepare(sr_session_ctx_t *session,
 	}
 }
 
+/* 【函数】frr_sr_config_change_cb_apply —— 两阶段提交的 apply 阶段：把上一步准备的
+ * transaction 真正应用(nb_candidate_commit_apply)，并释放其 candidate 配置。始终返回
+ * SR_ERR_OK。
+ */
 static int frr_sr_config_change_cb_apply(sr_session_ctx_t *session,
 					 const char *module_name)
 {
@@ -316,6 +374,9 @@ static int frr_sr_config_change_cb_apply(sr_session_ctx_t *session,
 	return SR_ERR_OK;
 }
 
+/* 【函数】frr_sr_config_change_cb_abort —— 事务回滚：调用 nb_candidate_commit_abort 撤销
+ * 已准备的事务并释放其配置。始终返回 SR_ERR_OK。
+ */
 static int frr_sr_config_change_cb_abort(sr_session_ctx_t *session,
 					 const char *module_name)
 {
@@ -331,6 +392,9 @@ static int frr_sr_config_change_cb_abort(sr_session_ctx_t *session,
 	return SR_ERR_OK;
 }
 
+/* 【函数】frr_sr_config_change_cb —— 配置变更的总回调：按 sysrepo 事件分派——ENABLED /
+ * CHANGE → prepare，DONE → apply，ABORT → abort；其余事件报错返回。
+ */
 /* Callback for changes in the running configuration. */
 static int frr_sr_config_change_cb(sr_session_ctx_t *session, uint32_t sub_id,
 				   const char *module_name, const char *xpath,
@@ -354,6 +418,10 @@ static int frr_sr_config_change_cb(sr_session_ctx_t *session, uint32_t sub_id,
 	}
 }
 
+/* 【函数】frr_sr_state_cb —— 状态获取回调：对请求路径调用 nb_oper_iterate_legacy 收集
+ * FRR 的运维数据并追加到 *parent（lyd 树），再把可能被替换的根回写 *parent。返回
+ * SR_ERR_OK / SR_ERR_INTERNAL。
+ */
 /* Callback for state retrieval. */
 static int frr_sr_state_cb(sr_session_ctx_t *session, uint32_t sub_id,
 			   const char *module_name, const char *xpath,
@@ -374,6 +442,10 @@ static int frr_sr_state_cb(sr_session_ctx_t *session, uint32_t sub_id,
 
 	return SR_ERR_OK;
 }
+/* 【函数】frr_sr_config_rpc_cb —— RPC 回调：按 xpath 找到北向节点后调用 nb_callback_rpc
+ * 执行注册的 RPC 回调，input / output 为 RPC 的入参与出参 lyd 树。返回 SR_ERR_OK；失败
+ * 返回 SR_ERR_OPERATION_FAILED（回调失败）或 SR_ERR_INTERNAL（路径未知）。
+ */
 static int frr_sr_config_rpc_cb(sr_session_ctx_t *session, uint32_t sub_id,
 				const char *xpath, const struct lyd_node *input,
 				sr_event_t sr_ev, uint32_t request_id,
@@ -402,6 +474,10 @@ static int frr_sr_config_rpc_cb(sr_session_ctx_t *session, uint32_t sub_id,
 	return ret;
 }
 
+/* 【函数】frr_sr_notification_send —— 通知发送钩子（注册到 nb_notification_send）：把参数
+ * 链表(元素为 yang_data)转成 sr_val_t 数组，再经 sr_notif_send 发往当前会话。返回
+ * NB_OK / NB_ERR。注意：转换中途失败会释放已分配的 sr 值；arguments 为空则发送无参通知。
+ */
 static int frr_sr_notification_send(const char *xpath, struct list *arguments)
 {
 	sr_val_t *values = NULL;
@@ -444,6 +520,9 @@ static int frr_sr_notification_send(const char *xpath, struct list *arguments)
 	return NB_OK;
 }
 
+/* 【函数】frr_sr_read_cb —— 事件管道可读回调：调用 sr_subscription_process_events 处理该
+ * 模块订阅上挂起的事件，然后重新注册读事件继续监听（sysrepo 事件驱动的核心循环）。
+ */
 static void frr_sr_read_cb(struct event *event)
 {
 	struct yang_module *module = EVENT_ARG(event);
@@ -461,6 +540,10 @@ static void frr_sr_read_cb(struct event *event)
 	event_add_read(master, frr_sr_read_cb, module, fd, &module->sr_thread);
 }
 
+/* 【函数】frr_sr_subscribe_config —— 为某模块订阅配置变更：sr_module_change_subscribe，
+ * 回调为 frr_sr_config_change_cb，带 ENABLED / NO_THREAD 等标志。订阅句柄存入
+ * module->sr_subscription。失败仅记日志，不中断。
+ */
 static void frr_sr_subscribe_config(struct yang_module *module)
 {
 	int ret;
@@ -478,6 +561,10 @@ static void frr_sr_subscribe_config(struct yang_module *module)
 			 sr_strerror(ret));
 }
 
+/* 【函数】frr_sr_subscribe_state —— yang_snodes_iterate 的遍历回调：只对“配置为 false 的
+ * state 子树(non-config，LYS_CONFIG_R)”的根节点订阅状态获取(sr_oper_get_subscribe)，回调
+ * 为 frr_sr_state_cb。返回 YANG_ITER_CONTINUE 继续遍历。
+ */
 static int frr_sr_subscribe_state(const struct lysc_node *snode, void *arg)
 {
 	struct yang_module *module = arg;
@@ -507,6 +594,9 @@ static int frr_sr_subscribe_state(const struct lysc_node *snode, void *arg)
 	return YANG_ITER_CONTINUE;
 }
 
+/* 【函数】frr_sr_subscribe_rpc —— yang_snodes_iterate 的遍历回调：对 LYS_RPC 节点订阅
+ * RPC(sr_rpc_subscribe_tree)，回调为 frr_sr_config_rpc_cb。返回 YANG_ITER_CONTINUE。
+ */
 static int frr_sr_subscribe_rpc(const struct lysc_node *snode, void *arg)
 {
 	struct yang_module *module = arg;
@@ -534,6 +624,9 @@ static int frr_sr_subscribe_rpc(const struct lysc_node *snode, void *arg)
 }
 
 /* CLI commands. */
+/* 【CLI】debug northbound client sysrepo [no] —— 开 / 关 sysrepo 北向客户端的调试日志。
+ * DEBUG_NODE2MODE 由当前 vty 节点得到调试掩码，按 argv[0] 是否为 "no" 决定开关。
+ */
 DEFUN (debug_nb_sr,
        debug_nb_sr_cmd,
        "[no] debug northbound client sysrepo",
@@ -551,6 +644,7 @@ DEFUN (debug_nb_sr,
 	return CMD_SUCCESS;
 }
 
+/* 【函数】frr_sr_cli_init —— 安装调试开关，并在 ENABLE / CONFIG 节点注册 CLI 命令。 */
 static void frr_sr_cli_init(void)
 {
 	debug_install(&nb_dbg_client_sysrepo);
@@ -559,6 +653,11 @@ static void frr_sr_cli_init(void)
 	install_element(CONFIG_NODE, &debug_nb_sr_cmd);
 }
 
+/* 【函数】frr_sr_init —— 初始化 sysrepo 集成：sr_connect 连接、sr_session_start 启动
+ * running 数据会话、遍历所有已加载 YANG 模块完成 配置 / 状态 / RPC 三类订阅，并为每个
+ * 模块注册事件管道读事件(frr_sr_read_cb)，最后注册通知发送钩子。任一步失败转
+ * cleanup(frr_sr_finish)。返回 0 成功、-1 失败。
+ */
 /* FRR's Sysrepo initialization. */
 static int frr_sr_init(void)
 {
@@ -613,6 +712,9 @@ cleanup:
 	return -1;
 }
 
+/* 【函数】frr_sr_finish —— 关闭：遍历模块退订并取消其读事件，停止会话、断开连接。返回
+ * 0。既作 frr_fini 钩子，也作初始化失败时的清理路径。
+ */
 static int frr_sr_finish(void)
 {
 	struct yang_module *module;
@@ -632,6 +734,9 @@ static int frr_sr_finish(void)
 	return 0;
 }
 
+/* 【函数】frr_sr_module_config_loaded —— frr_config_post 钩子：记录事件循环并执行
+ * frr_sr_init，成功后把 frr_sr_finish 注册到 frr_fini 钩子。返回 0 / -1。
+ */
 static int frr_sr_module_config_loaded(struct event_loop *tm)
 {
 	master = tm;
@@ -647,6 +752,7 @@ static int frr_sr_module_config_loaded(struct event_loop *tm)
 	return 0;
 }
 
+/* 【函数】frr_sr_module_late_init —— frr_late_init 钩子：执行 CLI 初始化。返回 0。 */
 static int frr_sr_module_late_init(struct event_loop *tm)
 {
 	frr_sr_cli_init();
@@ -654,6 +760,7 @@ static int frr_sr_module_late_init(struct event_loop *tm)
 	return 0;
 }
 
+/* 【函数】frr_sr_module_init —— 模块入口：注册 late_init 与 config_post 两个钩子。返回 0。 */
 static int frr_sr_module_init(void)
 {
 	hook_register(frr_late_init, frr_sr_module_late_init);
@@ -662,6 +769,9 @@ static int frr_sr_module_init(void)
 	return 0;
 }
 
+/* 【模块注册】FRR_MODULE_SETUP —— 声明本文件为一个 FRR 模块：名 frr_sysrepo、描述、
+ * 入口为 frr_sr_module_init。由 libfrr 加载时调用 .init。
+ */
 FRR_MODULE_SETUP(.name = "frr_sysrepo", .version = FRR_VERSION,
 		 .description = "FRR sysrepo integration module",
 		 .init = frr_sr_module_init,

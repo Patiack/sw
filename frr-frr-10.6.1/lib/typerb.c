@@ -9,6 +9,32 @@
  * Copyright (c) 2016 David Gwynne <dlg@openbsd.org>
  */
 
+/*
+ * 文件导读：typerb.c —— 红黑树算法实现
+ *
+ * 本文件实现 typerb.h 声明的红黑树操作。算法源自 OpenBSD / Niels Provos 的
+ * RB-tree（BSD 许可），FRR 将其重命名并剥离类型依赖，供 typesafe 框架复用。
+ *
+ * 层次结构：
+ *   - 一组 static inline 低级辅助函数：rbe_set / rbe_set_blackred /
+ *     rbe_rotate_left / rbe_rotate_right / rbe_insert_color / rbe_remove_color，
+ *     负责着色、旋转、插入后与删除后的自平衡；
+ *   - rbe_remove 与各 typed_rb_* 公开函数是真正的对外实现。
+ *
+ * 命名约定（用宏把通用名映射到类型化名，避免与其它模块冲突）：
+ *   rb_entry  映射到 typed_rb_entry，rbt_tree 映射到 typed_rb_root；
+ *   RBE_LEFT / RBE_RIGHT / RBE_PARENT / RBE_COLOR 访问节点字段；
+ *   RBH_ROOT 访问根字段。
+ *   颜色：RB_BLACK = 0，RB_RED = 1。
+ *
+ * 关键点：
+ *   - 所有比较经函数指针 cmpfn 完成，故实现与元素类型解耦；
+ *   - typed_rb_insert 发现等键时返回已存在的节点（不插入）；
+ *   - 删除后返回的旧节点内存会被 memset 清零，调用方可据此判断已摘除。
+ *
+ * 阅读顺序建议：先读宏与 rbe_set，再读左右旋，然后 rbe_insert_color 与
+ * rbe_remove_color 理解平衡，最后看 typed_rb_* 公开接口。
+ */
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
@@ -16,19 +42,27 @@
 #include <string.h>
 #include "lib/typesafe.h"
 
+/* 红黑树两种节点颜色。用整型而非 bool，便于直接赋值与位运算。 */
 #define RB_BLACK	0
 #define RB_RED		1
 
+/* 通用名到类型化名的别名，令下面的算法代码与具体类型无关。 */
 #define rb_entry		typed_rb_entry
 #define rbt_tree		typed_rb_root
 
+/* 节点字段访问宏：left / right / parent / color。 */
 #define RBE_LEFT(_rbe)		(_rbe)->rbt_left
 #define RBE_RIGHT(_rbe)		(_rbe)->rbt_right
 #define RBE_PARENT(_rbe)	(_rbe)->rbt_parent
 #define RBE_COLOR(_rbe)		(_rbe)->rbt_color
 
+/* 树根字段访问宏。 */
 #define RBH_ROOT(_rbt)		(_rbt)->rbt_root
 
+/*
+ * 初始化一个新节点：设父指针、左右孩子置空、颜色先着红。
+ * 新插入的节点一律先为红，再交给 rbe_insert_color 修正。
+ */
 static inline void rbe_set(struct rb_entry *rbe, struct rb_entry *parent)
 {
 	RBE_PARENT(rbe) = parent;
@@ -36,6 +70,9 @@ static inline void rbe_set(struct rb_entry *rbe, struct rb_entry *parent)
 	RBE_COLOR(rbe) = RB_RED;
 }
 
+/*
+ * 把 black 节点涂黑、red 节点涂红。用于插入旋转后的重新着色。
+ */
 static inline void rbe_set_blackred(struct rb_entry *black,
 				    struct rb_entry *red)
 {
@@ -43,6 +80,10 @@ static inline void rbe_set_blackred(struct rb_entry *black,
 	RBE_COLOR(red) = RB_RED;
 }
 
+/*
+ * 以 rbe 为支点左旋：rbe 的右孩子上提，rbe 变其左孩子，
+ * 并维护父指针与树根指针。旋转不改变中序遍历顺序。
+ */
 static inline void rbe_rotate_left(struct rbt_tree *rbt, struct rb_entry *rbe)
 {
 	struct rb_entry *parent;
@@ -67,6 +108,9 @@ static inline void rbe_rotate_left(struct rbt_tree *rbt, struct rb_entry *rbe)
 	RBE_PARENT(rbe) = tmp;
 }
 
+/*
+ * 以 rbe 为支点右旋，是 rbe_rotate_left 的镜像操作。
+ */
 static inline void rbe_rotate_right(struct rbt_tree *rbt, struct rb_entry *rbe)
 {
 	struct rb_entry *parent;
@@ -91,6 +135,12 @@ static inline void rbe_rotate_right(struct rbt_tree *rbt, struct rb_entry *rbe)
 	RBE_PARENT(rbe) = tmp;
 }
 
+/*
+ * 插入后的自平衡（红黑树性质修复）。
+ * 新节点已挂到树上且为红色，本函数边向上回溯边通过变色与旋转
+ * 消除"红-红冲突"，最后强制根为黑。
+ * 副作用：进入时令 count 加一（把计数并入此处，插入路径只调一次）。
+ */
 static inline void rbe_insert_color(struct rbt_tree *rbt, struct rb_entry *rbe)
 {
 	struct rb_entry *parent, *gparent, *tmp;
@@ -143,6 +193,11 @@ static inline void rbe_insert_color(struct rbt_tree *rbt, struct rb_entry *rbe)
 	RBE_COLOR(RBH_ROOT(rbt)) = RB_BLACK;
 }
 
+/*
+ * 删除后的自平衡。参数 parent 是 rbe 的父节点，rbe 是替换上来的孩子
+ * （可能为 NULL）。当被删节点原为黑色时，其子树黑色高度失衡，
+ * 本函数沿路径向上通过变色与旋转恢复平衡——这是红黑树最繁琐的部分。
+ */
 static inline void rbe_remove_color(struct rbt_tree *rbt,
 				    struct rb_entry *parent,
 				    struct rb_entry *rbe)
@@ -233,6 +288,12 @@ static inline void rbe_remove_color(struct rbt_tree *rbt,
 		RBE_COLOR(rbe) = RB_BLACK;
 }
 
+/*
+ * 删除节点 rbe 的核心实现，返回被删节点（内存已 memset 清零）。
+ * 分三种情况：无左子 / 无右子 / 左右都有（用中序后继替换）。
+ * 若删除的是黑节点则调用 rbe_remove_color 修复平衡，最后 count 减一。
+ * 注意：参数必须是树中真实存在的节点。
+ */
 static inline struct rb_entry *
 rbe_remove(struct rbt_tree *rbt, struct rb_entry *rbe)
 {
@@ -303,12 +364,18 @@ color:
 	return (old);
 }
 
+/* 对外删除入口，直接转调 rbe_remove。 */
 struct typed_rb_entry *typed_rb_remove(struct rbt_tree *rbt,
 				       struct rb_entry *rbe)
 {
 	return rbe_remove(rbt, rbe);
 }
 
+/*
+ * 对外插入入口：自根向下按 cmpfn 查找插入位置。
+ * 返回 NULL 表示插入成功；若找到等键节点则返回该节点且不插入。
+ * 成功插入后调用 rbe_insert_color 着色并计数。
+ */
 struct typed_rb_entry *typed_rb_insert(struct rbt_tree *rbt,
 		struct rb_entry *rbe, int (*cmpfn)(
 			const struct typed_rb_entry *a,
@@ -346,6 +413,7 @@ struct typed_rb_entry *typed_rb_insert(struct rbt_tree *rbt,
 	return NULL;
 }
 
+/* 从根向下查找与 key 同键的节点，找到返回，否则 NULL。 */
 /* Finds the node with the same key as elm */
 const struct rb_entry *typed_rb_find(const struct rbt_tree *rbt,
 		const struct rb_entry *key,
@@ -369,6 +437,10 @@ const struct rb_entry *typed_rb_find(const struct rbt_tree *rbt,
 	return NULL;
 }
 
+/*
+ * 查找键不小于 key 的最小节点。遍历时若 key 小于当前节点，
+ * 当前节点记为候选并继续往左；否则往右。返回 best 或 NULL。
+ */
 const struct rb_entry *typed_rb_find_gteq(const struct rbt_tree *rbt,
 		const struct rb_entry *key,
 		int (*cmpfn)(
@@ -392,6 +464,10 @@ const struct rb_entry *typed_rb_find_gteq(const struct rbt_tree *rbt,
 	return best;
 }
 
+/*
+ * 查找键严格小于 key 的最大节点。key 大于当前节点则记为候选并往右，
+ * 否则往左。返回 best 或 NULL。
+ */
 const struct rb_entry *typed_rb_find_lt(const struct rbt_tree *rbt,
 		const struct rb_entry *key,
 		int (*cmpfn)(
@@ -414,6 +490,10 @@ const struct rb_entry *typed_rb_find_lt(const struct rbt_tree *rbt,
 	return best;
 }
 
+/*
+ * 求中序后继：有右子树则取右子树最左节点；
+ * 否则向上找"我是其左孩子"的祖先。到达最大节点时返回 NULL。
+ */
 struct rb_entry *typed_rb_next(const struct rb_entry *rbe_const)
 {
 	struct rb_entry *rbe = (struct rb_entry *)rbe_const;
@@ -436,6 +516,10 @@ struct rb_entry *typed_rb_next(const struct rb_entry *rbe_const)
 	return rbe;
 }
 
+/*
+ * 求中序前驱：有左子树则取左子树最右节点；
+ * 否则向上找"我是其右孩子"的祖先。到达最小节点时返回 NULL。
+ */
 struct rb_entry *typed_rb_prev(const struct rb_entry *rbe_const)
 {
 	struct rb_entry *rbe = (struct rb_entry *)rbe_const;
@@ -458,6 +542,7 @@ struct rb_entry *typed_rb_prev(const struct rb_entry *rbe_const)
 	return rbe;
 }
 
+/* 沿左孩子一路到底即为最小节点；空树返回 NULL。 */
 struct rb_entry *typed_rb_min(const struct rbt_tree *rbt)
 {
 	struct rb_entry *rbe = RBH_ROOT(rbt);
@@ -471,6 +556,7 @@ struct rb_entry *typed_rb_min(const struct rbt_tree *rbt)
 	return parent;
 }
 
+/* 沿右孩子一路到底即为最大节点；空树返回 NULL。 */
 struct rb_entry *typed_rb_max(const struct rbt_tree *rbt)
 {
 	struct rb_entry *rbe = RBH_ROOT(rbt);
@@ -484,6 +570,11 @@ struct rb_entry *typed_rb_max(const struct rbt_tree *rbt)
 	return parent;
 }
 
+/*
+ * 判断节点 rbe 是否属于树 rbt：从 rbe 一路向上找根，
+ * 若最终根指针等于 rbt->rbt_root 则属于。复杂度 O(树高)。
+ * 注意：若 rbe 不在任何树中或树结构被破坏，行为未定义。
+ */
 bool typed_rb_member(const struct typed_rb_root *rbt,
 		     const struct typed_rb_entry *rbe)
 {

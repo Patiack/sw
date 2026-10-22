@@ -3,6 +3,39 @@
  * Copyright (c) 2016-2019  David Lamparter, for NetDEF, Inc.
  */
 
+/*
+ * 文件导读：typesafe.h —— 类型安全容器框架（lib 的基石之一）
+ *
+ * 背景：C 没有泛型。FRR 的做法是"宏生成"：调用方写
+ *   PREDECL_XXX(prefix);                 // 第一遍：前置声明
+ *   struct foo { ... struct prefix_item node; ... };
+ *   DECLARE_XXX(prefix, struct foo, node, cmpfn / hashfn);  // 第二遍：生成接口
+ * 宏便为前缀 prefix 生成一整套类型安全的操作函数（_init / _add / _del /
+ * _find / _next / _count ...）。函数内部用 container_of 在内嵌节点与
+ * 外层结构体之间转换，既避开 void 指针又保留类型检查。
+ *
+ * 为什么要两遍（PREDECL + DECLARE）：
+ *   PREDECL 只展开出 _head 与 _item 两个空壳结构体，让用户类型可以先互相
+ *   引用（例如 A 的容器里放 B 的节点）；DECLARE 才展开真正的函数体。
+ *
+ * 本文件定义的容器（各自对应 typesafe.c 里一段与类型无关的实现）：
+ *   LIST     单向链表，任意顺序，可作队列（add_tail / pop）
+ *   DLIST    双向链表，删除 O(1)
+ *   HEAP     N 叉堆（每节点 HEAP_NARY 个子），可作优先队列
+ *   SORTLIST 有序单向链表
+ *   HASH     哈希表（桶数组按 2 的幂增长 / 收缩）
+ *   SKIPLIST 跳表，有序，可作优先队列
+ *   RBTREE   红黑树（声明与实现见 typerb.h / typerb.c）
+ *
+ * UNIQ 与 NONUNIQ：唯一键版本在键相等时视为冲突；可重复键版本在键相等时
+ * 再按元素地址比较，从而允许重复键共存。
+ *
+ * 常用辅助宏：frr_each / frr_each_safe / frr_each_from 及反向版本 frr_rev_*；
+ * TYPESAFE_FIRST_NEXT / TYPESAFE_FIND 等把 const 变体批量包装成非 const。
+ *
+ * 阅读顺序建议：先看 frr_each 与 TYPESAFE_* 包装宏，再按 LIST -> DLIST ->
+ * HEAP -> SORTLIST -> HASH -> SKIPLIST 的顺序逐个读，最后转到 typerb.h。
+ */
 #ifndef _FRR_TYPESAFE_H
 #define _FRR_TYPESAFE_H
 
@@ -20,6 +53,13 @@ extern "C" {
 
 /* clang-format off */
 
+/*
+ * clang 静态分析器（clang-SA）专用的一段提示代码。
+ * 唯一键容器的 _add 成功时返回 NULL，而 SA 不理解我们真正持有的是内嵌
+ * tracker 结构体的地址（即对外层 item 的引用），会误报内存泄漏。
+ * 于是这里把 item 指针写进一个全局哑变量，只为告诉 SA"仍持有该引用"，
+ * 该变量从不被读取。非 clang-SA 构建时下列宏退化为空操作。
+ */
 #ifdef __clang_analyzer__
 /* so.  The _add typesafe calls on unique containers are defined to return
  * either NULL if the item was added to the container (i.e. it was "consumed"),
@@ -35,11 +75,13 @@ extern "C" {
  * the global variable, just to tell clang-SA that we still have a reference
  * to the pointer.  It's never read, just written to as a SA hint.
  */
+/* 仅供 clang-SA 观察的全局哑变量，用来"假装"持有 item 引用。 */
 static void *_sa_global_dummy;
 #define _sa_dummy_store(x) _sa_global_dummy = (x)
 #define _sa_assert(x) assert(x)
 
 #else /* !__clang_analyzer__ */
+/* 非 clang-SA 构建：把"引用提示"与断言宏都定义为空操作。 */
 #define _sa_dummy_store(x) do { } while (0)
 #define _sa_assert(x) do { } while (0)
 #endif
@@ -51,9 +93,17 @@ static void *_sa_global_dummy;
  * "frr_each (my_list_const, head, item)"
  */
 
+/*
+ * 通用正向迭代宏。要求容器提供 prefix_first 与 prefix_next。
+ * 用 const 变体迭代时，把容器前缀写成 "prefix_const"（见上方英文说明）。
+ */
 #define frr_each(prefix, head, item)                                           \
 	for (item = prefix##_first(head); item;                                \
 			item = prefix##_next(head, item))
+/*
+ * 允许在循环体内删除当前 item 的安全迭代宏：预先缓存下一个元素再执行循环体。
+ * 仅对实现了 _next_safe 的容器可用。
+ */
 #define frr_each_safe(prefix, head, item)                                      \
 	for (typeof(prefix##_next_safe(head, NULL)) prefix##_safe =            \
 			prefix##_next_safe(head,                               \
@@ -61,6 +111,7 @@ static void *_sa_global_dummy;
 		item;                                                          \
 		item = prefix##_safe,                                          \
 			prefix##_safe = prefix##_next_safe(head, prefix##_safe))
+/* 从指定元素 from 开始的正向迭代（包含 from 本身）。 */
 #define frr_each_from(prefix, head, item, from)                                \
 	for (item = from, from = prefix##_next_safe(head, item);               \
 		item;                                                          \
@@ -68,6 +119,7 @@ static void *_sa_global_dummy;
 
 /* reverse direction, only supported by a few containers */
 
+/* 反向迭代（从尾到头）。仅部分容器实现 _last / _prev，如 DLIST / RBTREE。 */
 #define frr_rev_each(prefix, head, item)                                       \
 	for (item = prefix##_last(head); item;                                 \
 			item = prefix##_prev(head, item))
@@ -86,6 +138,11 @@ static void *_sa_global_dummy;
 /* non-const variants.  these wrappers are the same for all the types, so
  * bundle them together here.
  */
+/*
+ * 批量把 const 首 / 后继访问器包装为返回非 const 指针的版本。
+ * 各容器预先实现 _const_first / _const_next，这里统一生成 _first / _next，
+ * 避免在每个容器宏里重复书写。
+ */
 #define TYPESAFE_FIRST_NEXT(prefix, type)                                      \
 macro_pure type *prefix ## _first(struct prefix##_head *h)                     \
 {                                                                              \
@@ -96,6 +153,7 @@ macro_pure type *prefix ## _next(struct prefix##_head *h, type *item)          \
 	return (type *)prefix ## _const_next(h, item);                         \
 }                                                                              \
 /* ... */
+/* 同上，把 const 的 _const_last / _const_prev 包装成 _last / _prev。 */
 #define TYPESAFE_LAST_PREV(prefix, type)                                       \
 macro_pure type *prefix ## _last(struct prefix##_head *h)                      \
 {                                                                              \
@@ -106,6 +164,7 @@ macro_pure type *prefix ## _prev(struct prefix##_head *h, type *item)          \
 	return (type *)prefix ## _const_prev(h, item);                         \
 }                                                                              \
 /* ... */
+/* 把 const 版 _const_find 包装成返回非 const 的 _find。 */
 #define TYPESAFE_FIND(prefix, type)                                            \
 macro_inline type *prefix ## _find(struct prefix##_head *h,                    \
 				   const type *item)                           \
@@ -113,6 +172,7 @@ macro_inline type *prefix ## _find(struct prefix##_head *h,                    \
 	return (type *)prefix ## _const_find(h, item);                         \
 }                                                                              \
 /* ... */
+/* 把 const 版 _const_find_lt / _const_find_gteq 包装成非 const 版本。 */
 #define TYPESAFE_FIND_CMP(prefix, type)                                        \
 macro_inline type *prefix ## _find_lt(struct prefix##_head *h,                 \
 				      const type *item)                        \
@@ -127,6 +187,7 @@ macro_inline type *prefix ## _find_gteq(struct prefix##_head *h,               \
 /* ... */
 
 /* *_member via find - when there is no better membership check than find() */
+/* 用 _const_find 实现 _member：指针相等即视为在容器内。 */
 #define TYPESAFE_MEMBER_VIA_FIND(prefix, type)                                 \
 macro_inline bool prefix ## _member(struct prefix##_head *h,                   \
 				    const type *item)                          \
@@ -136,6 +197,10 @@ macro_inline bool prefix ## _member(struct prefix##_head *h,                   \
 /* ... */
 
 /* *_member via find_gteq - same for non-unique containers */
+/*
+ * 可重复键容器的 _member：从 find_gteq 起沿 _next 线性扫描，
+ * 命中相等即返回真，遇到键更大（cmpfn > 0）则停止。
+ */
 #define TYPESAFE_MEMBER_VIA_FIND_GTEQ(prefix, type, cmpfn)                     \
 macro_inline bool prefix ## _member(struct prefix##_head *h,                   \
 				    const type *item)                          \
@@ -156,6 +221,10 @@ macro_inline bool prefix ## _member(struct prefix##_head *h,                   \
  * head *AND* the head doesn't point to itself (= everything except LIST,
  * DLIST and SKIPLIST), just switch out the entire head
  */
+/*
+ * 为"元素不反向指回头、且头不自指"的容器实现 _swap_all：整体交换两个 head。
+ * LIST / DLIST / SKIPLIST 因头里有自指指针，需各自的 _swap_all，不能用此宏。
+ */
 #define TYPESAFE_SWAP_ALL_SIMPLE(prefix)                                       \
 macro_inline void prefix ## _swap_all(struct prefix##_head *a,                 \
 				      struct prefix##_head *b)                 \
@@ -170,20 +239,37 @@ macro_inline void prefix ## _swap_all(struct prefix##_head *a,                 \
  * can be used as queue with add_tail / pop
  */
 
+/*
+ * 单向链表节点（内嵌进用户结构体），只含一个 next 指针。
+ * 不要直接使用本结构体，请用 PREDECL_LIST / DECLARE_LIST 生成的类型化版本。
+ */
 /* don't use these structs directly */
 struct slist_item {
 	struct slist_item *next;
 };
 
+/*
+ * 单向链表头。first 指向首元素；last_next 是"末元素 next 字段的地址"
+ * （即链尾那根指针的指针），用于 O(1) 尾部追加。
+ * 空链时 first 指向哨兵 typesafe_slist_sentinel，last_next 指向 &first。
+ */
 struct slist_head {
 	struct slist_item *first, **last_next;
 	size_t count;
 };
 
+/* 链尾哨兵实例。见下方英文说明：它取代 NULL 作为末元素 next 的值。 */
 /* this replaces NULL as the value for ->next on the last item. */
 extern struct slist_item typesafe_slist_sentinel;
+/* 链尾标记：指向哨兵。判断是否到链尾即比较指针是否等于它。 */
 #define _SLIST_LAST &typesafe_slist_sentinel
 
+/*
+ * 在 pos 指向的位置插入单链表节点 item。
+ * pos 是"前驱 next 字段的地址"（可为 head->first 或某元素的 next）。
+ * 若 pos 恰好等于 head->last_next（即插在链尾），则把 last_next 前移。
+ * 副作用：head->count 加一。
+ */
 static inline void typesafe_list_add(struct slist_head *head,
 		struct slist_item **pos, struct slist_item *item)
 {
@@ -194,6 +280,7 @@ static inline void typesafe_list_add(struct slist_head *head,
 	head->count++;
 }
 
+/* 判断 item 是否在本单链表上（实现见 typesafe.c）。 */
 extern bool typesafe_list_member(const struct slist_head *head,
 				 const struct slist_item *item);
 
@@ -205,13 +292,22 @@ extern bool typesafe_list_member(const struct slist_head *head,
  * }
  * DECLARE_LIST(namelist, struct name, nlitem);
  */
+/* 前置声明单链表：仅定义 _head / _item 两个空壳结构体。 */
 #define PREDECL_LIST(prefix)                                                   \
 struct prefix ## _head { struct slist_head sh; };                              \
 struct prefix ## _item { struct slist_item si; };                              \
 MACRO_REQUIRE_SEMICOLON() /* end */
 
+/* 单链表静态初始化器：first 指向哨兵，last_next 指向 &var.sh.first。 */
 #define INIT_LIST(var) { .sh = { .last_next = &var.sh.first, }, }
 
+/*
+ * 声明单链表的完整接口（第二遍展开）。
+ * 生成：_init / _fini / _add_head / _add_tail / _add_after（任意顺序插入）/
+ * _del / _pop / _const_first / _const_next / _next_safe / _count / _anywhere /
+ * _member / _first / _next / _swap_all。
+ * 因链尾地址被 last_next 缓存，_add_tail 为 O(1)。
+ */
 #define DECLARE_LIST(prefix, type, field)                                      \
                                                                                \
 macro_inline void prefix ## _init(struct prefix##_head *h)                     \
@@ -317,17 +413,30 @@ macro_pure bool prefix ## _member(const struct prefix##_head *h,               \
 }                                                                              \
 MACRO_REQUIRE_SEMICOLON() /* end */
 
+/*
+ * 双向链表节点（内嵌进用户结构体），含 next / prev 两个指针。
+ * 不要直接使用本结构体，请用 PREDECL_DLIST / DECLARE_DLIST 生成的类型化版本。
+ */
 /* don't use these structs directly */
 struct dlist_item {
 	struct dlist_item *next;
 	struct dlist_item *prev;
 };
 
+/*
+ * 双向链表头。hitem 是一个"哨兵"节点，与元素构成闭合环：
+ * 空链时 hitem.next = hitem.prev = &hitem，因此首尾无需特判。
+ */
 struct dlist_head {
 	struct dlist_item hitem;
 	size_t count;
 };
 
+/*
+ * 把 item 插入到 prev 之后。DLIST 是闭合环（末元素 next 指回 head），
+ * 故直接改写 prev->next 及相邻反向指针即可，无需判断是否链尾。
+ * 副作用：head->count 加一。
+ */
 static inline void typesafe_dlist_add(struct dlist_head *head,
 		struct dlist_item *prev, struct dlist_item *item)
 {
@@ -358,6 +467,10 @@ static inline void typesafe_dlist_add(struct dlist_head *head,
 	head->count++;
 }
 
+/*
+ * 整体交换两条双向链表。因环中元素的 next / prev 指回 head，
+ * 交换后必须把两端相邻节点的反向指针改指到新 head 上。
+ */
 static inline void typesafe_dlist_swap_all(struct dlist_head *a,
 					   struct dlist_head *b)
 {
@@ -386,19 +499,29 @@ static inline void typesafe_dlist_swap_all(struct dlist_head *a,
 	}
 }
 
+/* 判断 item 是否在本双链表上（实现见 typesafe.c）。 */
 extern bool typesafe_dlist_member(const struct dlist_head *head,
 				  const struct dlist_item *item);
 
 /* double-linked list, for fast item deletion
  */
+/* 前置声明双向链表。 */
 #define PREDECL_DLIST(prefix)                                                  \
 struct prefix ## _head { struct dlist_head dh; };                              \
 struct prefix ## _item { struct dlist_item di; };                              \
 MACRO_REQUIRE_SEMICOLON() /* end */
 
+/* 双向链表静态初始化器：让哨兵节点自指，形成空环。 */
 #define INIT_DLIST(var) { .dh = { \
 	.hitem = { &var.dh.hitem, &var.dh.hitem }, }, }
 
+/*
+ * 声明双向链表的完整接口。
+ * 生成：_init / _fini / _add_head / _add_tail / _add_after / _del / _pop
+ * （均 O(1)）/ _const_first / _const_last / _const_next / _const_prev /
+ * _next_safe / _prev_safe / _count / _anywhere / _member / _first / _next /
+ * _last / _prev / _swap_all。
+ */
 #define DECLARE_DLIST(prefix, type, field)                                     \
                                                                                \
 macro_inline void prefix ## _init(struct prefix##_head *h)                     \
@@ -513,31 +636,56 @@ MACRO_REQUIRE_SEMICOLON() /* end */
 
 /* note: heap currently caps out at 4G items */
 
+/*
+ * 堆中每个父节点的子节点个数（N 叉堆）。必须是 2 的幂——代码用位运算
+ * 计算父 / 兄弟下标。HEAP_NARY=8 时一个父节点最多 8 个子节点。
+ * 注意：堆容量上限约 4G 项（下标为 uint32_t）。
+ */
 #define HEAP_NARY 8U
+/* 堆元素在数组中的下标类型（同时也是 heap_item.index 的类型）。 */
 typedef uint32_t heap_index_i;
 
+/*
+ * 堆节点（内嵌进用户结构体）。index 记录本元素当前在 head->array 中的下标，
+ * 使得删除任意元素时能直接定位，并据此做上浮 / 下沉调整。
+ */
 struct heap_item {
 	uint32_t index;
 };
 
+/*
+ * 堆头。array 是元素指针数组（下标 0 为堆顶、即最小元素）；
+ * arraysz 为已分配容量；count 为当前元素个数。
+ */
 struct heap_head {
 	struct heap_item **array;
 	uint32_t arraysz, count;
 };
 
+/* 扩容阈值：插入前若 count+1 已达容量上限，就需要扩容。 */
 #define HEAP_RESIZE_TRESH_UP(h) \
 	(h->hh.count + 1 >= h->hh.arraysz)
+/* 缩容阈值：空堆或空闲容量过多（超过约一半）时缩容。 */
 #define HEAP_RESIZE_TRESH_DN(h) \
 	(h->hh.count == 0 || \
 	 h->hh.arraysz - h->hh.count > (h->hh.count + 1024) / 2)
 
+/* 前置声明 N 叉堆。 */
 #define PREDECL_HEAP(prefix)                                                   \
 struct prefix ## _head { struct heap_head hh; };                               \
 struct prefix ## _item { struct heap_item hi; };                               \
 MACRO_REQUIRE_SEMICOLON() /* end */
 
+/* 堆静态初始化器：空花括号即全零（array=NULL、count=0）。 */
 #define INIT_HEAP(var)		{ }
 
+/*
+ * 声明 N 叉堆的完整接口。cmpfn(a, b) 返回负值表示 a 优先（更靠前）。
+ * 生成：_init / _fini（要求堆已空）/ __cmp（内部比较器）/ _add / _del /
+ * _pop / _const_first / _const_next / _count / _member / _swap_all。
+ * _add 触发上浮，_del / _pop 触发下沉，并按阈值自动 resize。
+ * 注意：堆只保证堆顶最小，_const_next 是按数组顺序遍历，并非有序顺序。
+ */
 #define DECLARE_HEAP(prefix, type, field, cmpfn)                               \
                                                                                \
 macro_inline void prefix ## _init(struct prefix##_head *h)                     \
@@ -628,6 +776,10 @@ macro_pure bool prefix ## _member(const struct prefix##_head *h,               \
 }                                                                              \
 MACRO_REQUIRE_SEMICOLON() /* end */
 
+/*
+ * 调整堆容量（实现在 typesafe.c）。grow 为真扩容，否则缩容 / 释放。
+ * 下面两个 extern 分别是堆的下沉与上浮实现。
+ */
 extern void typesafe_heap_resize(struct heap_head *head, bool grow);
 extern void typesafe_heap_pushdown(struct heap_head *head, uint32_t index,
 		struct heap_item *item,
@@ -642,11 +794,16 @@ extern void typesafe_heap_pullup(struct heap_head *head, uint32_t index,
  * can be used as priority queue with add / pop
  */
 
+/*
+ * 有序单链表节点（内嵌进用户结构体），只含 next 指针。
+ * 不要直接使用本结构体，请用 PREDECL_SORTLIST / DECLARE_SORTLIST 的版本。
+ */
 /* don't use these structs directly */
 struct ssort_item {
 	struct ssort_item *next;
 };
 
+/* 有序单链表头。first 指向首元素（最小键）；count 为元素个数。 */
 struct ssort_head {
 	struct ssort_item *first;
 	size_t count;
@@ -660,19 +817,30 @@ struct ssort_head {
  * }
  * DECLARE_SORTLIST(namelist, struct name, nlitem)
  */
+/* 前置声明有序单链表（UNIQ / NONUNIQ 共用）。 */
 #define _PREDECL_SORTLIST(prefix)                                              \
 struct prefix ## _head { struct ssort_head sh; };                              \
 struct prefix ## _item { struct ssort_item si; };                              \
 MACRO_REQUIRE_SEMICOLON() /* end */
 
+/* 有序单链表的静态初始化器（空花括号即全零）。 */
 #define INIT_SORTLIST_UNIQ(var)		{ }
 #define INIT_SORTLIST_NONUNIQ(var)	{ }
 
+/* 前置声明唯一键有序单链表。 */
 #define PREDECL_SORTLIST_UNIQ(prefix)                                          \
 	_PREDECL_SORTLIST(prefix)
+/* 前置声明可重复键有序单链表。 */
 #define PREDECL_SORTLIST_NONUNIQ(prefix)                                       \
 	_PREDECL_SORTLIST(prefix)
 
+/*
+ * 有序单链表接口生成宏，由 DECLARE_SORTLIST_* 调用。
+ * cmpfn_nuq 用于查找（仅按键），cmpfn_uq 用于插入（含唯一性判定）。
+ * 生成：_init / _fini / _add / _del / _pop / _const_find_gteq /
+ * _const_find_lt / _const_first / _const_next / _next_safe / _count /
+ * _swap_all 等；_add 按 cmpfn_uq 找到有序位置插入。
+ */
 #define _DECLARE_SORTLIST(prefix, type, field, cmpfn_nuq, cmpfn_uq)            \
                                                                                \
 macro_inline void prefix ## _init(struct prefix##_head *h)                     \
@@ -769,6 +937,10 @@ macro_pure size_t prefix ## _count(const struct prefix##_head *h)              \
 }                                                                              \
 MACRO_REQUIRE_SEMICOLON() /* end */
 
+/*
+ * 唯一键有序单链表：插入与查找用同一个 cmpfn，键相等即冲突（_add 返回已有元素）。
+ * 额外生成 _const_find / _find / _member。
+ */
 #define DECLARE_SORTLIST_UNIQ(prefix, type, field, cmpfn)                      \
 	_DECLARE_SORTLIST(prefix, type, field, cmpfn, cmpfn);                  \
 									       \
@@ -788,6 +960,10 @@ TYPESAFE_FIND(prefix, type)                                                    \
 TYPESAFE_MEMBER_VIA_FIND(prefix, type)                                         \
 MACRO_REQUIRE_SEMICOLON() /* end */
 
+/*
+ * 可重复键有序单链表：内部先按键比较，键相等再按地址比较（__cmp），
+ * 以保证插入全序；_member 走 TYPESAFE_MEMBER_VIA_FIND_GTEQ 扫描同键段。
+ */
 #define DECLARE_SORTLIST_NONUNIQ(prefix, type, field, cmpfn)                   \
 macro_inline int _ ## prefix ## _cmp(const type *a, const type *b)             \
 {                                                                              \
@@ -808,12 +984,22 @@ MACRO_REQUIRE_SEMICOLON() /* end */
 /* hash, "sorted" by hash value
  */
 
+/*
+ * 哈希表节点（内嵌进用户结构体）。next 是同桶后继；hashval 缓存哈希值。
+ * 同桶按 hashval 非降序排列，既便于比较，也支持按桶遍历。
+ */
 /* don't use these structs directly */
 struct thash_item {
 	struct thash_item *next;
 	uint32_t hashval;
 };
 
+/*
+ * 哈希表头。entries 是桶数组（每桶一条链表）；count 为元素总数。
+ * tabshift 是"桶数指数 +1"的技巧值：0 表示空表，否则恒 >= 2，
+ * 使得 HASH_SIZE 可用 (1<<tabshift)>>1 在无分支下得到正确桶数（见下方英文说明）。
+ * minshift / maxshift 约束收缩 / 增长的下限与上限。
+ */
 struct thash_head {
 	struct thash_item **entries;
 	uint32_t count;
@@ -828,25 +1014,32 @@ struct thash_head {
 	uint8_t minshift, maxshift;
 };
 
+/* 由 tabshift 计算桶数：桶数 = 2 的 (tabshift-1) 次方（tabshift=0 时为 0）。 */
 #define _HASH_SIZE(tabshift)                                                   \
 	({                                                                     \
 		assume((tabshift) <= 31);                                      \
 		(1U << (tabshift)) >> 1;                                       \
 	})
+/* 便捷宏：直接由 head 求桶数。 */
 #define HASH_SIZE(head) \
 	_HASH_SIZE((head).tabshift)
+/* 由 tabshift 与哈希值算出桶下标：取哈希值高 (tabshift-1) 位。 */
 #define _HASH_KEY(tabshift, val)                                               \
 	({                                                                     \
 		assume((tabshift) >= 2 && (tabshift) <= 31);                   \
 		(val) >> (33 - (tabshift));                                    \
 	})
+/* 便捷宏：由 head 求桶下标。 */
 #define HASH_KEY(head, val) \
 	_HASH_KEY((head).tabshift, val)
+/* 扩容阈值：元素数达到桶数时触发扩容。 */
 #define HASH_GROW_THRESHOLD(head) \
 	((head).count >= HASH_SIZE(head))
+/* 缩容阈值：元素数降到桶数的一半以下时触发缩容。 */
 #define HASH_SHRINK_THRESHOLD(head) \
 	((head).count <= (HASH_SIZE(head) - 1) / 2)
 
+/* 扩容 / 缩容实现（见 typesafe.c）：grow 用于元素增加，shrink 用于元素减少。 */
 extern void typesafe_hash_grow(struct thash_head *head);
 extern void typesafe_hash_shrink(struct thash_head *head);
 
@@ -858,13 +1051,23 @@ extern void typesafe_hash_shrink(struct thash_head *head);
  * }
  * DECLARE_HASH(namelist, struct name, nlitem, cmpfunc, hashfunc)
  */
+/* 前置声明哈希表。 */
 #define PREDECL_HASH(prefix)                                                   \
 struct prefix ## _head { struct thash_head hh; };                              \
 struct prefix ## _item { struct thash_item hi; };                              \
 MACRO_REQUIRE_SEMICOLON() /* end */
 
+/* 哈希表静态初始化器：空花括号即全零（entries=NULL、tabshift=0）。 */
 #define INIT_HASH(var)	{ }
 
+/*
+ * 声明哈希表的完整接口。调用方需提供 cmpfn（同键判定）与 hashfn（取值哈希）。
+ * 生成：_init / _fini（先 shrink 释放）/ _add / _del / _pop / _pop_all /
+ * _const_find / _find / _const_first / _const_next / _next_safe / _count /
+ * _member / _swap_all 等。
+ * _add 先令 count 自增再按阈值 grow，并做等键检测（冲突时回退 count 并返回
+ * 已有元素）；_del 后按阈值 shrink；_pop_all(head, &i) 用游标 i 续取下一个。
+ */
 #define DECLARE_HASH(prefix, type, field, cmpfn, hashfn)                       \
                                                                                \
 macro_inline void prefix ## _init(struct prefix##_head *h)                     \
@@ -1021,19 +1224,35 @@ MACRO_REQUIRE_SEMICOLON() /* end */
  * can be used as priority queue with add / pop
  */
 
+/*
+ * 跳表核心常量（见下方三行定义）：
+ *   SKIPLIST_MAXDEPTH 最大层数；
+ *   SKIPLIST_EMBED    内嵌在 sskip_item 中的层数；
+ *   SKIPLIST_OVERFLOW 用来存放"溢出指针"的层序号——该层指针最低位作标记，
+ *                     指向堆上分配的 sskip_overflow，用于高于内嵌层数的层。
+ */
 /* don't use these structs directly */
 #define SKIPLIST_MAXDEPTH	16
 #define SKIPLIST_EMBED		4
 #define SKIPLIST_OVERFLOW	(SKIPLIST_EMBED - 1)
 
+/*
+ * 跳表节点（内嵌进用户结构体）。next[] 是内嵌的前向指针数组
+ * （SKIPLIST_EMBED 层）。更高层通过"溢出指针"间接存放。
+ */
 struct sskip_item {
 	struct sskip_item *next[SKIPLIST_EMBED];
 };
 
+/* 跳表的溢出高层前向指针数组，仅当节点随机层数超过内嵌层数时才分配。 */
 struct sskip_overflow {
 	struct sskip_item *next[SKIPLIST_MAXDEPTH - SKIPLIST_OVERFLOW];
 };
 
+/*
+ * 跳表头。hitem 是哨兵节点；overflow 提供 head 自身的高层前向指针；
+ * count 为元素个数。_init 时会把 hitem 的溢出层指向 overflow 数组并置标记位。
+ */
 struct sskip_head {
 	struct sskip_item hitem;
 	struct sskip_item *overflow[SKIPLIST_MAXDEPTH - SKIPLIST_OVERFLOW];
@@ -1048,14 +1267,23 @@ struct sskip_head {
  * }
  * DECLARE_SKIPLIST(namelist, struct name, nlitem, cmpfunc)
  */
+/* 前置声明跳表（UNIQ / NONUNIQ 共用）。 */
 #define _PREDECL_SKIPLIST(prefix)                                              \
 struct prefix ## _head { struct sskip_head sh; };                              \
 struct prefix ## _item { struct sskip_item si; };                              \
 MACRO_REQUIRE_SEMICOLON() /* end */
 
+/* 跳表静态初始化器（空花括号即全零；运行期 _init 会补上溢出指针）。 */
 #define INIT_SKIPLIST_UNIQ(var)		{ }
 #define INIT_SKIPLIST_NONUNIQ(var)	{ }
 
+/*
+ * 跳表接口生成宏，由 DECLARE_SKIPLIST_* 调用。
+ * cmpfn_nuq 用于查找（仅按键），cmpfn_uq 用于插入 / 删除（含唯一性判定）。
+ * 生成：_init（挂好溢出指针）/ _fini / _add / _del / _pop /
+ * _const_find_gteq / _const_find_lt / _const_first / _const_next /
+ * _next_safe / _count / _swap_all 等。
+ */
 #define _DECLARE_SKIPLIST(prefix, type, field, cmpfn_nuq, cmpfn_uq)            \
                                                                                \
 macro_inline void prefix ## _init(struct prefix##_head *h)                     \
@@ -1137,8 +1365,13 @@ macro_pure size_t prefix ## _count(const struct prefix##_head *h)              \
 }                                                                              \
 MACRO_REQUIRE_SEMICOLON() /* end */
 
+/* 前置声明唯一键跳表。 */
 #define PREDECL_SKIPLIST_UNIQ(prefix)                                          \
 	_PREDECL_SKIPLIST(prefix)
+/*
+ * 唯一键跳表：__cmp 作为统一比较器（查找与插入都用它），键相等即冲突。
+ * 额外生成 _const_find / _find / _member。
+ */
 #define DECLARE_SKIPLIST_UNIQ(prefix, type, field, cmpfn)                      \
 									       \
 macro_inline int prefix ## __cmp(const struct sskip_item *a,                   \
@@ -1161,8 +1394,13 @@ _DECLARE_SKIPLIST(prefix, type, field,                                         \
 		prefix ## __cmp, prefix ## __cmp);                             \
 MACRO_REQUIRE_SEMICOLON() /* end */
 
+/* 前置声明可重复键跳表。 */
 #define PREDECL_SKIPLIST_NONUNIQ(prefix)                                       \
 	_PREDECL_SKIPLIST(prefix)
+/*
+ * 可重复键跳表：__cmp 仅按键比较（供查找），__cmp_uq 在键相等时再按地址比较，
+ * 以保证插入全序；_member 走 TYPESAFE_MEMBER_VIA_FIND_GTEQ 扫描同键段。
+ */
 #define DECLARE_SKIPLIST_NONUNIQ(prefix, type, field, cmpfn)                   \
                                                                                \
 macro_inline int prefix ## __cmp(const struct sskip_item *a,                   \
@@ -1190,6 +1428,11 @@ _DECLARE_SKIPLIST(prefix, type, field,                                         \
 TYPESAFE_MEMBER_VIA_FIND_GTEQ(prefix, type, cmpfn)                             \
 MACRO_REQUIRE_SEMICOLON() /* end */
 
+/*
+ * 跳表底层实现原型（见 typesafe.c）。
+ * add 冲突时返回已存在元素、成功返回 NULL；del 返回被删元素或 NULL；
+ * pop 返回最小元素；find / find_gteq / find_lt 见对应语义。
+ */
 extern struct sskip_item *typesafe_skiplist_add(struct sskip_head *head,
 		struct sskip_item *item, int (*cmpfn)(
 			const struct sskip_item *a,
@@ -1221,6 +1464,7 @@ extern struct sskip_item *typesafe_skiplist_pop(struct sskip_head *head);
 }
 #endif
 
+/* typerb.h 与 typesafe.h 相互依赖、始终成套包含；分开只是为了文档清晰。 */
 /* the separation between these two files is really only for documentation
  * purposes, the are interdependent and are always included as a bundle
  */

@@ -4,6 +4,26 @@
  *                     Renato Westphal
  */
 
+/*
+ * 文件导读：取值 与 设值便捷包装实现（yang_wrappers.c）
+ *
+ * 本文件实现 yang_wrappers.h 声明的便捷包装：把 libyang 的值读取、类型转换、
+ * 字符串解析等细节封装成按类型分类的小函数，是 northbound 与各守护进程最常用的
+ * 取值入口。它建立在 yang.c 通用接口之上，属于“取值 与 设值”这一层。
+ *
+ * 统一的“四件套”模式（每种类型都有）：
+ *   yang_str2 加类型名     把字符串解析成该类型的值
+ *   yang_data_new_类型名   把该类型的值包装成 yang_data
+ *   yang_dnode_get_类型名  按 xpath 从数据树取值（内部走两个辅助函数）
+ *   yang_get_default_类型名 取 schema 上声明的默认值并转成该类型
+ *
+ * 两个辅助函数 yang_dnode_xpath_get_value 与 yang_dnode_xpath_get_canon 负责处理
+ * 可变参数路径与取值定位；宏 YANG_DNODE_GET_VALUE 与 YANG_DNODE_GET_CANON 把那段
+ * 样板代码收纳起来，避免每个 getter 重复书写。
+ *
+ * 重要提醒：这些 getter 在取不到值时往往直接断言或 abort，属于“取不到就崩”的约定，
+ * 调用方必须先确保路径一定存在。
+ */
 #include <zebra.h>
 
 #include "base64.h"
@@ -15,6 +35,10 @@
 #include "printfrr.h"
 
 
+/*
+ * YANG_DNODE_GET_ASSERT - 取值为空时的统一失败处理：记错误、打回溯、abort。
+ * 用于 getter 内部，表示“本应存在的节点却取不到”，属于不可恢复的编程错误。
+ */
 #define YANG_DNODE_GET_ASSERT(dnode, xpath)                                    \
 	do {                                                                   \
 		if ((dnode) == NULL) {                                         \
@@ -26,6 +50,10 @@
 	} while (0)
 
 /* Wrappers for repetitive varargs stanzas */
+/*
+ * YANG_DNODE_GET_VALUE - 收纳 getter 里启动可变参数、调用取值辅助、结束可变参数的样板。
+ * 展开后声明 dvalue 变量并完成赋值，因此使用它的函数里可直接引用 dvalue。
+ */
 #define YANG_DNODE_GET_VALUE                                                   \
 	va_list ap;                                                            \
                                                                                \
@@ -34,6 +62,9 @@
 	va_end(ap);
 
 
+/*
+ * YANG_DNODE_GET_CANON - 与 YANG_DNODE_GET_VALUE 类似，但取的是规范化字符串 canon。
+ */
 #define YANG_DNODE_GET_CANON                                                   \
 	va_list ap;                                                            \
                                                                                \
@@ -44,6 +75,11 @@
 
 PRINTFRR(2, 0)
 static inline const char *
+/*
+ * yang_dnode_xpath_get_canon - 取叶子节点的规范化字符串值。
+ * @xpath_fmt：可为 NULL（此时直接用 dnode）；非 NULL 则先按其定位到叶子。
+ * 返回：规范值字符串；定位失败会 abort。
+ */
 yang_dnode_xpath_get_canon(const struct lyd_node *dnode, const char *xpath_fmt,
 			   va_list ap)
 {
@@ -62,6 +98,11 @@ yang_dnode_xpath_get_canon(const struct lyd_node *dnode, const char *xpath_fmt,
 
 PRINTFRR(2, 0)
 static inline const struct lyd_value *
+/*
+ * yang_dnode_xpath_get_value - 取叶子节点的 lyd_value。
+ * 若是 union 类型，会深入一层取实际子类型的值。
+ * 返回：值结构指针；定位失败会 abort。
+ */
 yang_dnode_xpath_get_value(const struct lyd_node *dnode, const char *xpath_fmt,
 			   va_list ap)
 {
@@ -83,6 +124,10 @@ yang_dnode_xpath_get_value(const struct lyd_node *dnode, const char *xpath_fmt,
 	return dvalue;
 }
 
+/*
+ * yang_get_default_value - 按 xpath 取 schema 上声明的默认值字符串。
+ * 路径未知或没有默认值时打印错误并 abort。
+ */
 static const char *yang_get_default_value(const char *xpath)
 {
 	const struct lysc_node *snode;
@@ -105,16 +150,25 @@ static const char *yang_get_default_value(const char *xpath)
 /*
  * Primitive type: bool.
  */
+/*
+ * yang_str2bool - 把字符串解析成 bool（等于 "true" 即为真）。
+ */
 bool yang_str2bool(const char *value)
 {
 	return strmatch(value, "true");
 }
 
+/*
+ * yang_data_new_bool - 把 bool 值包装成 yang_data（转成 "true" 或 "false"）。
+ */
 struct yang_data *yang_data_new_bool(const char *xpath, bool value)
 {
 	return yang_data_new(xpath, (value) ? "true" : "false");
 }
 
+/*
+ * yang_dnode_get_bool - 按 xpath 从数据树取 bool 值；断言底层类型必须是 BOOL。
+ */
 bool yang_dnode_get_bool(const struct lyd_node *dnode, const char *xpath_fmt,
 			 ...)
 {
@@ -127,6 +181,9 @@ bool yang_dnode_get_bool(const struct lyd_node *dnode, const char *xpath_fmt,
 	return dvalue->boolean;
 }
 
+/*
+ * yang_get_default_bool - 取 xpath 处 schema 的默认值并解析为 bool。
+ */
 bool yang_get_default_bool(const char *xpath_fmt, ...)
 {
 	char xpath[XPATH_MAXLEN];
@@ -144,6 +201,9 @@ bool yang_get_default_bool(const char *xpath_fmt, ...)
 /*
  * Primitive type: dec64.
  */
+/*
+ * yang_str2dec64 - 把字符串解析成 dec64（double）；解析失败打印错误并 abort。
+ */
 double yang_str2dec64(const char *xpath, const char *value)
 {
 	double dbl = 0;
@@ -159,6 +219,9 @@ double yang_str2dec64(const char *xpath, const char *value)
 	return dbl;
 }
 
+/*
+ * yang_data_new_dec64 - 把 double 值格式化成字符串并包装成 yang_data。
+ */
 struct yang_data *yang_data_new_dec64(const char *xpath, double value)
 {
 	char value_str[BUFSIZ];
@@ -167,6 +230,10 @@ struct yang_data *yang_data_new_dec64(const char *xpath, double value)
 	return yang_data_new(xpath, value_str);
 }
 
+/*
+ * yang_dnode_get_dec64 - 按 xpath 取 dec64 值。
+ * dec64 在 libyang 中以整数存储，需按 fraction_digits 除以 10 的幂还原为小数。
+ */
 double yang_dnode_get_dec64(const struct lyd_node *dnode, const char *xpath_fmt,
 			    ...)
 {
@@ -184,6 +251,9 @@ double yang_dnode_get_dec64(const struct lyd_node *dnode, const char *xpath_fmt,
 	return (double)dvalue->dec64 / denom[dectype->fraction_digits];
 }
 
+/*
+ * yang_get_default_dec64 - 取默认值并解析为 dec64。
+ */
 double yang_get_default_dec64(const char *xpath_fmt, ...)
 {
 	char xpath[XPATH_MAXLEN];
@@ -200,6 +270,10 @@ double yang_get_default_dec64(const char *xpath_fmt, ...)
 
 /*
  * Primitive type: enum.
+ */
+/*
+ * yang_str2enum - 按 xpath 定位枚举类型，把字符串枚举名解析成其整数值。
+ * 找不到匹配的枚举名时打印错误并 abort。
  */
 int yang_str2enum(const char *xpath, const char *value)
 {
@@ -236,6 +310,9 @@ int yang_str2enum(const char *xpath, const char *value)
 	abort();
 }
 
+/*
+ * yang_data_new_enum - 按 xpath 定位枚举类型，把整数值转回枚举名并包装成 yang_data。
+ */
 struct yang_data *yang_data_new_enum(const char *xpath, int value)
 {
 	const struct lysc_node *snode;
@@ -270,6 +347,9 @@ struct yang_data *yang_data_new_enum(const char *xpath, int value)
 	abort();
 }
 
+/*
+ * yang_dnode_get_enum - 按 xpath 取枚举值（返回内部整数值）；断言类型为 ENUM 且有显式取值。
+ */
 int yang_dnode_get_enum(const struct lyd_node *dnode, const char *xpath_fmt,
 			...)
 {
@@ -282,6 +362,9 @@ int yang_dnode_get_enum(const struct lyd_node *dnode, const char *xpath_fmt,
 	return dvalue->enum_item->value;
 }
 
+/*
+ * yang_get_default_enum - 取默认值并解析为枚举值。
+ */
 int yang_get_default_enum(const char *xpath_fmt, ...)
 {
 	char xpath[XPATH_MAXLEN];
@@ -298,6 +381,10 @@ int yang_get_default_enum(const char *xpath_fmt, ...)
 
 /*
  * Primitive type: int8.
+ */
+/*
+ * int8 类型包装（上面 Primitive type: int8 一节）四件套：str2 解析、data_new 构造、
+ * dnode_get 取值、get_default 取默认值。
  */
 int8_t yang_str2int8(const char *value)
 {
@@ -340,6 +427,9 @@ int8_t yang_get_default_int8(const char *xpath_fmt, ...)
 /*
  * Primitive type: int16.
  */
+/*
+ * int16 类型包装四件套：str2 解析、data_new 构造、dnode_get 取值、get_default 取默认值。
+ */
 int16_t yang_str2int16(const char *value)
 {
 	return strtol(value, NULL, 10);
@@ -380,6 +470,9 @@ int16_t yang_get_default_int16(const char *xpath_fmt, ...)
 
 /*
  * Primitive type: int32.
+ */
+/*
+ * int32 类型包装四件套：str2 解析、data_new 构造、dnode_get 取值、get_default 取默认值。
  */
 int32_t yang_str2int32(const char *value)
 {
@@ -422,6 +515,9 @@ int32_t yang_get_default_int32(const char *xpath_fmt, ...)
 /*
  * Primitive type: int64.
  */
+/*
+ * int64 类型包装四件套：str2 解析、data_new 构造、dnode_get 取值、get_default 取默认值。
+ */
 int64_t yang_str2int64(const char *value)
 {
 	return strtoll(value, NULL, 10);
@@ -462,6 +558,9 @@ int64_t yang_get_default_int64(const char *xpath_fmt, ...)
 
 /*
  * Primitive type: uint8.
+ */
+/*
+ * uint8 类型包装四件套：str2 解析、data_new 构造、dnode_get 取值、get_default 取默认值。
  */
 uint8_t yang_str2uint8(const char *value)
 {
@@ -504,6 +603,9 @@ uint8_t yang_get_default_uint8(const char *xpath_fmt, ...)
 /*
  * Primitive type: uint16.
  */
+/*
+ * uint16 类型包装四件套：str2 解析、data_new 构造、dnode_get 取值、get_default 取默认值。
+ */
 uint16_t yang_str2uint16(const char *value)
 {
 	return strtoul(value, NULL, 10);
@@ -545,6 +647,9 @@ uint16_t yang_get_default_uint16(const char *xpath_fmt, ...)
 /*
  * Primitive type: uint32.
  */
+/*
+ * uint32 类型包装四件套：str2 解析、data_new 构造、dnode_get 取值、get_default 取默认值。
+ */
 uint32_t yang_str2uint32(const char *value)
 {
 	return strtoul(value, NULL, 10);
@@ -585,6 +690,9 @@ uint32_t yang_get_default_uint32(const char *xpath_fmt, ...)
 
 /*
  * Primitive type: uint64.
+ */
+/*
+ * uint64 类型包装四件套：str2 解析、data_new 构造、dnode_get 取值、get_default 取默认值。
  */
 uint64_t yang_str2uint64(const char *value)
 {
@@ -628,6 +736,11 @@ uint64_t yang_get_default_uint64(const char *xpath_fmt, ...)
  * Primitive type: string.
  *
  * All string wrappers can be used with non-string types.
+ */
+/*
+ * string 类型包装：data_new_string 构造、dnode_get_string 取值（返回库内字符串指针）、
+ * dnode_get_string_buf 取到调用方缓冲、get_default_string 与 get_default_string_buf 取默认值。
+ * 注意：这些包装对任意类型都可用（取的是规范化字符串），dnode_get_string 的返回值不必释放。
  */
 struct yang_data *yang_data_new_string(const char *xpath, const char *value)
 {
@@ -695,6 +808,10 @@ void yang_get_default_string_buf(char *buf, size_t size, const char *xpath_fmt,
 /*
  * Primitive type: binary.
  */
+/*
+ * binary 类型包装：data_new_binary 把原始字节做 base64 编码后包装成 yang_data；
+ * dnode_get_binary_buf 把库内 base64 字符串解码到调用方缓冲，返回实际字节数（缓冲不足会告警）。
+ */
 struct yang_data *yang_data_new_binary(const char *xpath, const char *value,
 				       size_t len)
 {
@@ -754,6 +871,9 @@ size_t yang_dnode_get_binary_buf(char *buf, size_t size,
 /*
  * Primitive type: empty.
  */
+/*
+ * empty 类型包装：data_new_empty 构造无值节点；dnode_get_empty 按 xpath 判断该空节点是否存在。
+ */
 struct yang_data *yang_data_new_empty(const char *xpath)
 {
 	return yang_data_new(xpath, NULL);
@@ -784,6 +904,10 @@ bool yang_dnode_get_empty(const struct lyd_node *dnode, const char *xpath_fmt,
 
 /*
  * Derived type: IP prefix.
+ */
+/*
+ * ip prefix 类型包装（前缀，含掩码）：str2 解析、data_new 构造、
+ * dnode_get 取值到 prefix、get_default 取默认值。
  */
 void yang_str2prefix(const char *value, union prefixptr prefix)
 {
@@ -834,6 +958,10 @@ void yang_get_default_prefix(union prefixptr var, const char *xpath_fmt, ...)
 /*
  * Derived type: ipv4.
  */
+/*
+ * ipv4 类型包装（单地址）：str2 解析到 in_addr、data_new 构造、
+ * dnode_get 取值到 in_addr、get_default 取默认值。
+ */
 void yang_str2ipv4(const char *value, struct in_addr *addr)
 {
 	(void)inet_pton(AF_INET, value, addr);
@@ -875,6 +1003,9 @@ void yang_get_default_ipv4(struct in_addr *var, const char *xpath_fmt, ...)
 
 /*
  * Derived type: ipv4p.
+ */
+/*
+ * ipv4p 类型包装（ipv4 前缀形式）：str2 解析、data_new 构造、dnode_get 取值、get_default 取默认值。
  */
 void yang_str2ipv4p(const char *value, union prefixptr prefix)
 {
@@ -922,6 +1053,10 @@ void yang_get_default_ipv4p(union prefixptr var, const char *xpath_fmt, ...)
 /*
  * Derived type: ipv6.
  */
+/*
+ * ipv6 类型包装（单地址）：str2 解析到 in6_addr、data_new 构造、
+ * dnode_get 取值到 in6_addr、get_default 取默认值。
+ */
 void yang_str2ipv6(const char *value, struct in6_addr *addr)
 {
 	(void)inet_pton(AF_INET6, value, addr);
@@ -963,6 +1098,9 @@ void yang_get_default_ipv6(struct in6_addr *var, const char *xpath_fmt, ...)
 
 /*
  * Derived type: ipv6p.
+ */
+/*
+ * ipv6p 类型包装（ipv6 前缀形式）：str2 解析、data_new 构造、dnode_get 取值、get_default 取默认值。
  */
 void yang_str2ipv6p(const char *value, union prefixptr prefix)
 {
@@ -1010,6 +1148,9 @@ void yang_get_default_ipv6p(union prefixptr var, const char *xpath_fmt, ...)
 /*
  * Derived type: ip.
  */
+/*
+ * ip 类型包装（通用 ipaddr，可承载 v4 或 v6）：str2 解析、data_new 构造、dnode_get 取值、get_default 取默认值。
+ */
 void yang_str2ip(const char *value, struct ipaddr *ip)
 {
 	(void)str2ipaddr(value, ip);
@@ -1049,6 +1190,9 @@ void yang_get_default_ip(struct ipaddr *var, const char *xpath_fmt, ...)
 	yang_str2ip(value, var);
 }
 
+/*
+ * mac 类型包装（以太网地址 ethaddr）：data_new 构造、str2 解析、dnode_get 取值。
+ */
 struct yang_data *yang_data_new_mac(const char *xpath,
 				    const struct ethaddr *mac)
 {
@@ -1073,6 +1217,10 @@ void yang_dnode_get_mac(struct ethaddr *mac, const struct lyd_node *dnode,
 	(void)prefix_str2mac(canon, mac);
 }
 
+/*
+ * date-and-time 类型包装：data_new_date_and_time 构造（is_monotime 为真时先把单调时钟换算为真实时间）、
+ * dnode_get_date_and_timespec 取 timespec、dnode_get_date_and_time 取 time_t。
+ */
 struct yang_data *yang_data_new_date_and_time(const char *xpath, time_t time, bool is_monotime)
 {
 	struct yang_data *yd;
@@ -1093,6 +1241,9 @@ struct yang_data *yang_data_new_date_and_time(const char *xpath, time_t time, bo
 	return yd;
 }
 
+/*
+ * yang_dnode_get_date_and_timespec - 取 date-and-time 并解析为 struct timespec（解析失败会 abort）。
+ */
 struct timespec yang_dnode_get_date_and_timespec(const struct lyd_node *dnode,
 						 const char *xpath_fmt, ...)
 {
@@ -1108,6 +1259,9 @@ struct timespec yang_dnode_get_date_and_timespec(const struct lyd_node *dnode,
 	return ts;
 }
 
+/*
+ * yang_dnode_get_date_and_time - 取 date-and-time 并解析为 time_t（解析失败会 abort）。
+ */
 time_t yang_dnode_get_date_and_time(const struct lyd_node *dnode,
 				    const char *xpath_fmt, ...)
 {
@@ -1123,6 +1277,9 @@ time_t yang_dnode_get_date_and_time(const struct lyd_node *dnode,
 	return time;
 }
 
+/*
+ * yang_dnode_get_bandwidth_ieee_float32 - 取 rt-types:bandwidth-ieee-float32 并解析为单精度浮点。
+ */
 float yang_dnode_get_bandwidth_ieee_float32(const struct lyd_node *dnode,
 					    const char *xpath_fmt, ...)
 {
@@ -1136,6 +1293,10 @@ float yang_dnode_get_bandwidth_ieee_float32(const struct lyd_node *dnode,
 	return value;
 }
 
+/*
+ * yang_dnode_get_identity - 取叶子节点的 identity 名称。
+ * 仅当节点的基类型是 LY_TYPE_IDENT 时返回其名字，否则返回 NULL。
+ */
 const char *yang_dnode_get_identity(const struct lyd_node *dnode)
 {
 	const struct lyd_node_term *term = (const struct lyd_node_term *)dnode;
@@ -1150,6 +1311,9 @@ const char *yang_dnode_get_identity(const struct lyd_node *dnode)
 	return NULL;
 }
 
+/*
+ * yang_nexthop_type2str - 把 nexthop 类型枚举转成 YANG 中使用的字符串名称（未知类型返回 "unknown"）。
+ */
 const char *yang_nexthop_type2str(uint32_t ntype)
 {
 	switch (ntype) {
@@ -1178,6 +1342,10 @@ const char *yang_nexthop_type2str(uint32_t ntype)
 }
 
 
+/*
+ * yang_afi_safi_value2identity - 把 afi 与 safi 组合映射为 frr-routing 模块的 identity 名。
+ * 无匹配组合时返回 NULL。
+ */
 const char *yang_afi_safi_value2identity(afi_t afi, safi_t safi)
 {
 	if (afi == AFI_IP && safi == SAFI_UNICAST)
@@ -1206,6 +1374,10 @@ const char *yang_afi_safi_value2identity(afi_t afi, safi_t safi)
 	return NULL;
 }
 
+/*
+ * yang_afi_safi_identity2value - 把 identity 名解析回 afi 与 safi（经出参返回）。
+ * 无法识别时输出 AFI_UNSPEC 与 SAFI_UNSPEC。
+ */
 void yang_afi_safi_identity2value(const char *key, afi_t *afi, safi_t *safi)
 {
 	if (strmatch(key, "frr-routing:ipv4-unicast")) {
