@@ -4,6 +4,46 @@
  * Copyright (C) 2017 Cumulus Networks
  * Copyright (C) 1999 Kunihiro Ishiguro
  */
+/* ============================================================================
+ * 【文件导读】bgp_packet.c —— BGP 报文“字节流收发层”：把消息对象编码成线格式，
+ *                    或把线格式解析回消息对象
+ * ============================================================================
+ * 职责与定位：
+ *   本文件处于 bgpd “连接线”的最底层，紧贴 TCP 套接字。它不决定“发什么路由”，
+ *   只负责“把 BGP 报文按 RFC4271 的线格式读出来 / 写出去”。上层 RIB 决策与
+ *   update-group 聚合（bgp_updgrp.c）产出的路由变化，最终都要经这里落到字节流。
+ *
+ * 两条主线：
+ *   - 接收线：bgp_io.c 的 IO 线程从套接字读满一个报文后，把该 stream 压入
+ *     connection->ibuf；主线程的 bgp_process_packet() 逐条弹出，按 type 分派到
+ *     bgp_open_receive / bgp_update_receive / bgp_notify_receive /
+ *     bgp_keepalive_receive / bgp_route_refresh_receive / bgp_capability_receive。
+ *     每个 *_receive 解析之后返回一个 FSM 事件码，由 bgp_event_update() 驱动状态机。
+ *   - 发送线：bgp_*_send 系列把构造好的报文 stream 经 bgp_packet_add() 压入
+ *     connection->obuf，再由 bgp_writes_on()/IO 线程写出。核心的批量路径是
+ *     bgp_generate_updgrp_packets()：把 update-group 已打包的 bpacket 逐 peer
+ *     “reformat”后塞进各自 obuf，实现“一次打包、多 peer 发送”。
+ *
+ * update-group 的关键思想（务必理解）：
+ *   bgp_updgrp.c 负责把“内容相同的一批更新”预编码成 bpacket（共享 buffer），
+ *   而本文件的 bgp_generate_updgrp_packets()/bpacket_reformat_for_peer() 负责在
+ *   发送瞬间按每个 peer 的属性（如 nexthop、AS_PATH、本地 AS）做差异化改写。
+ *   因此“打包”与“逐 peer 发送”被刻意分离——这正是 FRR 相比逐 peer 独立组包
+ *   的性能优势所在，也是阅读本文件最容易迷失的地方。
+ *
+ * 关键函数清单（建议阅读顺序）：
+ *   1) bgp_packet_set_marker / bgp_packet_set_size —— 报文头（Marker/长度/类型）
+ *   2) bgp_packet_add —— 入 obuf FIFO，并做 SendQ 卡死保护
+ *   3) bgp_process_packet —— 接收总入口（读 header、按 type 分派、驱动 FSM）
+ *   4) bgp_open_receive —— OPEN 解析 + 能力协商 + 冲突检测 + 参数校验
+ *   5) bgp_update_receive —— UPDATE 解析（withdraw/attr/NLRI/EoR）
+ *   6) bgp_generate_updgrp_packets —— 发送总调度（EOR、BoRR/EoRR、bpacket 出队）
+ *   7) bgp_notify_send* / bgp_write_notify —— NOTIFY 直写与 Hard Reset
+ *   8) bgp_capability_msg_parse / bgp_dynamic_capability_* —— 动态能力
+ *
+ * 建议阅读顺序：先 1、2（报文头与 FIFO），再 3、4、5（接收），最后 6（发送调度）。
+ * ============================================================================
+ */
 
 #include <zebra.h>
 #include <sys/time.h>
@@ -51,6 +91,11 @@
 #include "bgpd/bgp_flowspec.h"
 #include "bgpd/bgp_trace.h"
 
+/* ========== 0. 报文钩子：给外部模块（BMP/插件）预留的观测点 ========== */
+/* 钩子(hook)：bgp_packet_dump 在“收到报文、解析 header 之后”被调用，
+ * bgp_packet_send 在“主动发送 OPEN 等报文时”被调用；BMP 等模块借此旁路监听
+ * 收发报文，无需侵入本文件主逻辑。DEFINE_HOOK 在此展开钩子函数实现，
+ * 声明见 bgp_packet.h（DECLARE_HOOK）。 */
 DEFINE_HOOK(bgp_packet_dump,
 		(struct peer *peer, uint8_t type, bgp_size_t size,
 			struct stream *s),
@@ -61,6 +106,9 @@ DEFINE_HOOK(bgp_packet_send,
 			struct stream *s),
 		(peer, type, size, s));
 
+/* ========== 1. 报文头构造与 obuf FIFO 追加 ==========
+ * BGP 报文固定 19 字节头 = 16 字节 Marker(全 0xff) + 2 字节 Length + 1 字节 Type。
+ * RFC4271 规定 Marker 必须为全 1（历史上用于同步，接收侧仅做校验），本文件只负责写。 */
 /**
  * Sets marker and type fields for a BGP message.
  *
@@ -68,24 +116,32 @@ DEFINE_HOOK(bgp_packet_send,
  * @param type the packet type
  * @return the size of the stream
  */
+/* 【bgp_packet_set_marker】为报文写入 16 字节 Marker + 占位 Length(=0) + Type，
+ * 返回当前 stream 末尾偏移(endp)，供调用方随后续写报文体。长度字段先用 0 占位，
+ * 待报文体写完后由 bgp_packet_set_size() 回填，避免“边写边改长度”的复杂度。 */
 int bgp_packet_set_marker(struct stream *s, uint8_t type)
 {
 	int i;
 
 	/* Fill in marker. */
+/* Marker：16 字节全 0xff，按 RFC4271 逐字节写出。 */
 	for (i = 0; i < BGP_MARKER_SIZE; i++)
 		stream_putc(s, 0xff);
 
 	/* Dummy total length. This field is should be filled in later on. */
+/* Length 先用 0 占位（真实长度稍后由 bgp_packet_set_size 回填）。 */
 	stream_putw(s, 0);
 
 	/* BGP packet type. */
+/* Type：1 字节 BGP 报文类型（OPEN=1/UPDATE=2/NOTIFY=3/KEEPALIVE=4/...）。 */
 	stream_putc(s, type);
 
 	/* Return current stream size. */
 	return stream_get_endp(s);
 }
 
+/* 【bgp_packet_set_size】把总长度回填到 header 的 Length 字段（偏移 BGP_MARKER_SIZE=16）。
+ * 用 stream_putw_at 定点写入而非移动读写指针，故先保存 endp 再回写，写完指针不变。 */
 /**
  * Sets size field for a BGP message.
  *
@@ -99,9 +155,17 @@ void bgp_packet_set_size(struct stream *s)
 
 	/* Preserve current pointer. */
 	cp = stream_get_endp(s);
+/* 定点回填总长度到 header 第 16 字节处，不移动 stream 的读写指针。 */
 	stream_putw_at(s, BGP_MARKER_SIZE, cp);
 }
 
+/* 【bgp_packet_add】把已构造好的报文 stream 追加到该连接 obuf FIFO 尾部（发送队列）。
+ * 要点：
+ *  - 持 connection->io_mtx：obuf 会被 IO 线程并发消费，入队必须互斥；
+ *  - 队空时刷新 last_sendq_ok 时间戳，作为 SendQ 是否“卡住”的判断基准；
+ *  - 进而用 holdtime 判断发送队列是否长时间无进展：超过 2*holdtime 直接
+ *    触发 stop（bgp_event_stop_with_notify），这就是 BGP SendHoldTimer 的落地实现
+ *    （无需另建独立计时器——keepalive 会周期性经过此函数，从而周期性检查）。 */
 /*
  * Push a packet onto the beginning of the peer's output queue.
  * This function acquires the peer's write mutex before proceeding.
@@ -113,14 +177,17 @@ static void bgp_packet_add(struct peer_connection *connection,
 	uint32_t holdtime;
 	intmax_t sendholdtime;
 
+/* 锁住 io_mtx：obuf 可能被 IO 线程并发出队，入队与出队必须互斥。 */
 	frr_with_mutex (&connection->io_mtx) {
 		/* if the queue is empty, reset the "last OK" timestamp to
 		 * now, otherwise if we write another packet immediately
 		 * after it'll get confused
 		 */
+/* 队空则记下“最后一次成功发送”时间，作为后续 SendQ 卡死判断的基准。 */
 		if (!stream_fifo_count_safe(connection->obuf))
 			peer->last_sendq_ok = monotime(NULL);
 
+/* 追加到发送 FIFO 尾部。 */
 		stream_fifo_push(connection->obuf, s);
 	}
 
@@ -141,8 +208,10 @@ static void bgp_packet_add(struct peer_connection *connection,
 	 * timer that ticks down SendHoldTime, as we'll be here sooner
 	 * or later anyway and will see the checks below failing.
 	 */
+/* 未配置 holdtime 则不做 SendQ 卡死保护。 */
 	if (!holdtime) {
 		/* no holdtime, do nothing. */
+/* 发送队列超过 2*holdtime 无进展：判定对端一直不读，主动终止会话。 */
 	} else if (delta > sendholdtime) {
 		flog_err(EC_BGP_SENDQ_STUCK_PROPER,
 			 "%pBP has not made any SendQ progress for 2 holdtimes (%jds), terminating session",
@@ -157,6 +226,11 @@ static void bgp_packet_add(struct peer_connection *connection,
 	}
 }
 
+/* ========== 2. EOR(End-of-RIB) 报文构造 ========== */
+/* 【bgp_update_packet_eor】构造一条“End-of-RIB”空 UPDATE：
+ *  - IPv4/Unicast：完全空的 UPDATE（withdraw=0, attr=0）即隐式 EoR；
+ *  - 其它 AFI/SAFI：需显式携带 MP_UNREACH_NLRI（属性长度 6）表示该 AF 收敛完成。
+ * 是否发送受 DISABLE_BGP_ANNOUNCE 宏统一控制（测试/特殊构建用）。 */
 static struct stream *bgp_update_packet_eor(struct peer *peer, afi_t afi,
 					    safi_t safi)
 {
@@ -173,12 +247,14 @@ static struct stream *bgp_update_packet_eor(struct peer *peer, afi_t afi,
 
 	frrtrace(4, frr_bgp, eor_send, peer->bgp->name_pretty, afi, safi, peer->host);
 
+/* 按 peer 协商后的最大报文尺寸分配——Extended Message(RFC8092) 下可 > 4096。 */
 	s = stream_new(peer->max_packet_size);
 
 	/* Make BGP update packet. */
 	bgp_packet_set_marker(s, BGP_MSG_UPDATE);
 
 	/* Unfeasible Routes Length */
+/* Unfeasible Routes Length = 0（EOR 不撤销任何前缀）。 */
 	stream_putw(s, 0);
 
 	if (afi == AFI_IP && safi == SAFI_UNICAST) {
@@ -189,6 +265,7 @@ static struct stream *bgp_update_packet_eor(struct peer *peer, afi_t afi,
 		bgp_map_afi_safi_int2iana(afi, safi, &pkt_afi, &pkt_safi);
 
 		/* Total Path Attribute Length */
+/* 非 IPv4/Unicast 的 EoR：显式携带 MP_UNREACH_NLRI（长度 3：AFI+SAFI）。 */
 		stream_putw(s, 6);
 		stream_putc(s, BGP_ATTR_FLAG_OPTIONAL);
 		stream_putc(s, BGP_ATTR_MP_UNREACH_NLRI);
@@ -201,6 +278,9 @@ static struct stream *bgp_update_packet_eor(struct peer *peer, afi_t afi,
 	return s;
 }
 
+/* ========== 3. update-delay 与 Graceful-Restart 的 EOR 状态机 ========== */
+/* 【bgp_check_update_delay】当某 peer 的 EOR（隐式/显式）状态变化时调用，
+ * 判断“所有期望的 peer 是否都已完成 EOR”，若是则结束 update-delay（进入正常收敛）。 */
 /* Called when there is a change in the EOR(implicit or explicit) status of a
  * peer. Ends the update-delay if all expected peers are done with EORs. */
 void bgp_check_update_delay(struct bgp *bgp)
@@ -243,6 +323,8 @@ void bgp_check_update_delay(struct bgp *bgp)
 	}
 }
 
+/* 【bgp_update_restarted_peers】针对“已知重启过”的 peer（OPEN 里 GR 能力 R 位=1），
+ * 在其重新建立后计入 restarted_peers，并触发一次 update-delay 检查。 */
 /*
  * Called if peer is known to have restarted. The restart-state bit in
  * Graceful-Restart capability is used for that
@@ -264,6 +346,8 @@ void bgp_update_restarted_peers(struct peer *peer)
 	}
 }
 
+/* 【bgp_update_explicit_eors】检查 peer 是否已对“所有已协商的 AFI/SAFI”
+ * 显式发送了 EoR（PEER_STATUS_EOR_RECEIVED）；全部满足则计入 received_eors。 */
 /*
  * Should be called only when there is a change in the EOR_RECEIVED status
  * for any afi/safi on a peer.
@@ -298,6 +382,10 @@ static void bgp_update_explicit_eors(struct peer *peer)
 	bgp_check_update_delay(peer->bgp);
 }
 
+/* ========== 4. 接收侧：NLRI 分派与报文处理约定 ========== */
+/* 【bgp_nlri_parse】NLRI 解析的“前端分派器”：按 SAFI 把字节流交给各 AF 专用解析器
+ * （ip/label/vpn/evpn/flowspec）。mp_withdraw 为真表示这是 MP_UNREACH：多数 SAFI
+ * 传 NULL attr（纯撤销不需要属性），EVPN/flowspec 例外（仍需要 attr）。 */
 /**
  * Frontend for NLRI parsing, to fan-out to AFI/SAFI specific parsers.
  *
@@ -327,6 +415,9 @@ int bgp_nlri_parse(struct peer *peer, struct attr *attr,
 }
 
 
+/* ========== 5. 发送侧调度：pending refresh / write_proceed_actions ========== */
+/* 【bgp_process_pending_refresh】若此前因 EoR 未发而挂起的 ROUTE-REFRESH 请求
+ * （PEER_STATUS_REFRESH_PENDING）现在可以处理了：发送 BoRR 并触发路由重通告。 */
 /*
  * Check if route-refresh request from peer is pending (received before EoR),
  * and process it now.
@@ -351,6 +442,10 @@ static void bgp_process_pending_refresh(struct peer *peer, afi_t afi,
 	}
 }
 
+/* 【bgp_write_proceed_actions】发送收尾检查：遍历 peer 的每个 peer_af，
+ * 若仍有待发 bpacket、或 subgroup 还有包待打包、或该 AF 的 EoR 尚未发送，
+ * 就重新排一次 t_generate_updgrp_packets，保证“接着发”而不是漏发。
+ * 它是 bgp_generate_updgrp_packets 的“续跑”机制，防止一次 quota 用尽后停摆。 */
 /*
  * Checks a variety of conditions to determine whether the peer needs to be
  * rescheduled for packet generation again, and does so if necessary.
@@ -412,6 +507,15 @@ static void bgp_write_proceed_actions(struct peer *peer)
 	}
 }
 
+/* ========== 6. 发送核心：update-group 报文生成与逐 peer 输出 ========== */
+/* 【bgp_generate_updgrp_packets】发送主调度（由连接上的 t_generate_updgrp_packets
+ * 定时/事件触发）。职责：把每个 AF 的 update-group 已打包的 bpacket 出队、
+ * 按 peer 改写、压入 obuf；并在合适时机发送 EoR、BoRR/EoRR。
+ * 关键点：
+ *  - 仅 peer Established 且未被 update-delay/routeadv 挂起时工作；
+ *  - 受 wpkt_quanta（每轮打包上限）与 outq_limit（obuf 上限）双重限流，
+ *    并用 event_should_yield 主动让出 CPU，避免长时占用主线程；
+ *  - 优先发 WITHDRAW，再发 UPDATE（subgroup_withdraw_packet 先于 update）。 */
 /*
  * Generate advertisement information (withdraws, updates, EOR) from each
  * update group a peer belongs to, encode this information into packets, and
@@ -452,6 +556,7 @@ void bgp_generate_updgrp_packets(struct event *event)
 	 * let's stop adding to the outq if we are
 	 * already at the limit.
 	 */
+/* obuf 已达全局上限(outq_limit)，本轮不再入队，改为安排“续跑”。 */
 	if (connection->obuf->count >= bm->outq_limit) {
 		bgp_write_proceed_actions(peer);
 		return;
@@ -587,11 +692,15 @@ void bgp_generate_updgrp_packets(struct event *event)
 			/* Found a packet template to send, overwrite
 			 * packet with appropriate attributes from peer
 			 * and advance peer */
+/* 关键：把 update-group 打包好的 bpacket 按本 peer 的属性改写为可发送数据。 */
 			s = bpacket_reformat_for_peer(next_pkt, paf);
 			assert(s);
+/* 改写后的报文入本连接 obuf。 */
 			bgp_packet_add(connection, peer, s);
+/* 该 bpacket 已对别人就绪，推进该 subgroup 的“待发 peer”游标。 */
 			bpacket_queue_advance_peer(paf);
 		}
+/* 每轮最多处理 wpkt_quanta 个包，且需 event_should_yield 允许，防止长占 CPU。 */
 	} while (s && (++generated < wpq) && (connection->obuf->count <= bm->outq_limit) &&
 		 !event_should_yield(event));
 
@@ -601,6 +710,11 @@ void bgp_generate_updgrp_packets(struct event *event)
 	bgp_write_proceed_actions(peer);
 }
 
+/* ========== 7. 控制报文构造与发送 ==========
+ * KEEPALIVE / OPEN / NOTIFY / ROUTE-REFRESH / CAPABILITY 的统一出口。
+ * 除 NOTIFY 走“直写套接字”特殊路径外，其余都经 bgp_packet_add 入 obuf。 */
+/* 【bgp_keepalive_send】构造并排队一条 KEEPALIVE（无报文体，仅 19 字节头）。
+ * KEEPALIVE 用于维持存活，不携带任何数据。 */
 /*
  * Creates a BGP Keepalive packet and appends it to the peer's output queue.
  */
@@ -608,9 +722,11 @@ void bgp_keepalive_send(struct peer_connection *connection)
 {
 	struct stream *s;
 
+/* KEEPALIVE 固定用标准最大尺寸（4096），无需扩展。 */
 	s = stream_new(BGP_STANDARD_MESSAGE_MAX_PACKET_SIZE);
 
 	/* Make keepalive packet. */
+/* 只写 marker+length+type，无报文体。 */
 	bgp_packet_set_marker(s, BGP_MSG_KEEPALIVE);
 
 	/* Set packet size. */
@@ -628,6 +744,11 @@ void bgp_keepalive_send(struct peer_connection *connection)
 	bgp_writes_on(connection);
 }
 
+/* 【bgp_open_make】构造 OPEN 报文体：版本、MyAS（超 2 字节则填 AS_TRANS 并由
+ * AS4 能力携带真实 AS）、HoldTime、BGP Identifier，随后追加能力参数。
+ * 能力参数有两套长度编码：普通(1 字节 optlen，上限 255)与 Extended Optional
+ * Parameters(2 字节长度，RFC9072)。这里先按普通编码试写，若超出
+ * BGP_OPEN_NON_EXT_OPT_LEN 则回退并用扩展编码重写。 */
 struct stream *bgp_open_make(struct peer *peer, struct peer_connection *connection,
 			     uint16_t send_holdtime, as_t local_as, struct in_addr *id)
 {
@@ -638,10 +759,14 @@ struct stream *bgp_open_make(struct peer *peer, struct peer_connection *connecti
 	bgp_packet_set_marker(s, BGP_MSG_OPEN);
 
 	/* Set open packet values. */
+/* BGP Version = 4。 */
 	stream_putc(s, BGP_VERSION_4); /* BGP version */
+/* MyAS：超过 16 位最大值就填 AS_TRANS(23456)，真实 AS 由 AS4 能力携带。 */
 	stream_putw(s, (local_as <= BGP_AS_MAX) ? (uint16_t)local_as
 						: BGP_AS_TRANS);
+/* HoldTime（本端愿意等待对端存活的最大秒数）。 */
 	stream_putw(s, send_holdtime);		/* Hold Time */
+/* BGP Identifier（本机 Router-ID 的 IPv4 形式）。 */
 	stream_put_in_addr(s, id);		/* BGP Identifier */
 
 	/* Set capabilities */
@@ -651,6 +776,7 @@ struct stream *bgp_open_make(struct peer *peer, struct peer_connection *connecti
 	} else {
 		size_t endp = stream_get_endp(s);
 
+/* 先按普通编码试写能力；若超出上限则回退并用扩展编码重写。 */
 		if (bgp_open_capability(s, peer, connection, ext_opt_params) >
 		    BGP_OPEN_NON_EXT_OPT_LEN) {
 			stream_set_endp(s, endp);
@@ -670,6 +796,8 @@ struct stream *bgp_open_make(struct peer *peer, struct peer_connection *connecti
 	return s;
 }
 
+/* 【bgp_open_send】计算发送用的 HoldTime 与本地 AS（考虑 change_local_as），
+ * 调用 bgp_open_make 生成报文，经钩子广播后入 obuf 发送。 */
 /*
  * Creates a BGP Open packet and appends it to the peer's output queue.
  * Sets capabilities as necessary.
@@ -704,6 +832,10 @@ void bgp_open_send(struct peer_connection *connection)
 	bgp_writes_on(connection);
 }
 
+/* 【bgp_write_notify】把 NOTIFY 报文“直写”套接字（不等 IO 线程），力求尽快送出。
+ * 前置条件：要求 obuf 恰好有一条、且内容是合法 NOTIFY。属 best-effort：
+ * 写失败只按 TCP 致命错误处理，不做重传。写后把 v_start 翻倍（连接重试退避，
+ * 上限 120s），并向 FSM 投递 BGP_Stop（GR 场景下可能转为 Connect 而非 Idle）。 */
 /*
  * Writes NOTIFICATION message directly to a peer socket without waiting for
  * the I/O thread.
@@ -735,6 +867,7 @@ static void bgp_write_notify(struct peer_connection *connection,
 	 * socket is in nonblocking mode, if we can't deliver the NOTIFY, well,
 	 * we only care about getting a clean shutdown at this point.
 	 */
+/* 直接 write() 到 fd（非阻塞）：NOTIFY 走直写路径，尽量立刻送出。 */
 	ret = write(connection->fd, STREAM_DATA(s), stream_get_endp(s));
 
 	/*
@@ -749,19 +882,23 @@ static void bgp_write_notify(struct peer_connection *connection,
 
 	/* Disable Nagle, make NOTIFY packet go out right away */
 	val = 1;
+/* 关闭 Nagle，使 NOTIFY 立即发出。 */
 	(void)setsockopt(connection->fd, IPPROTO_TCP, TCP_NODELAY, (char *)&val,
 			 sizeof(val));
 
 	/* Retrieve BGP packet type. */
+/* 定位到 type 字段：跳过 marker(16)+length(2)。 */
 	stream_set_getp(s, BGP_MARKER_SIZE + 2);
 	type = stream_getc(s);
 
 	assert(type == BGP_MSG_NOTIFY);
 
 	/* Type should be notify. */
+/* 统计已发出的 NOTIFY 数。 */
 	atomic_fetch_add_explicit(&peer->notify_out, 1, memory_order_relaxed);
 
 	/* Double start timer. */
+/* 连接启动计时器翻倍退避（连续失败时逐步拉长重连间隔）。 */
 	peer->v_start *= 2;
 
 	/* Overflow check. */
@@ -772,11 +909,15 @@ static void bgp_write_notify(struct peer_connection *connection,
 	 * Handle Graceful Restart case where the state changes to
 	 * Connect instead of Idle
 	 */
+/* 投递 BGP_Stop；GR 场景下 FSM 可能据此转 Connect 而非 Idle。 */
 	BGP_EVENT_ADD(connection, BGP_Stop);
 
 	stream_free(s);
 }
 
+/* ========== 8. NOTIFY / Hard Reset（RFC8538 Graceful Notification） ========== */
+/* 【bgp_notify_encapsulate_hard_reset】把“原始 CEASE 通知”封装进一条
+ * Hard Reset 通知的数据段（ErrCode+Subcode+Data），实现“表达彻底终止意图”。 */
 /*
  * Encapsulate an original BGP CEASE Notification into Hard Reset
  */
@@ -796,6 +937,8 @@ static uint8_t *bgp_notify_encapsulate_hard_reset(uint8_t code, uint8_t subcode,
 	return message;
 }
 
+/* 【bgp_notify_decapsulate_hard_reset】接收侧反向操作：从 Hard Reset 的
+ * raw_data 中取出内层的 code/subcode/data。长度不足 2 视为无效，返回空结构。 */
 /*
  * Decapsulate an original BGP CEASE Notification from Hard Reset
  */
@@ -819,6 +962,8 @@ done:
 	return bn;
 }
 
+/* 【bgp_has_graceful_restart_notification】判断双方是否都已交换 GR 的 N 位
+ * （即都支持“Graceful Notification / Hard Reset”语义）。 */
 /* Check if Graceful-Restart N-bit is exchanged */
 bool bgp_has_graceful_restart_notification(struct peer *peer)
 {
@@ -826,6 +971,10 @@ bool bgp_has_graceful_restart_notification(struct peer *peer)
 	       CHECK_FLAG(peer->cap, PEER_CAP_GRACEFUL_RESTART_N_BIT_ADV);
 }
 
+/* 【bgp_notify_send_hard_reset】判断“本次要发的 CEASE”是否应升级为 Hard Reset：
+ * 仅当 N 位已交换，且子码属于需要彻底终止的集合（如 MaxPrefix、AdminShutdown、
+ * PeerUnconfig、HardReset、BFD Down）；AdminReset 是否升级由
+ * `bgp hard-administrative-reset` 配置决定。 */
 /*
  * Check if to send BGP CEASE Notification/Hard Reset?
  */
@@ -866,6 +1015,8 @@ bool bgp_notify_send_hard_reset(struct peer *peer, uint8_t code,
 	return false;
 }
 
+/* 【bgp_notify_received_hard_reset】接收侧判断：N 位已交换且收到的是
+ * CEASE/HardReset 子码，即认为对端要求彻底终止会话。 */
 /*
  * Check if received BGP CEASE Notification/Hard Reset?
  */
@@ -884,6 +1035,8 @@ bool bgp_notify_received_hard_reset(struct peer *peer, uint8_t code,
 	return false;
 }
 
+/* 映射表：CEASE 子码 → 本机记录的 peer down 原因（用于 show 与诊断）。
+ * 索引即子码值，越界时调用方会回退到 PEER_DOWN_CEASE_UNKNOWN。 */
 /* BGP cease subcode to peer down cause */
 static uint8_t bgp_cease_to_reset_cause[] = {
 	PEER_DOWN_CEASE_UNSPECIFIC,    PEER_DOWN_CEASE_PRX_COUNT,   PEER_DOWN_CEASE_ADMIN_SHUTDOWN,
@@ -894,6 +1047,14 @@ static uint8_t bgp_cease_to_reset_cause[] = {
 
 #define CEASE_CAUSES (sizeof(bgp_cease_to_reset_cause) / sizeof(bgp_cease_to_reset_cause[0]))
 
+/* 【bgp_notify_send_internal】NOTIFY 的统一实现（bgp_notify_send / _with_data /
+ * bgp_notify_io_invalid 三者的公共体）。
+ * 关键设计：
+ *  - 全程持 io_mtx，防止与其它线程同时改 obuf；
+ *  - 发送前 stream_fifo_clean 清空 obuf，丢弃未发数据（会话即将终止）；
+ *  - 若判定为 Hard Reset，则把原始 code/subcode 封装进数据段再发；
+ *  - 记录 last_reset_cause/notify 供调试；并按 CEASE 子码设置 peer 复位原因；
+ *  - use_curr=false 表示调用来自 IO 线程，禁止访问 peer 内部（如 curr）。 */
 /*
  * Creates a BGP Notify and appends it to the peer's output queue.
  *
@@ -924,6 +1085,7 @@ static void bgp_notify_send_internal(struct peer_connection *connection,
 	bool hard_reset = bgp_notify_send_hard_reset(peer, code, sub_code);
 
 	/* Lock I/O mutex to prevent other threads from pushing packets */
+/* 全程持 io_mtx（autounlock 在作用域结束时自动释放）。 */
 	frr_mutex_lock_autounlock(&connection->io_mtx);
 	/* ============================================== */
 
@@ -957,6 +1119,7 @@ static void bgp_notify_send_internal(struct peer_connection *connection,
 	bgp_packet_set_size(s);
 
 	/* wipe output buffer */
+/* 清空 obuf：会话即将终止，丢弃尚未发出的数据。 */
 	stream_fifo_clean(connection->obuf);
 
 	/*
@@ -1041,11 +1204,13 @@ static void bgp_notify_send_internal(struct peer_connection *connection,
 		peer_set_last_reset(peer, PEER_DOWN_NOTIFY_SEND);
 
 	/* Add packet to peer's output queue */
+/* 把 NOTIFY 压入 obuf，随后由 bgp_write_notify 直接写出。 */
 	stream_fifo_push(connection->obuf, s);
 
 	/* If Graceful-Restart N-bit (Notification) is exchanged,
 	 * and it's not a Hard Reset, let's retain the routes.
 	 */
+/* N 位已交换且非 Hard Reset：保留路由（NSF/GR 语义）。 */
 	if (bgp_has_graceful_restart_notification(peer) && !hard_reset &&
 	    CHECK_FLAG(peer->sflags, PEER_STATUS_NSF_MODE))
 		SET_FLAG(peer->sflags, PEER_STATUS_NSF_WAIT);
@@ -1057,6 +1222,7 @@ static void bgp_notify_send_internal(struct peer_connection *connection,
 	bgp_write_notify(connection, peer);
 }
 
+/* 【bgp_notify_send】对外最常用的入口：无数据段的 NOTIFY。 */
 /*
  * Creates a BGP Notify and appends it to the peer's output queue.
  *
@@ -1073,6 +1239,8 @@ void bgp_notify_send(struct peer_connection *connection, uint8_t code,
 	bgp_notify_send_internal(connection, code, sub_code, NULL, 0, true);
 }
 
+/* 【bgp_notify_send_with_data】带数据段的 NOTIFY（如 Bad Peer AS 回带对端 AS）。
+ * 由主线程调用，可安全访问 peer 对象（use_curr=true）。 */
 /*
  * Enqueue notification; called from the main pthread, peer object access is ok.
  */
@@ -1083,6 +1251,8 @@ void bgp_notify_send_with_data(struct peer_connection *connection, uint8_t code,
 				 true);
 }
 
+/* 【bgp_notify_io_invalid】专供 IO 线程在“报文非法/无法解析”时排队 NOTIFY：
+ * use_curr=false，刻意不触碰 peer 内部字段，避免与主线程的数据竞争。 */
 /*
  * For use by the io pthread, queueing a notification but avoiding access to
  * the peer object.
@@ -1095,6 +1265,9 @@ void bgp_notify_io_invalid(struct peer *peer, uint8_t code, uint8_t sub_code,
 				 datalen, false);
 }
 
+/* 【bgp_route_refresh_send】构造并发送 ROUTE-REFRESH 报文。
+ * subtype：0=普通请求；BGP_ROUTE_REFRESH_BORR/EORR=增强路由刷新(BoRR/EoRR)。
+ * orf_type==ORF_TYPE_PREFIX 时附带 ORF(前缀列表)项，并在写完后回填 ORF 长度。 */
 /*
  * Creates BGP Route Refresh packet and appends it to the peer's output queue.
  *
@@ -1125,19 +1298,24 @@ void bgp_route_refresh_send(struct peer *peer, afi_t afi, safi_t safi,
 	bgp_map_afi_safi_int2iana(afi, safi, &pkt_afi, &pkt_safi);
 
 	/* Make BGP update packet. */
+/* 对端未通告 Route-Refresh 能力，直接返回。 */
 	if (!CHECK_FLAG(peer->cap, PEER_CAP_REFRESH_RCV))
 		return;
 
 	s = stream_new(peer->max_packet_size);
 
+/* Route-Refresh 报文类型（新格式）。 */
 	bgp_packet_set_marker(s, BGP_MSG_ROUTE_REFRESH_NEW);
 
 	/* Encode Route Refresh message. */
+/* 编码 AFI(2B)。 */
 	stream_putw(s, pkt_afi);
+/* subtype：0=普通；增强刷新用 1(BoRR)/2(EoRR)。 */
 	if (subtype)
 		stream_putc(s, subtype);
 	else
 		stream_putc(s, 0);
+/* 编码 SAFI(1B)。 */
 	stream_putc(s, pkt_safi);
 
 	if (orf_type == ORF_TYPE_PREFIX)
@@ -1186,6 +1364,7 @@ void bgp_route_refresh_send(struct peer *peer, afi_t afi, safi_t safi,
 			}
 
 			/* Total ORF Entry Len. */
+/* 回填 ORF 条目总长度（指针 orfp 处）。 */
 			orf_len = stream_get_endp(s) - orfp - 2;
 			stream_putw_at(s, orfp, orf_len);
 		}
@@ -1207,6 +1386,9 @@ void bgp_route_refresh_send(struct peer *peer, afi_t afi, safi_t safi,
 	bgp_writes_on(peer->connection);
 }
 
+/* 【bgp_capability_send】构造并发送“动态能力(CAPABILITY)”报文。
+ * 前提：双方都已协商 DYNAMIC 能力(PEER_CAP_DYNAMIC_RCV/ADV)且会话 Established。
+ * action=SET 表示通告能力，UNSET 表示撤销。switch 按 capability_code 分派编码。 */
 /*
  * Create a BGP Capability packet and append it to the peer's output queue.
  *
@@ -1581,6 +1763,7 @@ void bgp_capability_send(struct peer *peer, afi_t afi, safi_t safi,
 				stream_putc(s, CAPABILITY_CODE_ENHE_LEN);
 				stream_putw(s, pkt_afi);
 				stream_putw(s, pkt_safi);
+/* 通告扩展下一跳：IPv4 AF，下一跳 AFI 固定为 IPv6（RFC5549）。 */
 				stream_putw(s, afi_int2iana(AFI_IP6));
 
 				COND_FLAG(peer->af_cap[AFI_IP][safi], PEER_CAP_ENHE_AF_ADV,
@@ -1616,6 +1799,10 @@ void bgp_capability_send(struct peer *peer, afi_t afi, safi_t safi,
 	bgp_writes_on(peer->connection);
 }
 
+/* ========== 9. 连接冲突检测（RFC1771/4271 6.8） ========== */
+/* 【bgp_collision_detect】处理“连接碰撞”：同一 peer 同时存在两条 TCP 连接时，
+ * 用 BGP Identifier（及 AS 号）比较决定保留哪一条。doppelganger 是指向另一条
+ * 连接所属 peer 的指针；返回 1/-1 表示“关闭对端连接 / 关闭本新连接”，0 表示无需处理。 */
 /* RFC1771 6.8 Connection collision detection. */
 static int bgp_collision_detect(struct peer_connection *connection,
 				struct peer *new, struct in_addr remote_id)
@@ -1743,8 +1930,16 @@ static int bgp_collision_detect(struct peer_connection *connection,
  * - May not call bgp_event_update()
  */
 
+/* 无需 FSM 动作时的“空”返回码。 */
 #define BGP_PACKET_NOOP 0
 
+/* ========== 10. 接收处理：OPEN / KEEPALIVE / UPDATE / NOTIFY / ROUTE-REFRESH /
+ * CAPABILITY 的报文级解析 ==========
+ * 约定（见上方大段注释）：每个 *_receive 返回一个 FSM 事件码；发了 NOTIFY 必须
+ * 返回 BGP_Stop；无需动作返回 BGP_PACKET_NOOP。 */
+/* 【bgp_open_receive】解析并校验 OPEN：版本、MyAS(含 AS4 能力)、HoldTime、
+ * Router-ID、连接冲突检测，然后交由 bgp_open_option_parse 处理能力选项，
+ * 最终确定 afc_nego 与 keepalive/holdtime 实际取值。 */
 /**
  * Process BGP OPEN message for peer.
  *
@@ -1773,6 +1968,8 @@ static int bgp_open_receive(struct peer_connection *connection,
 	uint16_t *holdtime_ptr;
 
 	/* Parse open packet. */
+/* 依次读取 OPEN 固定字段：version(1) / MyAS(2) / HoldTime(2) / Identifier(4)。
+ * 注意：此处先按 16 位 MyAS 读，AS4 真值稍后由能力解析覆盖。 */
 	version = stream_getc(connection->curr);
 	memcpy(notify_data_remote_as, stream_pnt(connection->curr), 2);
 	remote_as = stream_getw(connection->curr);
@@ -1803,6 +2000,7 @@ static int bgp_open_receive(struct peer_connection *connection,
 		XFREE(MTYPE_BGP_SOFT_VERSION, peer->soft_version);
 
 	/* Extended Optional Parameters Length for BGP OPEN Message */
+/* optlen==255 或本端启用了扩展可选参数，则可能使用扩展长度编码。 */
 	if (optlen == BGP_OPEN_NON_EXT_OPT_LEN
 	    || CHECK_FLAG(peer->flags, PEER_FLAG_EXTENDED_OPT_PARAMS)) {
 		uint8_t opttype;
@@ -1818,6 +2016,7 @@ static int bgp_open_receive(struct peer_connection *connection,
 		}
 
 		opttype = stream_getc(connection->curr);
+/* opttype=255(BGP_OPEN_NON_EXT_OPT_TYPE_EXTENDED_LENGTH)：改用 2 字节长度。 */
 		if (opttype == BGP_OPEN_NON_EXT_OPT_TYPE_EXTENDED_LENGTH) {
 			if (STREAM_READABLE(connection->curr) < 2) {
 				flog_err(
@@ -1828,6 +2027,7 @@ static int bgp_open_receive(struct peer_connection *connection,
 						BGP_NOTIFY_OPEN_MALFORMED_ATTR);
 				return BGP_Stop;
 			}
+/* 读到 2 字节扩展 optlen。 */
 			optlen = stream_getw(connection->curr);
 			SET_FLAG(peer->sflags,
 				 PEER_STATUS_EXT_OPT_PARAMS_LENGTH);
@@ -1847,6 +2047,7 @@ static int bgp_open_receive(struct peer_connection *connection,
 
 	if (optlen != 0) {
 		/* If not enough bytes, it is an error. */
+/* 剩余可读字节不足 optlen，判为格式错误并回 NOTIFY。 */
 		if (STREAM_READABLE(connection->curr) < optlen) {
 			flog_err(EC_BGP_PKT_OPEN,
 				 "%s: stream has not enough bytes (%u)",
@@ -1861,6 +2062,7 @@ static int bgp_open_receive(struct peer_connection *connection,
 		 * without
 		 * that we do not know which peer is connecting to us now.
 		 */
+/* 关键：先“窥探”AS4 能力取值——判断对端身份需要真实 4 字节 AS。 */
 		as4 = peek_for_as4_capability(connection, optlen);
 	}
 
@@ -1869,6 +2071,7 @@ static int bgp_open_receive(struct peer_connection *connection,
 
 	/* Just in case we have a silly peer who sends AS4 capability set to 0
 	 */
+/* 对端声称有 AS4 能力却把值填 0：非法，回 Bad Peer AS。 */
 	if (CHECK_FLAG(peer->cap, PEER_CAP_AS4_RCV) && !as4) {
 		flog_err(EC_BGP_PKT_OPEN,
 			 "%s bad OPEN, got AS4 capability, but AS4 set to 0",
@@ -1880,6 +2083,7 @@ static int bgp_open_receive(struct peer_connection *connection,
 	}
 
 	/* Codification of AS 0 Processing */
+/* 16 位 MyAS 为 0：非法。 */
 	if (remote_as == BGP_AS_ZERO) {
 		flog_err(EC_BGP_PKT_OPEN, "%s bad OPEN, got AS set to 0",
 			 peer->host);
@@ -1888,6 +2092,7 @@ static int bgp_open_receive(struct peer_connection *connection,
 		return BGP_Stop;
 	}
 
+/* 16 位 MyAS==AS_TRANS(23456)：必须从 AS4 能力取真实 AS。 */
 	if (remote_as == BGP_AS_TRANS) {
 		/* Take the AS4 from the capability.  We must have received the
 		 * capability now!  Otherwise we have a asn16 peer who uses
@@ -1942,6 +2147,7 @@ static int bgp_open_receive(struct peer_connection *connection,
 	 * internal peer, then the Error Subcode is set to
 	 * "Bad BGP Identifier".
 	 */
+/* 对端 Router-ID 为 0，或 iBGP 下与本机 Router-ID 相同：非法(Bad BGP Identifier)。 */
 	if (remote_id.s_addr == INADDR_ANY
 	    || (peer->sort == BGP_PEER_IBGP
 		&& ntohl(peer->local_id.s_addr) == ntohl(remote_id.s_addr))) {
@@ -1955,6 +2161,7 @@ static int bgp_open_receive(struct peer_connection *connection,
 	}
 
 	/* Peer BGP version check. */
+/* 仅支持 BGP Version 4。 */
 	if (version != BGP_VERSION_4) {
 		uint16_t maxver = htons(BGP_VERSION_4);
 		/* XXX this reply may not be correct if version < 4  XXX */
@@ -2030,6 +2237,7 @@ static int bgp_open_receive(struct peer_connection *connection,
 	 * When collision is detected and this peer is closed.
 	 * Return immediately.
 	 */
+/* 连接冲突检测：可能关闭本连接或对端连接。 */
 	ret = bgp_collision_detect(connection, peer, remote_id);
 	if (ret < 0)
 		return BGP_Stop;
@@ -2043,6 +2251,7 @@ static int bgp_open_receive(struct peer_connection *connection,
 	}
 
 	/* Set remote router-id */
+/* 记录对端 Router-ID。 */
 	peer->remote_id = remote_id;
 
 	/* From the rfc: Upon receipt of an OPEN message, a BGP speaker MUST
@@ -2052,6 +2261,7 @@ static int bgp_open_receive(struct peer_connection *connection,
 	   implementation may reject connections on the basis of the Hold Time.
 	   */
 
+/* HoldTime 必须为 0 或 >=3 秒，否则拒绝。 */
 	if (holdtime < 3 && holdtime != 0) {
 		bgp_notify_send_with_data(connection, BGP_NOTIFY_OPEN_ERR,
 					  BGP_NOTIFY_OPEN_UNACEP_HOLDTIME,
@@ -2080,6 +2290,7 @@ static int bgp_open_receive(struct peer_connection *connection,
 	else
 		send_holdtime = peer->bgp->default_holdtime;
 
+/* 取“本端发送 HoldTime”与“对端通告 HoldTime”的较小值作为实际 HoldTime。 */
 	if (holdtime < send_holdtime)
 		peer->v_holdtime = holdtime;
 	else
@@ -2088,6 +2299,7 @@ static int bgp_open_receive(struct peer_connection *connection,
 	/* Set effective keepalive to 1/3 the effective holdtime.
 	 * Use configured keeplive when < effective keepalive.
 	 */
+/* 实际 Keepalive = 实际 HoldTime / 3（RFC 建议），但不小于配置值。 */
 	peer->v_keepalive = peer->v_holdtime / 3;
 	if (CHECK_FLAG(peer->flags, PEER_FLAG_TIMER)) {
 		if (peer->keepalive && peer->keepalive < peer->v_keepalive)
@@ -2107,6 +2319,7 @@ static int bgp_open_receive(struct peer_connection *connection,
 
 	/* Open option part parse. */
 	if (optlen != 0) {
+/* 解析可选参数（能力）部分；失败则终止。 */
 		if (bgp_open_option_parse(peer, connection, optlen, &mp_capability) < 0)
 			return BGP_Stop;
 	} else {
@@ -2176,6 +2389,8 @@ static int bgp_open_receive(struct peer_connection *connection,
 	return Receive_OPEN_message;
 }
 
+/* 【bgp_keepalive_receive】收到 KEEPALIVE：更新 RTT；若配置了
+ * `neighbor ... shutdown on rtt`，当 RTT 高于阈值且连续命中，自动关闭该 peer。 */
 /**
  * Process BGP KEEPALIVE message for peer.
  *
@@ -2222,6 +2437,8 @@ static int bgp_keepalive_receive(struct peer_connection *connection,
 	return Receive_KEEPALIVE_message;
 }
 
+/* 【bgp_refresh_stalepath_timer_expire】BoRR 后置位的 stale 路由超时清理计时器：
+ * 超时仍未收到 EoRR，则清除该 AF 的 stale 路由。 */
 static void bgp_refresh_stalepath_timer_expire(struct event *event)
 {
 	struct peer_af *paf;
@@ -2245,6 +2462,8 @@ static void bgp_refresh_stalepath_timer_expire(struct event *event)
 	bgp_timer_set(peer->connection);
 }
 
+/* 【bgp_update_receive_eor】收到某 AF 的 End-of-RIB：置 EOR_RECEIVED 标志，
+ * 处理 update-delay / Graceful-Restart 的延迟选路，并清理 NSF stale 路由。 */
 static void bgp_update_receive_eor(struct bgp *bgp, struct peer *peer, afi_t afi, safi_t safi)
 {
 	struct vrf *vrf = vrf_lookup_by_id(bgp->vrf_id);
@@ -2286,6 +2505,9 @@ static void bgp_update_receive_eor(struct bgp *bgp, struct peer *peer, afi_t afi
 		bgp_clear_stale_route(peer, afi, safi);
 }
 
+/* 【bgp_update_receive】解析 UPDATE 报文：先校验 withdraw_len/attr_len 边界，
+ * 再解析路径属性(bgp_attr_parse)、解析各类 NLRI(IPv4/MP)，并识别 EoR。
+ * 属性解析若返回 WITHDRAW 类错误，则本应“更新”的 NLRI 退化为“撤销”。 */
 /**
  * Process BGP UPDATE message for peer.
  *
@@ -2317,6 +2539,7 @@ static int bgp_update_receive(struct peer_connection *connection,
 	struct bgp_nlri nlris[NLRI_TYPE_MAX];
 
 	/* Status must be Established. */
+/* UPDATE 只允许在 Established 状态到达。 */
 	if (!peer_established(connection)) {
 		flog_err(EC_BGP_INVALID_STATUS,
 			 "%s [FSM] Update packet received under status %s",
@@ -2337,12 +2560,14 @@ static int bgp_update_receive(struct peer_connection *connection,
 	peer->rcvd_attr_printed = false;
 
 	s = connection->curr;
+/* end 指向本报文的“报文体末尾”边界，后续所有长度校验都基于它。 */
 	end = stream_pnt(s) + size;
 
 	/* RFC1771 6.3 If the Unfeasible Routes Length or Total Attribute
 	   Length is too large (i.e., if Unfeasible Routes Length + Total
 	   Attribute Length + 23 exceeds the message Length), then the Error
 	   Subcode is set to Malformed Attribute List.  */
+/* 报文体不足 2 字节以读 Unfeasible Routes Length：格式错误。 */
 	if (stream_pnt(s) + 2 > end) {
 		flog_err(EC_BGP_UPDATE_RCV,
 			 "%s [Error] Update packet error (packet length is short for unfeasible length)",
@@ -2353,9 +2578,11 @@ static int bgp_update_receive(struct peer_connection *connection,
 	}
 
 	/* Unfeasible Route Length. */
+/* 读取撤销路由列表长度(2B)。 */
 	withdraw_len = stream_getw(s);
 
 	/* Unfeasible Route Length check. */
+/* 撤销长度越过报文边界：格式错误。 */
 	if (stream_pnt(s) + withdraw_len > end) {
 		flog_err(EC_BGP_UPDATE_RCV,
 			 "%s [Error] Update packet error (packet unfeasible length overflow %d)",
@@ -2375,6 +2602,7 @@ static int bgp_update_receive(struct peer_connection *connection,
 	}
 
 	/* Attribute total length check. */
+/* 报文体不足 2 字节以读属性总长度：格式错误。 */
 	if (stream_pnt(s) + 2 > end) {
 		flog_warn(
 			EC_BGP_UPDATE_PACKET_SHORT,
@@ -2386,9 +2614,11 @@ static int bgp_update_receive(struct peer_connection *connection,
 	}
 
 	/* Fetch attribute total length. */
+/* 读取路径属性总长度(2B)。 */
 	attribute_len = stream_getw(s);
 
 	/* Attribute length check. */
+/* 属性长度越过报文边界：格式错误。 */
 	if (stream_pnt(s) + attribute_len > end) {
 		flog_warn(
 			EC_BGP_UPDATE_PACKET_LONG,
@@ -2418,6 +2648,7 @@ static int bgp_update_receive(struct peer_connection *connection,
 
 	/* Parse attribute when it exists. */
 	if (attribute_len) {
+/* 解析路径属性；MP_REACH/MP_UNREACH 的 NLRI 会就地填进 nlris 槽位。 */
 		attr_parse_ret = bgp_attr_parse(peer, &attr, attribute_len,
 						&nlris[NLRI_MP_UPDATE],
 						&nlris[NLRI_MP_WITHDRAW]);
@@ -2452,6 +2683,7 @@ static int bgp_update_receive(struct peer_connection *connection,
 	}
 
 	/* Network Layer Reachability Information. */
+/* 剩余字节即 IPv4/Unicast 的 NLRI（更新部分）长度。 */
 	update_len = end - stream_pnt(s);
 
 	/* If we received MP_UNREACH_NLRI attribute, but also NLRIs, then
@@ -2536,6 +2768,7 @@ static int bgp_update_receive(struct peer_connection *connection,
 	 * Non-MP IPv4/Unicast EoR is a completely empty UPDATE
 	 * and MP EoR should have only an empty MP_UNREACH
 	 */
+/* EoR 判定：完全空的 UPDATE（无更新、无撤销、无 MP 更新）。 */
 	if (!update_len && !withdraw_len && nlris[NLRI_MP_UPDATE].length == 0) {
 		afi_t afi = 0;
 		safi_t safi;
@@ -2568,6 +2801,9 @@ static int bgp_update_receive(struct peer_connection *connection,
 	return Receive_UPDATE_message;
 }
 
+/* 【bgp_notify_receive】解析收到的 NOTIFY：抓取 code/subcode/data，
+ * 识别 Hard Reset 并解封内层通知，记录到 peer->notify，更新 peer 复位原因。
+ * 对 Unsupported Optional Parameter / Bad Peer AS 等有专门回退处理。 */
 /**
  * Process BGP NOTIFY message for peer.
  *
@@ -2583,6 +2819,7 @@ static int bgp_notify_receive(struct peer_connection *connection,
 	bool hard_reset = false;
 
 	/* Validate message size */
+/* NOTIFY 至少 2 字节(code+subcode)。 */
 	if (size < 2) {
 		flog_err(EC_BGP_NOTIFY_RCV,
 			 "%s [Error] Notify packet error (packet length is short)",
@@ -2596,6 +2833,7 @@ static int bgp_notify_receive(struct peer_connection *connection,
 		peer->notify.hard_reset = false;
 	}
 
+/* 读外层 code/subcode，剩余 size-2 为数据段长度。 */
 	outer.code = stream_getc(connection->curr);
 	outer.subcode = stream_getc(connection->curr);
 	outer.length = size - 2;
@@ -2606,6 +2844,7 @@ static int bgp_notify_receive(struct peer_connection *connection,
 		memcpy(outer.raw_data, stream_pnt(connection->curr), outer.length);
 	}
 
+/* 判断是否为 Hard Reset；是则解封内层真实通知。 */
 	hard_reset =
 		bgp_notify_received_hard_reset(peer, outer.code, outer.subcode);
 	if (hard_reset) {
@@ -2720,6 +2959,8 @@ static int bgp_notify_receive(struct peer_connection *connection,
 	return Receive_NOTIFICATION_message;
 }
 
+/* 【bgp_route_refresh_receive】处理收到的 ROUTE-REFRESH：普通请求→回 BoRR 并重通告；
+ * 增强刷新还处理 BoRR/EoRR 的 stale 路由标记与定时器，以及 ORF 前缀列表的增删。 */
 /**
  * Process BGP ROUTEREFRESH message for peer.
  *
@@ -2768,11 +3009,13 @@ static int bgp_route_refresh_receive(struct peer_connection *connection,
 	s = connection->curr;
 
 	/* Parse packet. */
+/* 读取 AFI(2B) / subtype(1B) / SAFI(1B)。 */
 	pkt_afi = stream_getw(s);
 	subtype = stream_getc(s);
 	pkt_safi = stream_getc(s);
 
 	/* Convert AFI, SAFI to internal values and check. */
+/* IANA 编号转内部 afi/safi；不识别则忽略该消息。 */
 	if (bgp_map_afi_safi_iana2int(pkt_afi, pkt_safi, &afi, &safi)) {
 		zlog_info(
 			"%s REFRESH_REQ for unrecognized afi/safi: %s/%s - ignored",
@@ -3153,6 +3396,11 @@ static int bgp_route_refresh_receive(struct peer_connection *connection,
 	return BGP_PACKET_NOOP;
 }
 
+/* ========== 11. 动态能力(CAPABILITY 报文)解析 ==========
+ * 与 OPEN 里的能力协商不同，这里的 *_dynamic_capability_* 处理的是会话运行中
+ * 通过 CAPABILITY 报文动态增删的能力项，action=SET/UNSET 分别表示通告/撤销。 */
+/* 【bgp_dynamic_capability_paths_limit】解析 Add-Path 的 Paths-Limit 能力：
+ * 按 (AFI,SAFI) 记录对端允许本机发送的路径条数上限。 */
 static void bgp_dynamic_capability_paths_limit(uint8_t *pnt, int action,
 					       struct capability_header *hdr,
 					       struct peer *peer)
@@ -3231,6 +3479,9 @@ ignore:
 	}
 }
 
+/* 【bgp_dynamic_capability_enhe】解析扩展下一跳能力(Extended Next-Hop, RFC5549)：
+ * 仅接受 IPv4 AFI + IPv6 下一跳、且 SAFI 属 {Unicast, MPLS_VPN, LabeledUnicast}
+ * 的组合，其余组合记录日志并忽略。 */
 static void bgp_dynamic_capability_enhe(uint8_t *pnt, int action, struct capability_header *hdr,
 					struct peer *peer)
 {
@@ -3306,6 +3557,8 @@ ignore:
 	}
 }
 
+/* 【bgp_dynamic_capability_orf】解析 ORF(Outbound Route Filter) 能力：
+ * 按 (AFI,SAFI) 与 mode(Both/Send/Receive) 设置 SM/RM 收发标志。 */
 static void bgp_dynamic_capability_orf(uint8_t *pnt, int action,
 				       struct capability_header *hdr,
 				       struct peer *peer)
@@ -3423,6 +3676,7 @@ static void bgp_dynamic_capability_orf(uint8_t *pnt, int action,
 	}
 }
 
+/* 【bgp_dynamic_capability_role】解析 BGP Role 能力(RFC9234)：记录对端角色。 */
 static void bgp_dynamic_capability_role(uint8_t *pnt, int action,
 					struct capability_header *hdr,
 					struct peer *peer)
@@ -3446,6 +3700,7 @@ static void bgp_dynamic_capability_role(uint8_t *pnt, int action,
 	}
 }
 
+/* 【bgp_dynamic_capability_fqdn】解析 FQDN 能力：提取并保存对端 hostname/domainname。 */
 static void bgp_dynamic_capability_fqdn(uint8_t *pnt, int action,
 					struct capability_header *hdr,
 					struct peer *peer)
@@ -3532,6 +3787,8 @@ static void bgp_dynamic_capability_fqdn(uint8_t *pnt, int action,
 	}
 }
 
+/* 【bgp_dynamic_capability_llgr】解析 Long-Lived GR 能力：按 (AFI,SAFI) 记录
+ * stale 时间（24 位编码）与标志，stale 时间取本端配置与对端通告的较小值。 */
 static void bgp_dynamic_capability_llgr(uint8_t *pnt, int action,
 					struct capability_header *hdr,
 					struct peer *peer)
@@ -3619,6 +3876,8 @@ static void bgp_dynamic_capability_llgr(uint8_t *pnt, int action,
 	}
 }
 
+/* 【bgp_dynamic_capability_graceful_restart】解析 Graceful-Restart 能力：
+ * 读取重启标志/时间(R/N 位)、各 AF 的 F 位(保留转发状态)，设置 peer->v_gr_restart。 */
 static void bgp_dynamic_capability_graceful_restart(uint8_t *pnt, int action,
 						    struct capability_header *hdr,
 						    struct peer *peer)
@@ -3716,6 +3975,8 @@ static void bgp_dynamic_capability_graceful_restart(uint8_t *pnt, int action,
 	}
 }
 
+/* 【bgp_dynamic_capability_software_version】解析软件版本能力：为兼容新旧草案，
+ * 同时兼容“能力值内含 1 字节长度”和“仅用能力头长度”两种编码。 */
 static void bgp_dynamic_capability_software_version(uint8_t *pnt, int action,
 						    struct capability_header *hdr,
 						    struct peer *peer)
@@ -3758,6 +4019,9 @@ static void bgp_dynamic_capability_software_version(uint8_t *pnt, int action,
 	}
 }
 
+/* 【bgp_capability_msg_parse】遍历 CAPABILITY 报文中的能力 TLV：
+ * 逐项做长度/动作合法性校验，再按能力码分派到对应 *_dynamic_capability_* 处理。
+ * 对已知能力用 cap_minsizes/cap_modsizes 表做最小长度与“整数倍”校验。 */
 /**
  * Parse BGP CAPABILITY message for peer.
  *
@@ -3971,6 +4235,8 @@ done:
 	return BGP_PACKET_NOOP;
 }
 
+/* 【bgp_capability_receive】CAPABILITY 报文接收入口：校验动态能力已协商、
+ * 会话已 Established，然后交给 bgp_capability_msg_parse 解析。 */
 /**
  * Parse BGP CAPABILITY message for peer.
  *
@@ -4016,6 +4282,11 @@ int bgp_capability_receive(struct peer_connection *connection,
 	return bgp_capability_msg_parse(peer, pnt, size);
 }
 
+/* ========== 12. 接收总入口：输入缓冲(ibuf)处理主循环 ========== */
+/* 【bgp_process_packet】从全局 connection_fifo 取连接，逐条消费其 ibuf 中的
+ * 报文：读 header(type/length)→按 type 分派到各 *_receive→必要时 bgp_event_update
+ * 驱动 FSM。这里刻意“绕过事件循环”直接调用 FSM，以保证事件顺序统一。
+ * 通过 rpkt_quanta 与 event_should_yield 主动让出，避免长时占用主线程。 */
 /**
  * Processes a peer's input buffer.
  *
@@ -4099,16 +4370,19 @@ void bgp_process_packet(struct event *event)
 		}
 
 		/* skip the marker and copy the packet length */
+/* 跳过 16 字节 Marker（不解析其内容）。 */
 		stream_forward_getp(connection->curr, BGP_MARKER_SIZE);
 		memcpy(notify_data_length, stream_pnt(connection->curr), 2);
 
 		/* read in the packet length and type */
+/* 读 Length(2B) 与 Type(1B)。 */
 		size = stream_getw(connection->curr);
 		type = stream_getc(connection->curr);
 
 		hook_call(bgp_packet_dump, peer, type, size, connection->curr);
 
 		/* adjust size to exclude the marker + length + type */
+/* size 去掉 header(19B)，得到报文体长度传给各 *_receive。 */
 		size -= BGP_HEADER_SIZE;
 
 		/* Read rest of the packet and call each sort of packet routine
@@ -4193,10 +4467,12 @@ void bgp_process_packet(struct event *event)
 			 * invalid header at this point is indicative of a
 			 * security issue.
 			 */
+/* header 已在 IO 层做过基本校验；此处类型非法视为安全事件。 */
 			assert (!"Message of invalid type received during input processing");
 		}
 
 		/* delete processed packet */
+/* 释放已处理报文。 */
 		stream_free(connection->curr);
 		connection->curr = NULL;
 		processed++;
@@ -4204,6 +4480,7 @@ void bgp_process_packet(struct event *event)
 
 		/* Update FSM */
 		if (mprc != BGP_PACKET_NOOP)
+/* 用 *_receive 返回的 FSM 事件码驱动状态机。 */
 			fsm_update_result = bgp_event_update(connection, mprc);
 
 		/*
@@ -4277,6 +4554,9 @@ done:
 		event_add_event(bm->master, bgp_process_packet, NULL, 0, &bm->e_process_packet);
 }
 
+/* ========== 13. 收尾 ========== */
+/* 【bgp_send_delayed_eor】当路由被 selection-deferral 计时器处理完后，
+ * 对每个 peer 触发一次发送调度（bgp_write_proceed_actions 会补发 EOR）。 */
 /* Send EOR when routes are processed by selection deferral timer */
 void bgp_send_delayed_eor(struct bgp *bgp)
 {

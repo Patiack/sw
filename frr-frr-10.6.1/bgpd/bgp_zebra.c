@@ -3,6 +3,55 @@
  * Copyright (C) 1997, 98, 99 Kunihiro Ishiguro
  * Copyright (c) 2023 LabN Consulting, L.L.C.
  */
+/* ============================================================================
+ * 【文件导读】bgp_zebra.c —— bgpd 与 zebra 的“南向接口”：把 BGP 决策结果真正
+ *                    装进内核 FIB，并从内核回灌拓扑/下一跳/接口信息
+ * ============================================================================
+ * 职责与定位：
+ *   本文件是 bgpd 的“数据面出口”。BGP 选出的最佳路径本身只是 RIB 里的决策，
+ *   要让流量真正按它转发，必须把“前缀 + 下一跳 + 标签 + 表 ID”编码成 zapi 消息
+ *   下发给 zebra，由 zebra 落到内核。反过来，zebra 也向 bgpd 订阅并推送：
+ *   接口/地址/邻居变化、已重分发路由的变化、下一跳解析结果、EVPN 的 VNI/ES/MACIP、
+ *   SRv6 locator/SID、标签池 chunk 等。所以本文件是**双向**的。
+ *
+ * 两条主线：
+ *   - 出向（bgpd → zebra）：bgp_zebra_route_install() 把待办 dest 压入
+ *     bm->zebra_announce_head 队列，异步地由 bgp_handle_route_announcements_to_zebra()
+ *     调用 bgp_zebra_announce_actual()/bgp_zebra_withdraw_actual() 编码并
+ *     zclient_route_send()。注意“下发是异步的”：函数返回 ≠ 已进内核；内核安装
+ *     结果通过 bgp_zebra_route_notify_owner() 回调回填 dest 的
+ *     BGP_NODE_FIB_INSTALL_PENDING / BGP_NODE_FIB_INSTALLED 标志。
+ *   - 入向（zebra → bgpd）：bgp_handlers[] 表把各类 ZEBRA_* 消息分派到对应回调
+ *     （接口 up/down、地址增删、redistribute 路由、EVPN、SRv6 等）。
+ *
+ * 关键概念（阅读本文件务必抓住）：
+ *   - zclient：与 zebra 的连接句柄。bgp_zclient 是主异步连接；bgp_zclient_sync
+ *     是同步连接（用于标签管理器 label-manager 这类需同步应答的请求）。
+ *   - zapi_route / zapi_nexthop：下发的“线格式”结构；nexthop 的 type
+ *     (IFINDEX / IPV4(_IFINDEX) / IPV6(_IFINDEX) / BLACKHOLE / IPV6_IFINDEX 链路本地)
+ *     决定内核如何解析该下一跳。
+ *   - VRF 对应：每条消息都带 vrf_id（bgp->vrf_id），zebra 按 VRF 找到对应表；
+ *     IS_BGP_INST_KNOWN_TO_ZEBRA() 判断该实例是否已向 zebra 注册。
+ *   - redistribute：把 IGP/直连/静态等路由引入 BGP，用 vrf_bitmap / mi_redist
+ *     在 zclient 上做“登记去重”，避免重复注册或过早注销。
+ *
+ * 关键函数清单（建议阅读顺序）：
+ *   1) bgp_zebra_init / bgp_zebra_connected / bgp_zebra_instance_register
+ *      —— 连接建立与重连后的重新登记（nexthop、redistribute、SRv6 locator）
+ *   2) bgp_zebra_route_install —— 下发入口（异步、入队、suppress-fib-pending 标记）
+ *   3) bgp_handle_route_announcements_to_zebra / bgp_zebra_announce_actual /
+ *      bgp_zebra_withdraw_actual —— 队列消费与 zapi 编码
+ *   4) bgp_zebra_announce_parse_nexthop / update_ipv4|6nh_for_route_install
+ *      —— 多路径(ECMP) nexthop 与标签/SRv6 编码的核心
+ *   5) bgp_zebra_route_notify_owner —— 内核安装结果回填（FIB_INSTALLED）
+ *   6) bgp_redistribute_set/unreg/redo —— 重分发登记与引用计数
+ *   7) bgp_interface_address_add / bgp_ifp_up / bgp_ifp_down —— 接口事件回调
+ *   8) EVPN/VXLAN/SRv6/标签 相关回调
+ *
+ * 建议阅读顺序：先 1、2、3（出向下发主链），再 4（nexthop 编码细节），
+ *   然后 5（异步回填闭环），接着 redistribute 与接口事件，最后 EVPN/SRv6/标签。
+ * ============================================================================
+ */
 
 #include <zebra.h>
 
@@ -57,17 +106,32 @@
 #include "bgpd/bgp_lcommunity.h"
 #include "bgpd/bgp_srv6.h"
 
+/* ========== 1. 全局 zclient 句柄与常驻基础设施（hook / MTYPE） ========== */
+/* 【全局】bgp_zclient —— bgpd 与 zebra 的**主异步连接**句柄。
+ * 所有路由下发、redistribute 登记、EVPN/SRv6 消息都经由它收发。 */
 /* All information about zebra. */
 struct zclient *bgp_zclient = NULL;
+/* 【全局】bgp_zclient_sync —— **同步连接**句柄。专供“请求-应答”式交互：
+ * 标签管理器(label manager)、流量管理 table-manager、SRv6 manager 等，
+ * 这些场景需要同步拿到 zebra 的返回值，不能走异步事件回调。 */
 struct zclient *bgp_zclient_sync;
 static bool bgp_zebra_label_manager_connect(void);
 
+/* 【HOOK】bgp_vrf_status_changed —— VRF/接口状态变化钩子，供 SNMP 等外部模块
+ * 挂钩感知（不改动主体逻辑）。 */
 /* hook to indicate vrf status change for SNMP */
 DEFINE_HOOK(bgp_vrf_status_changed, (struct bgp *bgp, struct interface *ifp),
 	    (bgp, ifp));
 
+/* 【MTYPE】BGP_IF_INFO —— 挂在 struct interface->info 上的 BGP 私有接口数据，
+ * 与 bgp_interface 结构配套（见 bgp_if_new_hook/delete_hook）。 */
 DEFINE_MTYPE_STATIC(BGPD, BGP_IF_INFO, "BGP interface context");
 
+/* 【函数】bgp_install_info_to_zebra —— 判断“现在能否向 zebra 下发/登记”。
+ * 返回 false 的两种情形：① 主 zclient 套接字不可用；② 该 BGP 实例尚未登录到
+ * zebra（IS_BGP_INST_KNOWN_TO_ZEBRA 为假，多 VRF 下 zebra 还没通知该 VRF）。
+ * 注意：它只判断“能不能”，不做任何实际发送；许多 xxx_install / xxx_send 函数首行
+ * 都用它做守卫。 */
 /* Can we install into zebra? */
 static inline bool bgp_install_info_to_zebra(struct bgp *bgp)
 {
@@ -85,8 +149,18 @@ static inline bool bgp_install_info_to_zebra(struct bgp *bgp)
 	return true;
 }
 
+/* 【全局】zclient_num_connects —— 与 zebra 成功建立连接的累计次数。
+ * 用途：bgp_zebra_nexthop_set() 里判断“是否曾经成功连过 zebra”来决定缺少接口
+ * 数据时算不算失败；也通过 bgp_zebra_num_connects() 对外暴露用于排障。 */
 int zclient_num_connects;
 
+/* 【函数】bgp_router_id_update —— 处理 zebra 发来的 router-id 更新消息。
+ * 调用时机：zebra 的 router-id 变化或首次同步时（ZEBRA_ROUTER_ID_UPDATE）。
+ * 参数：ZAPI_CALLBACK_ARGS 展开为 (int command, struct zclient *zclient,
+ *       zebra_size_t length, vrf_id_t vrf_id)。
+ * 处理：从 ibuf 读出 router-id 前缀，转交 bgp_router_id_zebra_bump() 让 bgpd
+ *       重算并传播 router-id（可能触发重选/重通告）。
+ * 返回：0。 */
 /* Router-id update message from zebra. */
 static int bgp_router_id_update(ZAPI_CALLBACK_ARGS)
 {
@@ -103,6 +177,12 @@ static int bgp_router_id_update(ZAPI_CALLBACK_ARGS)
 	return 0;
 }
 
+/* 【函数】bgp_update_interface_nbrs —— 设置/清除“无编号邻居(unnumbered)”所绑定的
+ * 接口，并相应地启动或停止该接口上的 IPv6 RA(Router Advertisement)。
+ * 背景：无编号/ENHE(RFC5549)邻居以接口名(conf_if)而非 IP 标识；接口出现
+ *   (upd_ifp != NULL) 时给它挂上 peer->ifp 并发 RA；接口消失(upd_ifp == NULL)
+ *   时停 RA 并清空 peer->ifp。
+ * 注意：只遍历本实例 bgp->peer，按 peer->conf_if 与 ifp->name 字符串匹配。 */
 /* Set or clear interface on which unnumbered neighbor is configured. This
  * would in turn cause BGP to initiate or turn off IPv6 RAs on this
  * interface.
@@ -116,9 +196,11 @@ static void bgp_update_interface_nbrs(struct bgp *bgp, struct interface *ifp,
 	for (ALL_LIST_ELEMENTS(bgp->peer, node, nnode, peer)) {
 		if (peer->conf_if && (strcmp(peer->conf_if, ifp->name) == 0)) {
 			if (upd_ifp) {
+				/* 接口出现：绑定 ifp 并在该接口发起 RA */
 				peer->ifp = upd_ifp;
 				bgp_zebra_initiate_radv(bgp, peer);
 			} else {
+				/* 接口消失：停止 RA，再清空 ifp（置为 NULL） */
 				bgp_zebra_terminate_radv(bgp, peer);
 				peer->ifp = upd_ifp;
 			}
@@ -126,12 +208,20 @@ static void bgp_update_interface_nbrs(struct bgp *bgp, struct interface *ifp,
 	}
 }
 
+/* 【函数】bgp_read_fec_update —— 处理 zebra 的 FEC 更新消息。
+ * FEC(Forwarding Equivalence Class) 与 BGP LU(Labeled Unicast, RFC3107) 相关：
+ * zebra 汇报某 FEC 的可解析/已建 LSP 情况，本回调把解析工作交给
+ * bgp_parse_fec_update()。返回 0。 */
 static int bgp_read_fec_update(ZAPI_CALLBACK_ARGS)
 {
 	bgp_parse_fec_update();
 	return 0;
 }
 
+/* 【函数】bgp_start_interface_nbrs —— 当某接口上出现可用本地地址时，为绑定该
+ * 接口(peer->conf_if)的邻居重新驱动 FSM。
+ * 处理：对已建立则跳过；否则先 BGP_Stop（复位可能残留的 Active）再 BGP_Start，
+ *   从而重新尝试建立会话。典型用于接口从 down 变 up/地址刚配好时“补启动”。 */
 static void bgp_start_interface_nbrs(struct bgp *bgp, struct interface *ifp)
 {
 	struct listnode *node, *nnode;
@@ -147,6 +237,10 @@ static void bgp_start_interface_nbrs(struct bgp *bgp, struct interface *ifp)
 	}
 }
 
+/* 【函数】bgp_nbr_connected_add —— zebra 通知某接口新增了邻居地址时调用。
+ * 仅当该接口上存在有效的 IPv6 链路本地地址(LL)时，才去启动绑定该接口的邻居
+ * 会话（无编号邻居依赖 LL 作为对端标识）。
+ * 参数：ifc 是发现邻居的接口上下文；若接口无 LL 地址则直接返回、不做动作。 */
 static void bgp_nbr_connected_add(struct bgp *bgp, struct nbr_connected *ifc)
 {
 	struct connected *connected;
@@ -169,6 +263,10 @@ static void bgp_nbr_connected_add(struct bgp *bgp, struct nbr_connected *ifc)
 	bgp_start_interface_nbrs(bgp, ifp);
 }
 
+/* 【函数】bgp_nbr_connected_delete —— 接口上的邻居地址消失时调用。
+ * 处理：对该接口上的所有无编号邻居发 BGP_Stop（记录复位原因 NBR_ADDR_DEL）；
+ *   del 为真时还要把 nbr_connected 记录从接口链表摘除并释放。
+ * 参数：del 控制“是否连记录一并删除”——接口整体消失才删，单纯地址删除则保留记录。 */
 static void bgp_nbr_connected_delete(struct bgp *bgp, struct nbr_connected *ifc,
 				     int del)
 {
@@ -191,6 +289,17 @@ static void bgp_nbr_connected_delete(struct bgp *bgp, struct nbr_connected *ifc,
 	}
 }
 
+/* ========== 2. 接口事件回调（创建/up/down/删除、地址增删、邻居地址） ==========
+ * 这些函数由 lib 的接口 hook / zebra 的 ZEBRA_* 消息驱动。它们把内核侧的拓扑
+ * 变化翻译成 BGP 侧动作：维护直连/邻居地址、驱动无编号邻居 FSM、触发 NHT
+ * 重评估（bgp_nht_ifp_up/down），并在 VRF 接口上更新 VPN 标签/SID 泄露。
+ * 关键：接口 down/up 会直接改变已下发路由的下一跳可达性，需联系 bgp_nht_ifp_*
+ * 与 bgp_connected_* 一起理解。 */
+
+/* 【函数】bgp_ifp_destroy —— 接口被删除(if_unreal)时的回调。
+ * 处理：让绑定该接口的无编号邻居停 RA 并解绑（upd_ifp=NULL），触发 vrf_status
+ *   钩子，删除该接口上学习到的本地 MAC。
+ * 注意：这里不直接操作 NHT——真正的下一跳失效处理在 down 路径（bgp_nht_ifp_down）。 */
 static int bgp_ifp_destroy(struct interface *ifp)
 {
 	struct bgp *bgp;
@@ -211,6 +320,16 @@ static int bgp_ifp_destroy(struct interface *ifp)
 	return 0;
 }
 
+/* 【函数】bgp_ifp_up —— 接口 up(if_up) 回调。
+ * 处理链：
+ *   1) 把接口上所有地址登记为直连(bgp_connected_add)、所有邻居地址登记
+ *      (bgp_nbr_connected_add)，从而启动/唤醒无编号邻居 FSM；
+ *   2) hook 通知外部(vrf_status)；
+ *   3) bgp_nht_ifp_up() —— 让依赖该接口的下一跳重新评估（可能由不可达变可达）；
+ *   4) 若这是 VRF 接口：更新 VPN 的标签/SID 泄露(vpn_leak_*) 并触发重分发；
+ *   5) 若是 SRv6 承载接口(table_id 254 且名匹配 DEFAULT_SRV6_IFNAME)，登记
+ *      SRv6 unicast SID 端点。
+ * 返回：0。 */
 static int bgp_ifp_up(struct interface *ifp)
 {
 	struct connected *c;
@@ -255,6 +374,15 @@ static int bgp_ifp_up(struct interface *ifp)
 	return 0;
 }
 
+/* 【函数】bgp_ifp_down —— 接口 down(if_down) 回调，与 bgp_ifp_up 基本对称。
+ * 处理链：
+ *   1) 删除该接口上的直连(bgp_connected_delete) 与邻居地址记录；
+ *   2) 若启用 fast external-failover(BGP_FLAG_NO_FAST_EXT_FAILOVER 未置)，把
+ *      TTL=1(GTSM 直连) 且下一跳接口正是它的直连邻居立即 Stop（快速故障倒换）；
+ *   3) hook 通知 + bgp_nht_ifp_down()（下一跳可能因此失效）；
+ *   4) VRF 接口：撤销 VPN 标签/SID 泄露；
+ *   5) 若是 SRv6 接口，取消 SRv6 unicast SID 端点。
+ * 返回：0。 */
 static int bgp_ifp_down(struct interface *ifp)
 {
 	struct connected *c;
@@ -317,6 +445,16 @@ static int bgp_ifp_down(struct interface *ifp)
 	return 0;
 }
 
+/* 【函数】bgp_interface_address_add —— zebra 通知接口新增地址
+ *   (ZEBRA_INTERFACE_ADDRESS_ADD)。
+ * 处理：
+ *   1) 读地址(ifc)；接口 operative 时把地址登记为直连(bgp_connected_add)；
+ *   2) 若新增的是链路本地地址且接口已有邻居，启动无编号邻居 FSM
+ *      (bgp_start_interface_nbrs)；
+ *   3) 否则对该接口上“当前使用 v4-mapped 或 LL 作为 v6_global 下一跳”的 IPv6
+ *      邻居，把新学到的全局 v6 地址(GUA) 更新为 peer->nexthop.v6_global 并重通告
+ *      ——这是让无编号/ENHE 邻居在 GUA 就绪后切到正确 next-hop 的关键(RFC5549)。
+ * 返回：0。 */
 static int bgp_interface_address_add(ZAPI_CALLBACK_ARGS)
 {
 	struct connected *ifc;
@@ -344,6 +482,7 @@ static int bgp_interface_address_add(ZAPI_CALLBACK_ARGS)
 		return 0;
 
 	if (if_is_operative(ifc->ifp)) {
+		/* 接口可用：把该地址登记为直连，供 NHT 判断直连下一跳 */
 		bgp_connected_add(bgp, ifc);
 
 		/* If we have learnt of any neighbors on this interface,
@@ -389,6 +528,9 @@ static int bgp_interface_address_add(ZAPI_CALLBACK_ARGS)
 							&peer->nexthop
 								 .v6_global);
 					}
+					/* 把接口新 GUA 复制为该邻居的 v6 下一跳，
+					 * 并对所有 AFI/SAFI 重新生成/发送更新，
+					 * 使通告出去的 next-hop 立刻用上 GUA。 */
 					memcpy(&peer->nexthop.v6_global,
 					       &addr->u.prefix6,
 					       IPV6_MAX_BYTELEN);
@@ -403,6 +545,11 @@ static int bgp_interface_address_add(ZAPI_CALLBACK_ARGS)
 	return 0;
 }
 
+/* 【函数】bgp_interface_address_delete —— 接口地址被删(ZEBRA_INTERFACE_ADDRESS_DELETE)。
+ * 处理：operative 时从直连表删掉该地址；若被删的正是某邻居用作 v6_global 的 GUA，
+ *   则回退到链路本地地址(v6_local) 并重通告，而不打断会话（见函数内注释）。
+ * 注意：结尾 connected_free 释放临时 ifc，因 zebra_interface_address_read 返回的是
+ *   一份新分配对象。 */
 static int bgp_interface_address_delete(ZAPI_CALLBACK_ARGS)
 {
 	struct listnode *node, *nnode;
@@ -454,6 +601,8 @@ static int bgp_interface_address_delete(ZAPI_CALLBACK_ARGS)
 				 * next hop. This applies to both unnumbered and
 				 * numbered interfaces
 				 */
+				/* GUA 被删：退回链路本地地址作为 v6 下一跳，并重通告，
+				 * 保持会话不断（无编号与编号接口均适用）。 */
 				IPV6_ADDR_COPY(&peer->nexthop.v6_global, &peer->nexthop.v6_local);
 				FOREACH_AFI_SAFI (afi, safi)
 					bgp_announce_route(peer, afi, safi,
@@ -467,6 +616,9 @@ static int bgp_interface_address_delete(ZAPI_CALLBACK_ARGS)
 	return 0;
 }
 
+/* 【函数】bgp_interface_nbr_address_add —— 接口出现新的邻居 IPv6 地址
+ *   (ZEBRA_INTERFACE_NBR_ADDRESS_ADD)。接口 operative 时登记邻居记录
+ *   (bgp_nbr_connected_add)，进而可能启动无编号邻居 FSM。返回 0。 */
 static int bgp_interface_nbr_address_add(ZAPI_CALLBACK_ARGS)
 {
 	struct nbr_connected *ifc = NULL;
@@ -492,6 +644,9 @@ static int bgp_interface_nbr_address_add(ZAPI_CALLBACK_ARGS)
 	return 0;
 }
 
+/* 【函数】bgp_interface_nbr_address_delete —— 接口邻居 IPv6 地址消失
+ *   (ZEBRA_INTERFACE_NBR_ADDRESS_DELETE)。接口 operative 时对该接口上的无编号
+ *   邻居发 BGP_Stop（del=0，仅停会话、保留记录），最后释放临时 nbr_connected。 */
 static int bgp_interface_nbr_address_delete(ZAPI_CALLBACK_ARGS)
 {
 	struct nbr_connected *ifc = NULL;
@@ -519,6 +674,17 @@ static int bgp_interface_nbr_address_delete(ZAPI_CALLBACK_ARGS)
 	return 0;
 }
 
+/* 【函数】zebra_read_route —— 接收 zebra 重分发来的路由
+ *   (ZEBRA_REDISTRIBUTE_ROUTE_ADD/DEL)，喂给 BGP 的 redistribute 逻辑
+ *   （变成 BGP 中的 BGP_ROUTE_REDISTRIBUTE 路径）。
+ * 这是“其它协议(connected/static/ospf/...) → BGP”的入口，方向与 announce 相反。
+ * 关键处理：
+ *   - 忽略 srcdest 路由与 IPv6 链路本地前缀；
+ *   - ADD 实为“更新”：先对同一前缀的**其它** type 做一次隐式 delete，避免同一
+ *     前缀在多个来源之间残留（见函数内英文注释）；
+ *   - 从 api.nexthops[0] 取 ifindex/type/nexthop/blackhole 类型；
+ *   - 调 bgp_redistribute_add()/bgp_redistribute_delete()。
+ * 返回：0 成功；-1 解码失败。 */
 /* Zebra route add and delete treatment. */
 static int zebra_read_route(ZAPI_CALLBACK_ARGS)
 {
@@ -546,11 +712,13 @@ static int zebra_read_route(ZAPI_CALLBACK_ARGS)
 	    && IN6_IS_ADDR_LINKLOCAL(&api.prefix.u.prefix6))
 		return 0;
 
+	/* ADD 消息携带下一跳信息；DEL 只需前缀 + type */
 	add = (cmd == ZEBRA_REDISTRIBUTE_ROUTE_ADD);
 	if (add) {
 		if (api.nexthop_num == 0)
 			return 0;
 
+		/* 重分发场景取第一个下一跳即可（zebra 对已解析路由通常给单跳） */
 		ifindex = api.nexthops[0].ifindex;
 		nhtype = api.nexthops[0].type;
 
@@ -570,6 +738,8 @@ static int zebra_read_route(ZAPI_CALLBACK_ARGS)
 		 * other
 		 * source type.
 		 */
+		/* 同一前缀若曾由别的源类型重分发进来，ADD(更新) 时先隐式删除它们，
+		 * 保证前缀在来源变化时不会“两个源各留一份”。 */
 		for (i = 0; i < ZEBRA_ROUTE_MAX; i++) {
 			if (i != api.type)
 				bgp_redistribute_delete(bgp, &api.prefix, i,
@@ -607,6 +777,14 @@ static int zebra_read_route(ZAPI_CALLBACK_ARGS)
 	return 0;
 }
 
+/* ========== 3. 接口/地址查找辅助函数（供下一跳与 peer 处理使用） ==========
+ * 纯查询/工具函数：按地址（是否跨网段/是否精确）或接口查找 struct interface，
+ * 或从接口上挑出 v6 全局/链路本地、v4 地址。它们被 bgp_zebra_nexthop_set、
+ * bgp_path_info_to_ipv6_nexthop 等频繁调用，把“一个 IP”映射到“一个接口”。 */
+
+/* 【函数】if_lookup_by_ipv4 —— 按 IPv4 地址查找接口，用 prefix_match：只要该地址
+ * 落在某接口的**任一子网**内即返回该接口（非精确匹配）。
+ * 典型用途：判断对端是否直连(shared_network)，从而决定 next-hop 处理方式。 */
 struct interface *if_lookup_by_ipv4(struct in_addr *addr, vrf_id_t vrf_id)
 {
 	struct vrf *vrf;
@@ -635,6 +813,8 @@ struct interface *if_lookup_by_ipv4(struct in_addr *addr, vrf_id_t vrf_id)
 	return NULL;
 }
 
+/* 【函数】if_lookup_by_ipv4_exact —— 与 if_lookup_by_ipv4 类似，但要求地址
+ * **精确等于**接口地址（IPV4_ADDR_SAME）。用于把“本地地址”定位到自身所属接口。 */
 struct interface *if_lookup_by_ipv4_exact(struct in_addr *addr, vrf_id_t vrf_id)
 {
 	struct vrf *vrf;
@@ -658,6 +838,8 @@ struct interface *if_lookup_by_ipv4_exact(struct in_addr *addr, vrf_id_t vrf_id)
 	return NULL;
 }
 
+/* 【函数】if_lookup_by_ipv6 —— 按 IPv6 地址查找接口（prefix_match）。
+ * 链路本地地址需 ifindex 与接口匹配（同一 LL 可出现在多接口）；全局地址命中即返回。 */
 struct interface *if_lookup_by_ipv6(struct in6_addr *addr, ifindex_t ifindex,
 				    vrf_id_t vrf_id)
 {
@@ -693,6 +875,8 @@ struct interface *if_lookup_by_ipv6(struct in6_addr *addr, ifindex_t ifindex,
 	return NULL;
 }
 
+/* 【函数】if_lookup_by_ipv6_exact —— IPv6 精确匹配版(IPV6_ADDR_SAME)，
+ * 链路本地地址仍需 ifindex 与接口一致。 */
 struct interface *if_lookup_by_ipv6_exact(struct in6_addr *addr,
 					  ifindex_t ifindex, vrf_id_t vrf_id)
 {
@@ -723,6 +907,8 @@ struct interface *if_lookup_by_ipv6_exact(struct in6_addr *addr,
 	return NULL;
 }
 
+/* 【函数】if_get_ipv6_global —— 从接口上取第一个**全局** IPv6 地址(非 LL)写入
+ * *addr，取到返回 1，否则 0。用于为 v4/v6 会话确定对外可用 v6 下一跳(GUA)。 */
 int if_get_ipv6_global(struct interface *ifp, struct in6_addr *addr)
 {
 	struct connected *connected;
@@ -740,6 +926,8 @@ int if_get_ipv6_global(struct interface *ifp, struct in6_addr *addr)
 	return 0;
 }
 
+/* 【函数】if_get_ipv6_local —— 从接口上取第一个链路本地 IPv6 地址写入 *addr，
+ * 取到返回 true。无编号邻居以 LL 作为对端标识，故常与 if_get_ipv6_global 配对。 */
 static bool if_get_ipv6_local(struct interface *ifp, struct in6_addr *addr)
 {
 	struct connected *connected;
@@ -757,6 +945,8 @@ static bool if_get_ipv6_local(struct interface *ifp, struct in6_addr *addr)
 	return false;
 }
 
+/* 【函数】if_get_ipv4_address —— 从接口上取第一个非 martian 的 IPv4 地址写入
+ * *addr，取到返回 1。用于 v6 会话场景下确定可用的 v4 下一跳。 */
 static int if_get_ipv4_address(struct interface *ifp, struct in_addr *addr)
 {
 	struct connected *connected;
@@ -774,6 +964,21 @@ static int if_get_ipv4_address(struct interface *ifp, struct in_addr *addr)
 }
 
 
+/* ========== 4. bgp_zebra_nexthop_set —— 从本地/远端套接字推导邻居的下一跳 ========== */
+/* 【函数】bgp_zebra_nexthop_set —— 根据一条已建立/即将建立的 TCP 连接(本地地址 local、
+ * 远端地址 remote)，推算本端用于该 peer 的完整下一跳信息，填入 nexthop
+ * (struct bgp_nexthop：v4 / v6_global / v6_local / ifp)。
+ * 这是 BGP 决定“向外通告时 next-hop 写什么、以及需要跟踪哪个下一跳”的源头之一。
+ * 调用时机：peer 连接建立/地址变化时（FSM 侧）调用。
+ * 关键分支：
+ *   - local 为 AF_INET：定位本地接口(优先 update_if，否则按本地地址精确定位)，记录
+ *     v4，并从接口取 v6_global/v6_local（供 RFC5549 ENHE 用）。
+ *   - local 为 AF_INET6：记录 v6_global/v6_local，并从接口取 v4 地址；区分链路
+ *     本地 vs 全局，处理直连场景的 LL。
+ *   - 找不到 ifp：VIEW 实例放行；否则若曾连过 zebra（zclient_num_connects）视为失败。
+ * 返回：true 表示可用；false 表示失败（例如链路本地不可用且不满足放行条件）。
+ * 副作用：可能设置 peer->shared_network（对端是否同网段直连），并在其变化时触发
+ *   BFD 源地址更新。 */
 bool bgp_zebra_nexthop_set(union sockunion *local, union sockunion *remote,
 			   struct bgp_nexthop *nexthop, struct peer *peer)
 {
@@ -894,6 +1099,8 @@ bool bgp_zebra_nexthop_set(union sockunion *local, union sockunion *remote,
 			if (!peer_has_ipv6_configured || !direct)
 				v6_ll_avail = true;
 		}
+		/* 对端 v4 地址落在本地某接口子网内 => 直接相连(shared_network)，
+		 * 影响 multiaccess/NHT 判定与 BFD。 */
 		if (if_lookup_by_ipv4(&remote->sin.sin_addr, peer->bgp->vrf_id))
 			peer->shared_network = true;
 		else
@@ -973,6 +1180,15 @@ bool bgp_zebra_nexthop_set(union sockunion *local, union sockunion *remote,
 	return v6_ll_avail;
 }
 
+/* 【函数】bgp_path_info_to_ipv6_nexthop —— 从一条路径的属性里取出“实际使用的
+ * IPv6 下一跳地址”，并按需回填 ifindex（链路本地地址必须带 ifindex）。
+ * 依据 mp_nexthop_len 区分几种编码：
+ *   - 仅全局地址(GLOBAL / VPNV6_GLOBAL)；
+ *   - 全局 + 链路本地(GLOBAL_AND_LL / VPNV6_GLOBAL_AND_LL)，再按
+ *     BGP_ATTR_NH_MP_PREFER_GLOBAL 决定优先全局还是 LL；
+ *   - Cisco 兼容：全局为 :: 且对端是 v6 时，退用对端连接地址。
+ * 返回：指向属性内 in6_addr 的指针（可能为 NULL，表示无 v6 下一跳）。
+ * 注意：返回的是**属性内部地址**，调用方不得修改。 */
 static struct in6_addr *
 bgp_path_info_to_ipv6_nexthop(struct bgp_path_info *path, ifindex_t *ifindex)
 {
@@ -1016,6 +1232,12 @@ bgp_path_info_to_ipv6_nexthop(struct bgp_path_info *path, ifindex_t *ifindex)
 	return nexthop;
 }
 
+/* 【函数】bgp_table_map_apply —— 把表级 route-map(table-map) 应用到一条待下发路径，
+ * 决定该路径是否“允许安装到 FIB”（DENY 则不予下发）。
+ * 注意：route_map_apply 可能修改 path->attr，故调用方通常传入临时拷贝；apply 之后
+ *   统一 bgp_attr_flush() 清理临时聚合属性。
+ * 返回：true=允许(PERMIT/无匹配)，false=拒绝(DENY)。
+ * 副作用：DENY 时按需打印调试信息（含 v4/v6 下一跳）。 */
 static bool bgp_table_map_apply(struct route_map *map, const struct prefix *p,
 				struct bgp_path_info *path)
 {
@@ -1046,13 +1268,27 @@ static bool bgp_table_map_apply(struct route_map *map, const struct prefix *p,
 	return false;
 }
 
+/* ========== 5. 流规格(Flowspec)table-manager：表 ID 区间(chunk)管理 ==========
+ * Flowspec 需要把匹配规则放进独立的内核路由表，表 ID 由 zebra 的 table-manager
+ * 按“区间(chunk)”分配。这里通过 bgp_zclient_sync 同步连接向 table-manager 申请
+ * 一段表 ID 区间，并在拿到后补装之前挂起的 Flowspec 路由。
+ * 相关变量：
+ *   bgp_tm_thread_connect —— 重连定时器事件；
+ *   bgp_tm_status_connected / bgp_tm_chunk_obtained —— 连接/区间状态标志；
+ *   bgp_tm_min/max/chunk_size —— 已分配区间范围与请求块大小。 */
 static struct event *bgp_tm_thread_connect;
 static bool bgp_tm_status_connected;
 static bool bgp_tm_chunk_obtained;
+/* Flowspec 每次向 table-manager 申请的表 ID 区间大小 */
 #define BGP_FLOWSPEC_TABLE_CHUNK 100000
 static uint32_t bgp_tm_min, bgp_tm_max, bgp_tm_chunk_size;
 struct bgp *bgp_tm_bgp;
 
+/* 【函数】bgp_zebra_tm_connect —— 周期性的 table-manager 连接/保活任务。
+ * 处理：已连则拉长到 60s 再试；否则调用 tm_table_manager_connect() 建立连接；
+ *   成功后若尚未拿到 chunk，则申请区间并补装 Flowspec 表路由
+ *   (bgp_zebra_announce_table(bgp_tm_bgp, AFI_IP, SAFI_FLOWSPEC))。最后重新挂定时器。
+ * 参数 t 的 EVENT_ARG 是 bgp_zclient_sync（同步连接句柄）。 */
 static void bgp_zebra_tm_connect(struct event *t)
 {
 	struct zclient *zc;
@@ -1089,11 +1325,14 @@ static void bgp_zebra_tm_connect(struct event *t)
 			&bgp_tm_thread_connect);
 }
 
+/* 【函数】bgp_zebra_tm_chunk_obtained —— 返回是否已成功取得 table-manager 的表 ID 区间。 */
 bool bgp_zebra_tm_chunk_obtained(void)
 {
 	return bgp_tm_chunk_obtained;
 }
 
+/* 【函数】bgp_zebra_tm_get_id —— 分配下一个 Flowspec 表 ID。
+ * 若尚未取得区间，用本地静态自增计数(临时兜底)；否则从区间 [min,max) 顺序取用。 */
 uint32_t bgp_zebra_tm_get_id(void)
 {
 	static int table_id;
@@ -1103,6 +1342,9 @@ uint32_t bgp_zebra_tm_get_id(void)
 	return bgp_tm_min++;
 }
 
+/* 【函数】bgp_zebra_init_tm_connect —— 初始化 table-manager 的连接流程
+ * （幂等：已存在定时器则直接返回）。设置默认 chunk 大小、记录发起实例，并启动
+ * 首个连接定时器（1s 后）。 */
 void bgp_zebra_init_tm_connect(struct bgp *bgp)
 {
 	int delay = 1;
@@ -1120,6 +1362,8 @@ void bgp_zebra_init_tm_connect(struct bgp *bgp)
 			&bgp_tm_thread_connect);
 }
 
+/* 【函数】bgp_zebra_get_table_range —— 向 table-manager 申请一段表 ID 区间。
+ * 未连接时返回 -1；成功时通过 start/end 回传区间。返回 0 成功。 */
 int bgp_zebra_get_table_range(struct zclient *zc, uint32_t chunk_size,
 			      uint32_t *start, uint32_t *end)
 {
@@ -1138,6 +1382,21 @@ int bgp_zebra_get_table_range(struct zclient *zc, uint32_t chunk_size,
 	return 0;
 }
 
+/* ========== 6. 路由下发的 nexthop / 标签 / SRv6 编码（zapi_nexthop 构造） ==========
+ * 把 BGP 路径的下一跳翻译成 zebra 的 zapi_nexthop。type 的选择直接决定内核如何
+ * 解析下一跳：IFINDEX / IPV4 / IPV4_IFINDEX / IPV6 / IPV6_IFINDEX / BLACKHOLE。
+ * 链路本地 IPv6 必须带 ifindex；EVPN 导入 VR 的路由按 onlink 挂在 l3-vni SVI 上。 */
+
+/* 【函数】update_ipv4nh_for_route_install —— 把一个 IPv4 下一跳编码进 zapi_nexthop。
+ * 返回 true 表示编码成功。
+ * 关键（决定内核如何解析 nexthop）：
+ *   - BLACKHOLE：直接照抄 attr 的黑洞类型（NULL0 等）；
+ *   - is_evpn：EVPN 覆盖网关 IP 用 NEXTHOP_TYPE_IPV4；否则用
+ *     NEXTHOP_TYPE_IPV4_IFINDEX + EVPN/ONLINK 标志，绑定 l3vni 的 SVI ifindex
+ *     （v6 对应见 update_ipv6nh_for_route_install）；
+ *   - 跨 VRF(nh_othervrf) 且网关为 0：用 NEXTHOP_TYPE_IFINDEX（仅接口、无网关）；
+ *   - 其余：NEXTHOP_TYPE_IPV4。
+ * 参数 nh_bgp 是**下一跳所属**实例（可能与路由实例不同，见 vrf leaking）。 */
 static bool update_ipv4nh_for_route_install(int nh_othervrf, struct bgp *nh_bgp,
 					    struct in_addr *nexthop,
 					    struct attr *attr, bool is_evpn,
@@ -1178,6 +1437,14 @@ static bool update_ipv4nh_for_route_install(int nh_othervrf, struct bgp *nh_bgp,
 	return true;
 }
 
+/* 【函数】update_ipv6nh_for_route_install —— 把一个 IPv6 下一跳编码进 zapi_nexthop。
+ * 返回 false 表示无法编码（例如需要 ifindex 却推导不出）。
+ * 关键：
+ *   - BLACKHOLE / EVPN 分支同 v4；
+ *   - 跨 VRF：未指定地址→IFINDEX；链路本地→IPV6_IFINDEX(需 ifindex)；全局→IPV6；
+ *   - 同 VRF：链路本地地址**必须**带 ifindex——依次尝试 best_pi 的对端接口、conf_if、
+ *     ifname、nexthop.ifp；仍为 0 则返回 false（无法解析）。
+ * 参数 pi/best_pi 用于从 peer 关联推断链路本地下一跳的 ifindex。 */
 static bool update_ipv6nh_for_route_install(int nh_othervrf, struct bgp *nh_bgp,
 					    struct in6_addr *nexthop,
 					    ifindex_t ifindex,
@@ -1260,6 +1527,10 @@ static bool update_ipv6nh_for_route_install(int nh_othervrf, struct bgp *nh_bgp,
 	return true;
 }
 
+/* 【函数】bgp_zebra_use_nhop_weighted —— 计算加权 ECMP 的下一跳权重。
+ * 依据 attr->link_bw（链路带宽扩展团体）：不存在时，若配置为 SKIP_MISSING 则返回
+ * false（跳过该下一跳），否则用默认权重 BGP_ZEBRA_DEFAULT_NHOP_WEIGHT；存在则用其值。
+ * 返回 true=可用，*nh_weight 为权重。 */
 static bool bgp_zebra_use_nhop_weighted(struct bgp *bgp, struct attr *attr,
 					uint64_t *nh_weight)
 {
@@ -1279,6 +1550,19 @@ static bool bgp_zebra_use_nhop_weighted(struct bgp *bgp, struct attr *attr,
 	return true;
 }
 
+/* 【函数】bgp_zebra_announce_parse_nexthop —— 构造下发给 zebra 的**全部** next-hop
+ * 列表（ECMP 多路径编码的核心）。
+ * 处理：
+ *   1) 判断是否跨 VRF(vrfleak)；EVPN MAC-IP 用 NHG id 时走 zapi_route_set_nhg_id，
+ *      不为每条路径产生显式 nexthop；
+ *   2) 沿 bgp_path_info_mpath_next() 遍历所有多路径成员（受 multipath_num 上限约束）；
+ *   3) 逐条：判下一跳地址族 → 加权 ECMP 权重 → 应用 table-map → 编码 v4/v6 nexthop
+ *      (调用 update_*nh_for_route_install) → 携带标签栈(BGP_PATH_INFO_NUM_LABELS；
+ *      EVPN 时取 L3VNI 标签并标 ZEBRA_LSP_EVPN，否则按 mpls_lse_decode 逐层) →
+ *      EVPN RMAC → SRv6 段(seg6_segs / 转置 transpose_sid)；
+ *   4) metric/tag 只允许由第一个下一跳(info)覆盖。
+ * 输出：*valid_nh_count、*allow_recursion、*metric、*tag、api->nexthops[]。
+ * 参数 do_wt_ecmp 决定加权方式(LINK_BW / NNHN_COUNT)。 */
 static void bgp_zebra_announce_parse_nexthop(struct bgp_path_info *info, const struct prefix *p,
 					     struct bgp *bgp, struct zapi_route *api,
 					     unsigned int *valid_nh_count, afi_t afi, safi_t safi,
@@ -1310,6 +1594,8 @@ static void bgp_zebra_announce_parse_nexthop(struct bgp_path_info *info, const s
 	if (info->extra && info->extra->vrfleak && info->extra->vrfleak->bgp_orig)
 		nh_othervrf = 1;
 
+	/* EVPN MAC-IP 路由可改用一条 L3 NHG(Nexthop Group) id 引用，避免逐跳展开；
+	 * 走 NHG 时 mpinfo 置 NULL（不进入下面的多路径展开）。 */
 	/* EVPN MAC-IP routes are installed with a L3 NHG id */
 	if (nhg_id && bgp_evpn_path_es_use_nhg(bgp, info, nhg_id)) {
 		mpinfo = NULL;
@@ -1318,11 +1604,13 @@ static void bgp_zebra_announce_parse_nexthop(struct bgp_path_info *info, const s
 		mpinfo = info;
 	}
 
+	/* 遍历多路径成员（含首条 info）：形成 ECMP 的多个 nexthop */
 	for (; mpinfo; mpinfo = bgp_path_info_mpath_next(mpinfo)) {
 		uint64_t nh_weight;
 		bool is_evpn;
 		bool is_parent_evpn;
 
+		/* 达到 ECMP 上限即停止（multipath_num 由 max-paths 配置） */
 		if (*valid_nh_count >= multipath_num)
 			break;
 
@@ -1367,6 +1655,8 @@ static void bgp_zebra_announce_parse_nexthop(struct bgp_path_info *info, const s
 
 		zapi_nexthop_init(api_nh);
 
+		/* SR-TE color：把 BGP 的 color 扩展团体透传给 zebra，
+		 * 供其在有 SR-TE policy 时按 color 选择带标签的转发路径。 */
 		api_nh->srte_color = bgp_attr_get_color(info->attr);
 
 		if (bgp_debug_zebra(&api->prefix)) {
@@ -1446,6 +1736,9 @@ static void bgp_zebra_announce_parse_nexthop(struct bgp_path_info *info, const s
 		num_labels = BGP_PATH_INFO_NUM_LABELS(mpinfo);
 		labels = num_labels ? mpinfo->extra->labels->label : NULL;
 
+		/* 带标签的下一跳（RFC3107 标签单播 / VPN 标签栈 / EVPN）：EVPN 取
+		 * L3VNI 标签并标 ZEBRA_LSP_EVPN；否则把 MPLS 标签栈逐层
+		 * mpls_lse_decode 后放进 api_nh->labels，并置 LSP 类型。 */
 		if (num_labels && (is_evpn || bgp_is_valid_label(&labels[0]))) {
 			enum lsp_types_t nh_label_type = ZEBRA_LSP_NONE;
 
@@ -1483,6 +1776,8 @@ static void bgp_zebra_announce_parse_nexthop(struct bgp_path_info *info, const s
 
 		api_nh->weight = nh_weight;
 
+		/* SRv6 封装：把 SID(seg6_segs[0]) 与封装行为带给 zebra；若 locator
+		 * 采用转置(transposition)方案，则用标签值 transpose_sid 转置出 SID。 */
 		if (((mpinfo->attr->srv6_l3service &&
 		      !sid_zero_ipv6(&mpinfo->attr->srv6_l3service->sid)) ||
 		     (mpinfo->attr->srv6_vpn && !sid_zero_ipv6(&mpinfo->attr->srv6_vpn->sid))) &&
@@ -1522,6 +1817,8 @@ static void bgp_zebra_announce_parse_nexthop(struct bgp_path_info *info, const s
 	}
 }
 
+/* 【函数】bgp_debug_zebra_nh —— 调试用：按 zapi_nexthop 的 type 打印每个下一跳
+ * (地址/接口/VRF/权重/标签/SRv6 段/RMAC)。仅在 ZEBRA 调试开启时被调用。 */
 static void bgp_debug_zebra_nh(struct zapi_route *api)
 {
 	int i;
@@ -1599,6 +1896,18 @@ static void bgp_debug_zebra_nh(struct zapi_route *api)
 	}
 }
 
+/* 【函数】bgp_zebra_announce_actual —— 真正把一条（最佳）路径编码成 ZEBRA_ROUTE_ADD
+ * 下发给 zebra（出向的实际编码点）。
+ * 流程：
+ *   - FLOWSPEC 表改走 PBR 路径(bgp_pbr_update_entry)；
+ *   - 初始化 zapi_route：vrf_id / type=ZEBRA_ROUTE_BGP / safi / prefix；
+ *   - 导入路由取“最终来源 peer”(bgp_get_imported_bpi_ultimate) 决定 IBGP 标志；
+ *   - iBGP/confed/聚合，或 EBGP 多跳/关闭直连检查 ⇒ 允许递归(ALLOW_RECURSION)；
+ *   - table-map/tableid、SR-TE、opaque(附加数据) 等消息位；
+ *   - 调 bgp_zebra_announce_parse_nexthop() 生成 nexthop 列表；聚合路由改黑洞 NULL0；
+ *   - metric/tag/distance；
+ *   - zclient_route_send(ZEBRA_ROUTE_ADD, ...) 发送（**异步**）。
+ * 返回：zclient 发送状态（SUCCESS / BUFFERED / FAILURE）。 */
 enum zclient_send_status bgp_zebra_announce_actual(struct bgp_dest *dest,
 						   struct bgp_path_info *info, struct bgp *bgp)
 {
@@ -1741,6 +2050,10 @@ enum zclient_send_status bgp_zebra_announce_actual(struct bgp_dest *dest,
 }
 
 
+/* 【函数】bgp_zebra_announce_table —— 把整张表(bgp->rib[afi][safi])里所有已选中且允许
+ * 下发的路径重新下发一遍。用于批量刷新（重连后、table-map 变更、EVPN 场景、Flowspec
+ * 拿到表区间后等）。
+ * 注意：会先应用 table-map 决定 is_add（allow/deny），再调 bgp_zebra_route_install()。 */
 /* Announce all routes of a table to zebra */
 void bgp_zebra_announce_table(struct bgp *bgp, afi_t afi, safi_t safi)
 {
@@ -1779,6 +2092,9 @@ void bgp_zebra_announce_table(struct bgp *bgp, afi_t afi, safi_t safi)
 			}
 }
 
+/* 【函数】bgp_zebra_announce_table_all_subtypes —— 与 bgp_zebra_announce_table 类似，
+ * 但只要求 pi->type == ZEBRA_ROUTE_BGP、不限定 sub_type，即“所有 BGP 子类型”都下发。
+ * 用于实例注册/重连后的整体重装。 */
 /* Announce routes of any bgp subtype of a table to zebra */
 void bgp_zebra_announce_table_all_subtypes(struct bgp *bgp, afi_t afi,
 					   safi_t safi)
@@ -1802,6 +2118,9 @@ void bgp_zebra_announce_table_all_subtypes(struct bgp *bgp, afi_t afi,
 							NULL, false);
 }
 
+/* 【函数】bgp_zebra_withdraw_actual —— 真正把一条路径从前缀的 FIB 中撤销，编码
+ * ZEBRA_ROUTE_DELETE 下发（只需 prefix/tableid，不需要 nexthop）。
+ * FLOWSPEC 表同样改走 PBR 路径。返回 zclient 发送状态。 */
 enum zclient_send_status bgp_zebra_withdraw_actual(struct bgp_dest *dest,
 						   struct bgp_path_info *info,
 						   struct bgp *bgp)
@@ -1836,6 +2155,19 @@ enum zclient_send_status bgp_zebra_withdraw_actual(struct bgp_dest *dest,
 	return zclient_route_send(ZEBRA_ROUTE_DELETE, bgp_zclient, &api);
 }
 
+/* ========== 7. 异步路由下发队列与 FIB 安装结果回填 ==========
+ * 下发是“批量异步”的：bgp_zebra_route_install() 只把 dest 挂队列 + 置标志；本节的
+ * bgp_handle_route_announcements_to_zebra() 才真正消费队列、编码下发。zebra 若发送
+ * 缓冲满(ZCLIENT_SEND_BUFFERED)，就暂停并在可写时由 bgp_zebra_buffer_write_ready()
+ * 回调继续。内核安装结果最终由 bgp_zebra_route_notify_owner() 回填。 */
+
+/* 【函数】bgp_handle_route_announcements_to_zebra —— 出向下发队列的消费点。
+ * 从 bm->zebra_announce_head 逐条取 dest：按 dest 标志(BGP_NODE_SCHEDULE_FOR_INSTALL/
+ * DELETE)决定 announce 还是 withdraw；EVPN(L2VPN/EVPN 表)走 evpn_zebra_install/uninstall，
+ * 其余走 bgp_zebra_announce_actual/withdraw_actual。
+ * 每处理一条：unlock 之前 lock 的 za_bgp_pi、清 za_* 指针、unlock dest。
+ * 若遇到 ZCLIENT_SEND_BUFFERED（zebra 忙）立即 break，剩余项待可写回调继续；否则
+ * 处理完后若队列仍有剩余，再次排事件继续。参数 e 常为 NULL。 */
 /*
  * Walk the new Fifo list one by one and invoke bgp_zebra_announce/withdraw
  * to install/withdraw the routes to zebra.
@@ -1849,6 +2181,8 @@ enum zclient_send_status bgp_zebra_withdraw_actual(struct bgp_dest *dest,
  * is free, a callback is triggered which inturn call this same function and
  * continue processing items on list.
  */
+/* 【宏】ZEBRA_ANNOUNCEMENTS_LIMIT —— 单次事件处理的队列条数上限，避免长时间霸占
+ * 主事件循环（大量路由下发时分批让出 CPU）。 */
 #define ZEBRA_ANNOUNCEMENTS_LIMIT 1000
 static void bgp_handle_route_announcements_to_zebra(struct event *e)
 {
@@ -1945,11 +2279,18 @@ static void bgp_handle_route_announcements_to_zebra(struct event *e)
  * Callback function invoked when zclient_flush_data() receives a BUFFER_EMPTY
  * i.e. zebra is free to receive more incoming data.
  */
+/* 【函数】bgp_zebra_buffer_write_ready —— zclient 发送缓冲变为可写时的回调，
+ * 直接驱动一次队列消费（继续之前因 BUFFERED 中断的下发）。 */
 static void bgp_zebra_buffer_write_ready(void)
 {
 	bgp_handle_route_announcements_to_zebra(NULL);
 }
 
+/* 【函数】bgp_zebra_update_fib_install_pending —— 手动设置/清除某 dest 的“FIB 安装挂起”
+ * 状态（配合 suppress-fib-pending）。
+ * install=true 且开启 suppress 时：increment 挂起计数并置 BGP_NODE_FIB_INSTALL_PENDING；
+ * install=false 时 decrement 并清标志。该标志用于：在路由尚未真正进 FIB 前抑制向对端
+ * 通告，避免“我先通告、内核还没装好”造成的黑洞。 */
 void bgp_zebra_update_fib_install_pending(struct bgp_dest *dest, struct bgp *bgp, bool install)
 {
 	/*
@@ -1994,6 +2335,19 @@ void bgp_zebra_update_fib_install_pending(struct bgp_dest *dest, struct bgp *bgp
  *                                     save new pi, mark as going to be
  *                                     withdrawn.
  */
+/* 【函数】bgp_zebra_route_install —— 路由下发/撤销的**唯一入口**（由 RIB 决策路径调用）。
+ * 关键点：它是**异步**的——只做“入队 + 打标志 + 引用计数”，不实际发送；真正发送在
+ * bgp_handle_route_announcements_to_zebra() 里。
+ * 处理：
+ *   - EVPN 表(L2VPN/EVPN)特殊对待；
+ *   - suppress-fib-pending：install 时若该 dest 从未装过(BGP_NODE_FIB_INSTALLED 未置)，
+ *     increment 挂起计数 + 置 PENDING；撤销时 decrement + 清 PENDING；
+ *   - main_zebra_update_hold 期间抑制非 EVPN 下发；
+ *   - 未连接 zebra 且非 EVPN 直接返回；
+ *   - 按当前标志把 dest 挂入/更新 bm->zebra_announce_head，保存 za_bgp_pi(带 lock)，
+ *     EVPN 场景还保存 za_vpn/za_is_sync；置 SCHEDULE_FOR_INSTALL/DELETE 标志；
+ *   - 排事件交给 bgp_handle_route_announcements_to_zebra() 消费。
+ * 上面的英文注释给出 Install/Withdrawal 各状态组合下的行为表，务必对照阅读。 */
 void bgp_zebra_route_install(struct bgp_dest *dest, struct bgp_path_info *info,
 			     struct bgp *bgp, bool install, struct bgpevpn *vpn,
 			     bool is_sync)
@@ -2077,6 +2431,9 @@ void bgp_zebra_route_install(struct bgp_dest *dest, struct bgp_path_info *info,
 			NULL, 0, &bm->t_bgp_zebra_route);
 }
 
+/* 【函数】bgp_zebra_withdraw_table_all_subtypes —— 把整张表里所有
+ * type==ZEBRA_ROUTE_BGP 的已选中路径从 zebra 撤销
+ * （即对每条调 bgp_zebra_route_install(install=false)）。用于实例注销/关闭时清空 FIB。 */
 /* Withdraw all entries in a BGP instances RIB table from Zebra */
 void bgp_zebra_withdraw_table_all_subtypes(struct bgp *bgp, afi_t afi, safi_t safi)
 {
@@ -2101,6 +2458,17 @@ void bgp_zebra_withdraw_table_all_subtypes(struct bgp *bgp, afi_t afi, safi_t sa
 	}
 }
 
+/* ========== 8. 重分发(redistribute)：把其它协议路由引入 BGP ==========
+ * bgp->redist[afi][type] 是 struct bgp_redist 的链表（同一 type 可有多个 instance）。
+ * 这里维护两类状态：
+ *   1) BGP 本地：bgp_redist 记录(instance、route-map、metric)；
+ *   2) zclient 侧登记：vrf_bitmap(redist[afi][type]) 或 mi_redist(带 instance)，用于
+ *      判断“是否已向 zebra 登记过”，避免重复注册/过早注销——这正是引用计数的意义。
+ * 关键：登记与撤销必须配对；未连接 zebra 时只记本地，等连接恢复由
+ * bgp_zebra_instance_register() 补发（重发 redist）。 */
+
+/* 【函数】bgp_redist_lookup —— 在 bgp->redist[afi][type] 链表中按 instance 查找
+ * struct bgp_redist；未找到返回 NULL。 */
 struct bgp_redist *bgp_redist_lookup(struct bgp *bgp, afi_t afi, uint8_t type,
 				     unsigned short instance)
 {
@@ -2119,6 +2487,8 @@ struct bgp_redist *bgp_redist_lookup(struct bgp *bgp, afi_t afi, uint8_t type,
 	return NULL;
 }
 
+/* 【函数】bgp_redist_add —— 查找或新建一个 bgp_redist（先 lookup，命中即复用）。
+ * 新建时初始化 instance，并挂到对应链表（必要时先创建链表）。返回该对象。 */
 struct bgp_redist *bgp_redist_add(struct bgp *bgp, afi_t afi, uint8_t type,
 				  unsigned short instance)
 {
@@ -2141,6 +2511,8 @@ struct bgp_redist *bgp_redist_add(struct bgp *bgp, afi_t afi, uint8_t type,
 	return red;
 }
 
+/* 【函数】bgp_redist_del —— 从链表摘除并释放一个 bgp_redist；若该 type 链表已空，
+ * 则删除链表本身。 */
 static void bgp_redist_del(struct bgp *bgp, afi_t afi, uint8_t type,
 			   unsigned short instance)
 {
@@ -2156,6 +2528,14 @@ static void bgp_redist_del(struct bgp *bgp, afi_t afi, uint8_t type,
 	}
 }
 
+/* 【函数】bgp_redistribute_set —— 打开/更新某协议的重分发。
+ * 逻辑：
+ *   - changed 为真时先 bgp_redistribute_unreg() 复位旧配置并撤路由；
+ *   - 在 zclient 侧登记：带 instance 用 redist_*_instance / table_direct(把 instance
+ *     复用为 table_id)；否则用 vrf_bitmap_set；已登记则返回 CMD_WARNING（去重）；
+ *   - 未连接 zebra 就只记本地、返回 CMD_SUCCESS（连接恢复后补发）；
+ *   - 否则 zebra_redistribute_send(ZEBRA_REDISTRIBUTE_ADD) 通知 zebra 开始推送该协议。
+ * 返回 CMD_SUCCESS / CMD_WARNING。 */
 /* Other routes redistribution into BGP. */
 int bgp_redistribute_set(struct bgp *bgp, afi_t afi, int type,
 			 unsigned short instance, bool changed)
@@ -2232,6 +2612,8 @@ int bgp_redistribute_set(struct bgp *bgp, afi_t afi, int type,
 	return CMD_SUCCESS;
 }
 
+/* 【函数】bgp_redistribute_resend —— 对已登记的重分发“先删后加”，强制 zebra 重发一遍
+ * 该协议当前的所有路由（用于 route-map 等参数变化后刷新）。返回 -1 表示未连接 zebra。 */
 int bgp_redistribute_resend(struct bgp *bgp, afi_t afi, int type,
 			    unsigned short instance)
 {
@@ -2255,6 +2637,10 @@ int bgp_redistribute_resend(struct bgp *bgp, afi_t afi, int type,
 	return 0;
 }
 
+/* 【函数】bgp_redistribute_rmap_set —— 设置重分发引用的 route-map。
+ * 关键：用 route_map_counter_increment/decrement 维护 route-map 的**引用计数**，
+ *   新增引用前先 decrement 旧 map，避免过早释放仍被引用的 route-map。
+ * 返回 true=发生变化并已更新，false=与旧值相同无需变更。 */
 /* Redistribute with route-map specification.  */
 bool bgp_redistribute_rmap_set(struct bgp_redist *red, const char *name,
 			       struct route_map *route_map)
@@ -2274,6 +2660,10 @@ bool bgp_redistribute_rmap_set(struct bgp_redist *red, const char *name,
 	return true;
 }
 
+/* 【函数】bgp_redistribute_metric_set —— 设置重分发的 metric(MED)。
+ * 除记录 red->redist_metric 外，还要遍历 RIB，把已由该源重分发的路径的 attr->med
+ * 更新为新值并 bgp_process() 重新通告（保证运行中改 metric 立即生效）。
+ * 返回 true=变化并已更新，false=相同值。 */
 /* Redistribute with metric specification.  */
 bool bgp_redistribute_metric_set(struct bgp *bgp, struct bgp_redist *red,
 				 afi_t afi, int type, uint32_t metric)
@@ -2313,6 +2703,10 @@ bool bgp_redistribute_metric_set(struct bgp *bgp, struct bgp_redist *red,
 }
 
 /* Unset redistribution.  */
+/* 【函数】bgp_redistribute_unreg —— 撤销某协议在 zebra 侧的登记（但不删本地 red 记录）。
+ * 处理：从 zclient 的 mi_redist/vrf_bitmap 去登记；若与 zebra 连接正常则发
+ * ZEBRA_REDISTRIBUTE_DELETE；最后 bgp_redistribute_withdraw() 把该源已学到的路由从
+ * BGP RIB 撤掉。未登记返回 CMD_WARNING。 */
 int bgp_redistribute_unreg(struct bgp *bgp, afi_t afi, int type,
 			   unsigned short instance)
 {
@@ -2363,6 +2757,10 @@ int bgp_redistribute_unreg(struct bgp *bgp, afi_t afi, int type,
 }
 
 /* Unset redistribution.  */
+/* 【函数】_bgp_redistribute_unset —— 内部：彻底取消某 instance 的重分发。
+ * 顺序：先处理 VNC 特例(不受 zebra 连接状态影响，故在 red 查找之前)→ 查找 red →
+ * bgp_redistribute_unreg() 撤 zebra 登记与路由 → 释放 route-map 名并 decrement 计数 →
+ * 清零 metric → bgp_redist_del() 删本地记录。 */
 static void _bgp_redistribute_unset(struct bgp *bgp, afi_t afi, int type,
 				    unsigned short instance)
 {
@@ -2397,6 +2795,9 @@ static void _bgp_redistribute_unset(struct bgp *bgp, afi_t afi, int type,
 	bgp_redist_del(bgp, afi, type, instance);
 }
 
+/* 【函数】bgp_redistribute_unset —— 对外入口：取消重分发。
+ * ZEBRA_ROUTE_TABLE / ZEBRA_ROUTE_TABLE_DIRECT 且 instance==0 时表示“取消该 type 下
+ * 所有 instance”，需遍历链表逐个撤销；否则直接处理单个 instance。 */
 void bgp_redistribute_unset(struct bgp *bgp, afi_t afi, int type,
 			    unsigned short instance)
 {
@@ -2415,6 +2816,8 @@ void bgp_redistribute_unset(struct bgp *bgp, afi_t afi, int type,
 		_bgp_redistribute_unset(bgp, afi, type, red->instance);
 }
 
+/* 【函数】bgp_redistribute_redo —— 对某实例下所有 AFI、所有 type、所有 instance 的重分发
+ * 逐条重发(bgp_redistribute_resend)。用于连接恢复/配置整体刷新后重新同步。 */
 void bgp_redistribute_redo(struct bgp *bgp)
 {
 	afi_t afi;
@@ -2438,11 +2841,16 @@ void bgp_redistribute_redo(struct bgp *bgp)
 	}
 }
 
+/* 【函数】bgp_zclient_reset —— 复位主 zclient（关闭并重建连接），触发重连。
+ * 场景：zebra 重启或连接异常时强制重建。 */
 void bgp_zclient_reset(void)
 {
 	zclient_reset(bgp_zclient);
 }
 
+/* 【函数】bgp_zebra_update_srv6_encap_routes —— 对某 AFI 的单播表中所有带 SRv6 封装
+ * (srv6_l3service 或 srv6_vpn 的 SID 非零)的已选 BGP 路径，批量执行 add/撤销下发。
+ * 用于 SRv6 SID 变化后需要重装带 SRv6 封装的 FIB 条目时。 */
 void bgp_zebra_update_srv6_encap_routes(struct bgp *bgp, afi_t afi, struct bgp *from_bgp, bool add)
 {
 	struct bgp_table *table;
@@ -2469,6 +2877,16 @@ void bgp_zebra_update_srv6_encap_routes(struct bgp *bgp, afi_t afi, struct bgp *
 	}
 }
 
+/* 【函数】bgp_zebra_instance_register —— 把某 BGP 实例注册到 zebra。
+ * 调用时机：默认实例在 zebra 连接建立时；其它 VRF 实例在被 zebra 通知/创建后。
+ * 处理：
+ *   - 未连接直接返回；
+ *   - zclient_send_reg_requests() —— 订阅 router-id、接口、redistribute（这是**重连后
+ *     重新登记**的关键一步）；
+ *   - EVPN 实例启用时告知 zebra advertise_all_vni；
+ *   - bgp_nht_register_nexthops() —— 重新登记所有积压的下一跳；
+ *   - SRv6 locator 已配置但未拿到时，向 zebra 请求 locator。
+ * 这正是“重连后需要重新登记哪些东西”的答案：nexthop、redistribute、EVPN VNI、SRv6。 */
 /* Register this instance with Zebra. Invoked upon connect (for
  * default instance) and when other VRFs are learnt (or created and
  * already learnt).
@@ -2499,6 +2917,9 @@ void bgp_zebra_instance_register(struct bgp *bgp)
 		bgp_zebra_srv6_manager_get_locator(bgp->srv6_locator_name);
 }
 
+/* 【函数】bgp_zebra_instance_deregister —— 从 zebra 注销实例（实例删除时调用，默认或 VRF）。
+ * 处理：EVPN 实例先关闭 advertise_all_vni；再 zclient_send_dereg_requests() 取消订阅
+ * （router-id、接口、redistribute）。 */
 /* Deregister this instance with Zebra. Invoked upon the instance
  * being deleted (default or VRF) and it is already registered.
  */
@@ -2519,6 +2940,11 @@ void bgp_zebra_instance_deregister(struct bgp *bgp)
 	zclient_send_dereg_requests(bgp_zclient, bgp->vrf_id);
 }
 
+/* 【函数】bgp_zebra_initiate_radv —— 为某 peer 启动 IPv6 RA（无编号/ENHE 邻居需要，
+ * 让对端通过 RA 学到本端接口地址从而完成下一跳解析）。
+ * 处理：若配置了 BGP_FLAG_IPV6_NO_AUTO_RA 或未连 zebra 直接返回；无编号(peer->ifp)
+ *   走 zclient_send_interface_radv_req 开 RA；否则对编号 ENHE peer 调
+ *   bgp_nht_reg_enhe_cap_intfs() 找出接口并开启 RA。 */
 void bgp_zebra_initiate_radv(struct bgp *bgp, struct peer *peer)
 {
 	uint32_t ra_interval = BGP_UNNUM_DEFAULT_RA_INTERVAL;
@@ -2545,6 +2971,8 @@ void bgp_zebra_initiate_radv(struct bgp *bgp, struct peer *peer)
 		  : bgp_nht_reg_enhe_cap_intfs(peer);
 }
 
+/* 【函数】bgp_zebra_terminate_radv —— 与 bgp_zebra_initiate_radv 对称，关闭 RA
+ * （无编号走 zapi，编号 ENHE peer 走 bgp_nht_dereg_enhe_cap_intfs）。 */
 void bgp_zebra_terminate_radv(struct bgp *bgp, struct peer *peer)
 {
 	/* Don't try to terminate if we're not connected to Zebra */
@@ -2566,6 +2994,13 @@ void bgp_zebra_terminate_radv(struct bgp *bgp, struct peer *peer)
 		  : bgp_nht_dereg_enhe_cap_intfs(peer);
 }
 
+/* ========== 9. EVPN / VXLAN 相关交互（advertise 设置、VNI/ES/MACIP 回调） ==========
+ * 这些函数把 EVPN 的“元设置”下发给 zebra（子网通告、SVI/gw macip 通告、flood-control、
+ * advertise-all-vni、重复地址检测参数），并接收 zebra 关于 VNI/ES/L3VNI/MACIP 的通知。
+ * 相关 RFC：EVPN 控制面 RFC7432；EVPN 与 IP 前缀 RFC9136；type-2 携带 IP(RFC9135)。 */
+
+/* 【函数】bgp_zebra_advertise_subnet —— 通知 zebra 对指定 VNI 是否通告子网路由。
+ * 构造 ZEBRA_ADVERTISE_SUBNET 消息发送。返回 zclient 发送结果。 */
 int bgp_zebra_advertise_subnet(struct bgp *bgp, int advertise, vni_t vni)
 {
 	struct stream *s = NULL;
@@ -2595,6 +3030,8 @@ int bgp_zebra_advertise_subnet(struct bgp *bgp, int advertise, vni_t vni)
 	return zclient_send_message(bgp_zclient);
 }
 
+/* 【函数】bgp_zebra_advertise_svi_macip —— 通知 zebra 对指定 VNI 是否通告 SVI 的 MAC/IP
+ * (ZEBRA_ADVERTISE_SVI_MACIP)。 */
 int bgp_zebra_advertise_svi_macip(struct bgp *bgp, int advertise, vni_t vni)
 {
 	struct stream *s = NULL;
@@ -2619,6 +3056,8 @@ int bgp_zebra_advertise_svi_macip(struct bgp *bgp, int advertise, vni_t vni)
 	return zclient_send_message(bgp_zclient);
 }
 
+/* 【函数】bgp_zebra_advertise_gw_macip —— 通知 zebra 对指定 VNI 是否通告“默认网关”的
+ * MAC/IP (ZEBRA_ADVERTISE_DEFAULT_GW)。 */
 int bgp_zebra_advertise_gw_macip(struct bgp *bgp, int advertise, vni_t vni)
 {
 	struct stream *s = NULL;
@@ -2648,6 +3087,8 @@ int bgp_zebra_advertise_gw_macip(struct bgp *bgp, int advertise, vni_t vni)
 	return zclient_send_message(bgp_zclient);
 }
 
+/* 【函数】bgp_zebra_vxlan_flood_control —— 设置某 VNI（evpn 为空则全局）的 BUM 洪泛
+ * 控制模式(如 head-end replication / 继承全局)。构造 ZEBRA_VXLAN_FLOOD_CONTROL 下发。 */
 int bgp_zebra_vxlan_flood_control(struct bgp *bgp, struct bgpevpn *evpn)
 {
 	struct stream *s;
@@ -2685,6 +3126,8 @@ int bgp_zebra_vxlan_flood_control(struct bgp *bgp, struct bgpevpn *evpn)
 	return zclient_send_message(bgp_zclient);
 }
 
+/* 【函数】bgp_zebra_advertise_all_vni —— 开关“向 zebra 学习所有 VNI”的注册
+ * (ZEBRA_ADVERTISE_ALL_VNI)。仅在 advertise 时附带当前 BUM 处理设置。 */
 int bgp_zebra_advertise_all_vni(struct bgp *bgp, int advertise)
 {
 	struct stream *s;
@@ -2712,6 +3155,8 @@ int bgp_zebra_advertise_all_vni(struct bgp *bgp, int advertise)
 	return zclient_send_message(bgp_zclient);
 }
 
+/* 【函数】bgp_zebra_dup_addr_detection —— 把 EVPN 重复地址检测(dup addr detect)参数
+ * (使能、时间窗口、最大移动次数、冻结等)下发给 zebra(ZEBRA_DUPLICATE_ADDR_DETECTION)。 */
 int bgp_zebra_dup_addr_detection(struct bgp *bgp)
 {
 	struct stream *s;
@@ -2749,6 +3194,14 @@ int bgp_zebra_dup_addr_detection(struct bgp *bgp)
 	return zclient_send_message(bgp_zclient);
 }
 
+/* ========== 10. PBR / Flowspec 的 zebra 交互（ipset / iptable / ip rule） ==========
+ * Flowspec 下发到内核时被翻译成 ipset / iptable / ip-rule 这套 PBR 设施。这里的
+ * *_notify_owner 回调接收 zebra 对“安装/卸载/失败”的异步确认并回填各对象的
+ * installed / install_in_progress 状态；encode_* 负责把对象编码进 zstream。 */
+
+/* 【函数】rule_notify_owner —— 接收 ip rule 的安装/删除通知(ZAPI_RULE_*)。
+ * 在 bgp_pbr_action 或 bgp_pbr_rule 中定位对象，更新 installed / install_in_progress；
+ * 装好后把该 rule 挂到对应 bgp_path_info 的 flowspec 列表(便于随路由撤销一起清理)。 */
 static int rule_notify_owner(ZAPI_CALLBACK_ARGS)
 {
 	uint32_t seqno, priority, unique;
@@ -2821,6 +3274,8 @@ static int rule_notify_owner(ZAPI_CALLBACK_ARGS)
 	return 0;
 }
 
+/* 【函数】ipset_notify_owner —— 接收 ipset 定义(容器)的安装/删除通知(ZAPI_IPSET_*)，
+ * 回填 bgp_pbr_match 的 installed / install_in_progress。 */
 static int ipset_notify_owner(ZAPI_CALLBACK_ARGS)
 {
 	uint32_t unique;
@@ -2863,6 +3318,8 @@ static int ipset_notify_owner(ZAPI_CALLBACK_ARGS)
 	return 0;
 }
 
+/* 【函数】ipset_entry_notify_owner —— 接收 ipset 中一条表项的安装/删除通知
+ * (ZAPI_IPSET_ENTRY_*)，回填 bgp_pbr_match_entry 状态，并把表项链到路径的 flowspec。 */
 static int ipset_entry_notify_owner(ZAPI_CALLBACK_ARGS)
 {
 	uint32_t unique;
@@ -2928,6 +3385,9 @@ static int ipset_entry_notify_owner(ZAPI_CALLBACK_ARGS)
 	return 0;
 }
 
+/* 【函数】iptable_notify_owner —— 接收 iptable 规则的安装/删除通知(ZAPI_IPTABLE_*)，
+ * 回填 bgp_pbr_match 的 installed_in_iptable / install_iptable_in_progress，并对
+ * action 引用计数 +1（有 iptable 规则引用该 action）。 */
 static int iptable_notify_owner(ZAPI_CALLBACK_ARGS)
 {
 	uint32_t unique;
@@ -2970,6 +3430,15 @@ static int iptable_notify_owner(ZAPI_CALLBACK_ARGS)
 	return 0;
 }
 
+/* 【函数】bgp_zebra_route_notify_owner —— 接收 zebra 对**普通路由**安装结果的异步通知，
+ * 这是“异步下发”的闭环点（配合 suppress-fib-pending）。
+ * 依据 note 处理：
+ *   - ZAPI_ROUTE_INSTALLED：清 PENDING、置 BGP_NODE_FIB_INSTALLED，并立即选出 best path
+ *     通告(group_announce_route)——即“装好后才通告”；
+ *   - ZAPI_ROUTE_FAIL_INSTALL / BETTER_ADMIN_WON：清 PENDING/INSTALLED 并重新通告；
+ *   - ZAPI_ROUTE_REMOVED：仅清 INSTALLED（便于后续重装）。
+ * 解码出 prefix/table_id/afi/safi，找到 bgp 实例与 bgp_dest 后处理。
+ * 返回：0 成功；-1 解码/查表失败。 */
 /* Process route notification messages from RIB */
 static int bgp_zebra_route_notify_owner(int command, struct zclient *zclient,
 					zebra_size_t length, vrf_id_t vrf_id)
@@ -3087,6 +3556,8 @@ static int bgp_zebra_route_notify_owner(int command, struct zclient *zclient,
 	return 0;
 }
 
+/* 【函数】bgp_encode_pbr_rule_action —— 把 ip rule(pbr_rule) 编码进 zstream。
+ * pbr 非空时带优先级/唯一号/src-dst 过滤；为空时用 fwmark 作过滤（对应 ipset/iptable 方案）。 */
 /* this function is used to forge ip rule,
  * - either for iptable/ipset using fwmark id
  * - or for sample ip rule cmd
@@ -3150,6 +3621,7 @@ static void bgp_encode_pbr_rule_action(struct stream *s,
 	zapi_pbr_rule_encode(s, &r);
 }
 
+/* 【函数】bgp_encode_pbr_ipset_match —— 编码 ipset 定义(唯一号 / 类型 / 地址族 / 名字)。 */
 static void bgp_encode_pbr_ipset_match(struct stream *s,
 				  struct bgp_pbr_match *pbim)
 {
@@ -3160,6 +3632,8 @@ static void bgp_encode_pbr_ipset_match(struct stream *s,
 		   ZEBRA_IPSET_NAME_SIZE);
 }
 
+/* 【函数】bgp_encode_pbr_ipset_entry_match —— 编码 ipset 中的一条表项
+ * (src/dst 前缀、端口区间、协议)。 */
 static void bgp_encode_pbr_ipset_entry_match(struct stream *s,
 				  struct bgp_pbr_match_entry *pbime)
 {
@@ -3183,6 +3657,8 @@ static void bgp_encode_pbr_ipset_entry_match(struct stream *s,
 	stream_putc(s, pbime->proto);
 }
 
+/* 【函数】bgp_encode_pbr_iptable_match —— 编码 iptable 规则(动作 FORWARD/DROP、fwmark、
+ * 包长区间、tcp flags/mask、dscp、fragment、flow label 等)。 */
 static void bgp_encode_pbr_iptable_match(struct stream *s,
 					 struct bgp_pbr_action *bpa,
 					 struct bgp_pbr_match *pbm)
@@ -3215,6 +3691,13 @@ static void bgp_encode_pbr_iptable_match(struct stream *s,
 	stream_putw(s, pbm->flow_label);
 }
 
+/* 【函数】bgp_zebra_connected —— 与 zebra 建立连接后的回调（“连上了”这一刻的总入口）。
+ * 处理：
+ *   1) zclient_num_connects++（即便后续没响应也算连上过）；
+ *   2) 注册 BFD client；
+ *   3) 只处理默认实例（其它 VRF 尚未从 zebra 学到），bgp_zebra_instance_register()；
+ *   4) 视情况向 zebra 重新声明 GR 能力(BGP_GR_ROUTER_DETECT_AND_SEND_CAPABILITY)。
+ * 这是“重连后重新登记”的起点。 */
 /* BGP has established connection with Zebra. */
 static void bgp_zebra_connected(struct zclient *zclient)
 {
@@ -3241,6 +3724,9 @@ static void bgp_zebra_connected(struct zclient *zclient)
 	BGP_GR_ROUTER_DETECT_AND_SEND_CAPABILITY_TO_ZEBRA(bgp, bgp->peer);
 }
 
+/* 【函数】bgp_zebra_process_remote_routes_for_l2vni —— 定时器任务：对已学习/保留的远端
+ * 路由(VTEP/MAC)按 VNI 分批安装(install_uninstall_routes_for_vni)。仍有待处理 VNI 时，
+ * 20ms 后再排一次，避免一次性占用过多 CPU。 */
 void bgp_zebra_process_remote_routes_for_l2vni(struct event *e)
 {
 	/*
@@ -3258,6 +3744,9 @@ void bgp_zebra_process_remote_routes_for_l2vni(struct event *e)
 				     20, &bm->t_bgp_zebra_l2_vni);
 }
 
+/* 【函数】bgp_zebra_process_local_es_add —— 接收本地 ES(Ethernet Segment)新增通知
+ * (ZEBRA_LOCAL_ES_ADD)。解析 ESI、originator IP、active、df_pref、bypass 后交给
+ * bgp_evpn_local_es_add()（EVPN 多归属 ES/DF 选举，RFC7432）。 */
 static int bgp_zebra_process_local_es_add(ZAPI_CALLBACK_ARGS)
 {
 	esi_t esi;
@@ -3298,6 +3787,8 @@ static int bgp_zebra_process_local_es_add(ZAPI_CALLBACK_ARGS)
 	return 0;
 }
 
+/* 【函数】bgp_zebra_process_local_es_del —— 接收本地 ES 删除通知(ZEBRA_LOCAL_ES_DEL)，
+ * 调 bgp_evpn_local_es_del()。 */
 static int bgp_zebra_process_local_es_del(ZAPI_CALLBACK_ARGS)
 {
 	esi_t esi;
@@ -3324,6 +3815,8 @@ static int bgp_zebra_process_local_es_del(ZAPI_CALLBACK_ARGS)
 	return 0;
 }
 
+/* 【函数】bgp_zebra_process_local_es_evi —— 接收 ES 与 EVI 的绑定/解绑通知
+ * (ZEBRA_LOCAL_ES_EVI_ADD/DEL)，按 cmd 调 bgp_evpn_local_es_evi_add/del()。 */
 static int bgp_zebra_process_local_es_evi(ZAPI_CALLBACK_ARGS)
 {
 	esi_t esi;
@@ -3358,6 +3851,10 @@ static int bgp_zebra_process_local_es_evi(ZAPI_CALLBACK_ARGS)
 	return 0;
 }
 
+/* 【函数】bgp_zebra_process_local_l3vni —— 接收 L3VNI 增删通知(ZEBRA_L3VNI_ADD/DEL)。
+ * ADD 时解析 SVI RMAC、originator IP、filter、SVI ifindex、VRR RMAC、anycast-mac，
+ * 调 bgp_evpn_local_l3vni_add()；DEL 调 bgp_evpn_local_l3vni_del()。
+ * L3VNI 把 VRF 与 VXLAN 打通，是“VRF 路由经 EVPN/VXLAN 转发”的关键。 */
 static int bgp_zebra_process_local_l3vni(ZAPI_CALLBACK_ARGS)
 {
 	int filter = 0;
@@ -3406,6 +3903,9 @@ static int bgp_zebra_process_local_l3vni(ZAPI_CALLBACK_ARGS)
 	return 0;
 }
 
+/* 【函数】bgp_zebra_process_local_vni —— 接收 L2VNI 增删通知(ZEBRA_VNI_ADD/DEL)。
+ * ADD 解析 VTEP IP、tenant vrf、mcast 组、SVI ifindex；VTEP IP 为零则用本地 router-id。
+ * 调 bgp_evpn_local_vni_add/del()。 */
 static int bgp_zebra_process_local_vni(ZAPI_CALLBACK_ARGS)
 {
 	struct stream *s;
@@ -3460,6 +3960,9 @@ static int bgp_zebra_process_local_vni(ZAPI_CALLBACK_ARGS)
 	}
 }
 
+/* 【函数】bgp_zebra_process_local_macip —— 接收本地 MAC/IP 学习通知(ZEBRA_MACIP_ADD/DEL)。
+ * 解析 VNI、MAC、IP(校验 ipa_len)、flags/seqnum/ESI(ADD) 或 state(DEL)，
+ * 调 bgp_evpn_local_macip_add/del()（EVPN type-2 的产生/撤销源头之一）。 */
 static int bgp_zebra_process_local_macip(ZAPI_CALLBACK_ARGS)
 {
 	struct stream *s;
@@ -3527,6 +4030,9 @@ static int bgp_zebra_process_local_macip(ZAPI_CALLBACK_ARGS)
 	}
 }
 
+/* 【函数】bgp_zebra_process_local_ip_prefix —— 接收本地 IP 前缀通告通知
+ * (ZEBRA_IP_PREFIX_ROUTE_ADD/DEL)，按地址族调 bgp_evpn_advertise/withdraw_type5_route()
+ * ——即把 VRF 内的 IP 前缀作为 EVPN type-5 路由(RFC9136)通告或撤销。 */
 static int bgp_zebra_process_local_ip_prefix(ZAPI_CALLBACK_ARGS)
 {
 	struct stream *s = NULL;
@@ -3567,6 +4073,9 @@ static int bgp_zebra_process_local_ip_prefix(ZAPI_CALLBACK_ARGS)
 
 extern struct zebra_privs_t bgpd_privs;
 
+/* 【函数】bgp_ifp_create —— 接口新建(if_real)回调。登记本地 MAC；若该 VRF 有 BGP 实例，
+ * 更新无编号邻居绑定(upd_ifp=ifp)、触发 vrf_status 钩子；若是 loopback（且存在默认实例）
+ * 则更新 VPN 标签/SID 泄露。 */
 static int bgp_ifp_create(struct interface *ifp)
 {
 	struct bgp *bgp;
@@ -3598,6 +4107,17 @@ static int bgp_ifp_create(struct interface *ifp)
 	return 0;
 }
 
+/* ========== 11. SRv6 交互（locator / locator-chunk / SID 分配通知） ==========
+ * BGP 使用 SRv6 时需向 zebra 的 SRv6 manager 申请 locator 与 SID（END.DT4/DT6/DT46 等
+ * 行为）。locator 提供 SID 空间；chunk 是 locator 中划给本实例的可用段；SID 由 zebra
+ * 分配后通过 ZEBRA_SRV6_SID_NOTIFY 异步回灌。相关 RFC：SRv6 SID 结构 RFC8986，
+ * SRv6 用于 L3VPN 见 RFC9252。
+ * 关键函数：get/release_locator_chunk、request/release_srv6_sid、
+ * bgp_zebra_srv6_sid_notify（把 SID 落地到 vpn_policy / srv6_unicast）。 */
+
+/* 【函数】bgp_zebra_process_srv6_locator_chunk —— 接收 SRv6 manager 回应的 locator chunk
+ * 并加入 bgp->srv6_locator_chunks。先校验 locator 名匹配、去重；成功后触发
+ * vpn_leak_postchange_all() 让新 SID 空间可用于 VPN 通告。 */
 static int bgp_zebra_process_srv6_locator_chunk(ZAPI_CALLBACK_ARGS)
 {
 	struct stream *s = NULL;
@@ -3638,6 +4158,9 @@ static int bgp_zebra_process_srv6_locator_chunk(ZAPI_CALLBACK_ARGS)
  *
  * @param locator The locator to be processed
  */
+/* 【函数】bgp_zebra_process_srv6_locator_internal —— 内部：处理一个 SRv6 locator。
+ * 校验实例已配置 locator 且名字匹配后，深拷贝 locator 存到 bgp->srv6_locator，触发
+ * VPN-to-VRF/VRF-to-VPN 泄露重算，并为 AFI_IP/6 确保 unicast SID。返回 -1 表示参数非法。 */
 static int bgp_zebra_process_srv6_locator_internal(struct srv6_locator *locator, struct bgp *bgp)
 {
 	if (!bgp || !bgp_srv6_locator_is_configured(bgp) || !locator)
@@ -3672,6 +4195,16 @@ static int bgp_zebra_process_srv6_locator_internal(struct srv6_locator *locator,
 	return 0;
 }
 
+/* 【函数】bgp_zebra_srv6_sid_notify —— 处理 zebra 的 SRv6 SID 通知
+ * (ZEBRA_SRV6_SID_NOTIFY)，这是 SID 分配的**异步落地**点（函数很长，是 SRv6 状态机核心）。
+ * 流程：选出已配置 locator 的实例 → 解码 ctx/sid/behavior/note → 找到 SID 所属 VRF 的
+ *   bgp_vrf 与 locator → 依据 note：
+ *   - ALLOCATED：校验 locator 名/前缀，处理 wide-function 与 transpose，按 behavior
+ *     (DT4/DT6/DT46) 把 SID/locator/label 存入 vpn_policy[afi] 或 srv6_unicast[afi]、
+ *     注册 SID，重算泄露与 SRv6 unicast；
+ *   - RELEASED：若与记录一致则清 locator/label、注销 SID、撤 SRv6 unicast；
+ *   - FAIL_ALLOC / FAIL_RELEASE：仅日志。
+ * 返回 0；出错 -1。 */
 static int bgp_zebra_srv6_sid_notify(ZAPI_CALLBACK_ARGS)
 {
 	afi_t afi = AFI_UNSPEC;
@@ -3978,6 +4511,8 @@ static int bgp_zebra_srv6_sid_notify(ZAPI_CALLBACK_ARGS)
 	return 0;
 }
 
+/* 【函数】bgp_zebra_process_srv6_locator_add —— 接收 locator 新增(ZEBRA_SRV6_LOCATOR_ADD)，
+ * 对每个“已配置 locator”的实例调内部处理函数。返回 -1 解码失败。 */
 static int bgp_zebra_process_srv6_locator_add(ZAPI_CALLBACK_ARGS)
 {
 	struct srv6_locator loc = {};
@@ -3995,6 +4530,10 @@ static int bgp_zebra_process_srv6_locator_add(ZAPI_CALLBACK_ARGS)
 	return 0;
 }
 
+/* 【函数】bgp_zebra_process_srv6_locator_delete_per_bgp —— 内部：对某实例删除一个 locator
+ * 及其派生状态：先对相关 VRF 撤销 tovpn 泄露 → 清理 chunks、functions → 清理各 VRF 的
+ * tovpn_sid/tovpn_sid_locator（vpn_policy[IP/IP6] 与 per-vrf）→ 清 bgp->srv6_locator →
+ * 重算泄露。 */
 static void bgp_zebra_process_srv6_locator_delete_per_bgp(struct srv6_locator *loc, struct bgp *bgp)
 {
 	struct listnode *node, *nnode;
@@ -4128,6 +4667,8 @@ static void bgp_zebra_process_srv6_locator_delete_per_bgp(struct srv6_locator *l
 	vpn_leak_postchange_all();
 }
 
+/* 【函数】bgp_zebra_process_srv6_locator_delete —— 接收 locator 删除
+ * (ZEBRA_SRV6_LOCATOR_DELETE)，对匹配名字的实例调内部 per-bgp 删除函数。 */
 static int bgp_zebra_process_srv6_locator_delete(ZAPI_CALLBACK_ARGS)
 {
 	struct srv6_locator loc = {};
@@ -4148,6 +4689,9 @@ static int bgp_zebra_process_srv6_locator_delete(ZAPI_CALLBACK_ARGS)
 	return 0;
 }
 
+/* 【表】bgp_handlers —— zebra 消息分派表：下标是 ZEBRA_* 消息类型，值是处理回调。
+ * 由 bgp_zebra_init() 交给 zclient_new()。这是“入向”的总路由：zebra 的每类通知都经此表
+ * 找到对应函数。注意 ADD/DEL 常共用同一回调（回调内用 cmd 区分）。 */
 static zclient_handler *const bgp_handlers[] = {
 	[ZEBRA_ROUTER_ID_UPDATE] = bgp_router_id_update,
 	[ZEBRA_INTERFACE_ADDRESS_ADD] = bgp_interface_address_add,
@@ -4181,6 +4725,7 @@ static zclient_handler *const bgp_handlers[] = {
 	[ZEBRA_SRV6_SID_NOTIFY] = bgp_zebra_srv6_sid_notify,
 };
 
+/* 【函数】bgp_if_new_hook —— 接口新增钩子：为 ifp->info 分配 BGP 私有数据(bgp_interface)。 */
 static int bgp_if_new_hook(struct interface *ifp)
 {
 	struct bgp_interface *iifp;
@@ -4193,12 +4738,14 @@ static int bgp_if_new_hook(struct interface *ifp)
 	return 0;
 }
 
+/* 【函数】bgp_if_delete_hook —— 接口删除钩子：释放 ifp->info。 */
 static int bgp_if_delete_hook(struct interface *ifp)
 {
 	XFREE(MTYPE_BGP_IF_INFO, ifp->info);
 	return 0;
 }
 
+/* 【函数】bgp_if_init —— 注册接口 add/del 钩子（进程初始化时调用）。 */
 void bgp_if_init(void)
 {
 	/* Initialize Zebra interface data structure. */
@@ -4206,11 +4753,14 @@ void bgp_if_init(void)
 	hook_register_prio(if_del, 0, bgp_if_delete_hook);
 }
 
+/* 【函数】bgp_zebra_label_manager_ready —— 同步 zclient(bgp_zclient_sync) 套接字是否就绪。 */
 static bool bgp_zebra_label_manager_ready(void)
 {
 	return (bgp_zclient_sync->sock > 0);
 }
 
+/* 【函数】bgp_start_label_manager —— 定时器任务：若标签管理器未就绪则尝试连接，
+ * 失败则 1s 后重试。 */
 static void bgp_start_label_manager(struct event *start)
 {
 	if (!bgp_zebra_label_manager_ready() &&
@@ -4219,6 +4769,10 @@ static void bgp_start_label_manager(struct event *start)
 				&bm->t_bgp_start_label_manager);
 }
 
+/* 【函数】bgp_zebra_label_manager_connect —— 建立到 zebra 标签管理器的**同步连接**：
+ *   连接 socket → 置非阻塞 → 发 hello 声明这是同步客户端 → lm_label_manager_connect；
+ *   成功后通知标签池(bgp_lp_event_zebra_up)与 L3VPN(vpn_leak_postchange_all)。
+ * 返回 true 表示连接成功。 */
 static bool bgp_zebra_label_manager_connect(void)
 {
 	/* Connect to label manager. */
@@ -4258,11 +4812,21 @@ static bool bgp_zebra_label_manager_connect(void)
 	return true;
 }
 
+/* 【函数】bgp_zebra_capabilities —— 接收 zebra 的能力通告，记录 v6_with_v4_nexthops
+ * （用于 RFC5549/ENHE 场景判断 zebra 是否支持“v6 前缀配 v4 下一跳”）。 */
 static void bgp_zebra_capabilities(struct zclient_capabilities *cap)
 {
 	bm->v6_with_v4_nexthops = cap->v6_with_v4_nexthop;
 }
 
+/* 【函数】bgp_zebra_init —— bgpd 启动时初始化 zebra 子系统（在 bgpd.c 初始化早期调用）。
+ * 处理：
+ *   - 注册接口 hook(if_real / if_up / if_down / if_unreal)；
+ *   - 创建主 zclient，zclient_init(客户端类型 ZEBRA_ROUTE_BGP)，挂接回调：
+ *     zebra_buffer_write_ready / zebra_connected / zebra_capabilities / nexthop_update；
+ *   - 创建**同步** zclient(bgp_zclient_sync) 供标签管理器等使用；
+ *   - 若标签管理器未就绪，启动 bgp_start_label_manager 定时器连接。
+ * 参数 instance：bgpd 的实例号（多实例部署用）。 */
 void bgp_zebra_init(struct event_loop *master, unsigned short instance)
 {
 	zclient_num_connects = 0;
@@ -4295,6 +4859,7 @@ void bgp_zebra_init(struct event_loop *master, unsigned short instance)
 				&bm->t_bgp_start_label_manager);
 }
 
+/* 【函数】bgp_zebra_destroy —— 进程退出时停用并释放两个 zclient（主 + 同步）。 */
 void bgp_zebra_destroy(void)
 {
 	if (bgp_zclient == NULL)
@@ -4310,11 +4875,15 @@ void bgp_zebra_destroy(void)
 	bgp_zclient_sync = NULL;
 }
 
+/* 【函数】bgp_zebra_num_connects —— 返回累计连接次数（zclient_num_connects）。 */
 int bgp_zebra_num_connects(void)
 {
 	return zclient_num_connects;
 }
 
+/* ========== 12. PBR 发送 / GR 能力 / SRv6 管理器辅助 / 标签池（文件尾部杂项） ========== */
+/* 【函数】bgp_send_pbr_rule_action —— 向 zebra 下发/撤销一条 ip rule(pbr action)。
+ * 若已在安装中则直接返回（去重）；发送成功后对 install 置 install_in_progress。 */
 void bgp_send_pbr_rule_action(struct bgp_pbr_action *pbra,
 			      struct bgp_pbr_rule *pbr,
 			      bool install)
@@ -4351,6 +4920,7 @@ void bgp_send_pbr_rule_action(struct bgp_pbr_action *pbra,
 	}
 }
 
+/* 【函数】bgp_send_pbr_ipset_match —— 创建/销毁一个 ipset(ZEBRA_IPSET_CREATE/DESTROY)。 */
 void bgp_send_pbr_ipset_match(struct bgp_pbr_match *pbrim, bool install)
 {
 	struct stream *s;
@@ -4378,6 +4948,8 @@ void bgp_send_pbr_ipset_match(struct bgp_pbr_match *pbrim, bool install)
 		pbrim->install_in_progress = true;
 }
 
+/* 【函数】bgp_send_pbr_ipset_entry_match —— 在 ipset 中增删一条表项
+ * (ZEBRA_IPSET_ENTRY_ADD/DELETE)。 */
 void bgp_send_pbr_ipset_entry_match(struct bgp_pbr_match_entry *pbrime,
 				    bool install)
 {
@@ -4406,6 +4978,8 @@ void bgp_send_pbr_ipset_entry_match(struct bgp_pbr_match_entry *pbrime,
 		pbrime->install_in_progress = true;
 }
 
+/* 【函数】bgp_encode_pbr_interface_list —— 把该实例在 PBR 配置里登记的接口(按地址族)的
+ * ifindex 列表编码进 zstream。 */
 static void bgp_encode_pbr_interface_list(struct bgp *bgp, struct stream *s,
 					  uint8_t family)
 {
@@ -4427,6 +5001,7 @@ static void bgp_encode_pbr_interface_list(struct bgp *bgp, struct stream *s,
 	}
 }
 
+/* 【函数】bgp_pbr_get_ifnumber —— 统计该实例在某地址族下已登记的 PBR 接口数量。 */
 static int bgp_pbr_get_ifnumber(struct bgp *bgp, uint8_t family)
 {
 	struct bgp_pbr_config *bgp_pbr_cfg = bgp->bgp_pbr_cfg;
@@ -4447,6 +5022,8 @@ static int bgp_pbr_get_ifnumber(struct bgp *bgp, uint8_t family)
 	return cnt;
 }
 
+/* 【函数】bgp_send_pbr_iptable —— 增删 iptable 规则(ZEBRA_IPTABLE_ADD/DELETE)，并带上
+ * 关联接口列表。install 时对 action 引用计数 +1（发送失败则置 install_iptable_in_progress）。 */
 void bgp_send_pbr_iptable(struct bgp_pbr_action *pba,
 			  struct bgp_pbr_match *pbm,
 			  bool install)
@@ -4488,6 +5065,11 @@ void bgp_send_pbr_iptable(struct bgp_pbr_action *pba,
  * - if nexthop IP is present : to this nexthop
  * - if vrf is different from local : to the matching VRF
  */
+/* 【函数】bgp_zebra_announce_default —— 往指定 table_id 注入一条默认路由(IPv4/IPv6)：
+ *   - 若给定下一跳 IP：默认路由指向该 next-hop；
+ *   - 若跨 VRF：指向匹配 VRF 的接口(NEXTHOP_TYPE_IFINDEX)。
+ * 用于 Flowspec/VRF 等需要“把流量导向某 VRF/下一跳”的场景。
+ * 注意 vrf-lite(非 netns)下不跨 VRF 注入（直接用 VRF 表 ID 分流）。 */
 void bgp_zebra_announce_default(struct bgp *bgp, struct nexthop *nh,
 				afi_t afi, uint32_t table_id, bool announce)
 {
@@ -4568,6 +5150,9 @@ void bgp_zebra_announce_default(struct bgp *bgp, struct nexthop *nh,
 }
 
 /* Send capabilities to RIB */
+/* 【函数】bgp_zebra_send_capabilities —— 向 zebra 声明/取消本客户端的 GR(优雅重启)能力
+ * (ZEBRA_CLIENT_GR_CAPABILITIES / ZEBRA_CLIENT_GR_DISABLE)，附带 stale 时间。
+ * 返回 BGP_GR_SUCCESS / BGP_GR_FAILURE。 */
 int bgp_zebra_send_capabilities(struct bgp *bgp, bool disable)
 {
 	struct zapi_cap api;
@@ -4641,6 +5226,9 @@ int bgp_zebra_send_capabilities(struct bgp *bgp, bool disable)
 /* Send route update pesding or completed status to RIB for the
  * specific AFI, SAFI
  */
+/* 【函数】bgp_zebra_update —— 向 zebra 发送某 AFI/SAFI 的路由更新进度状态
+ * (UPDATE_PENDING / UPDATE_COMPLETE 等 ZEBRA_CLIENT_* 能力)，配合 GR/EOR。
+ * 非默认 VRF 的 L2VPN EVPN 直接忽略。返回 BGP_GR_*。 */
 int bgp_zebra_update(struct bgp *bgp, afi_t afi, safi_t safi,
 		     enum zserv_client_capabilities type)
 {
@@ -4699,6 +5287,8 @@ int bgp_zebra_update(struct bgp *bgp, afi_t afi, safi_t safi,
 
 
 /* Send RIB stale timer update */
+/* 【函数】bgp_zebra_stale_timer_update —— 把 RIB stale 时间(GR 用)下发给 zebra
+ * (ZEBRA_CLIENT_RIB_STALE_TIME)。 */
 int bgp_zebra_stale_timer_update(struct bgp *bgp)
 {
 	struct zapi_cap api;
@@ -4736,11 +5326,14 @@ int bgp_zebra_stale_timer_update(struct bgp *bgp)
 	return BGP_GR_SUCCESS;
 }
 
+/* 【函数】bgp_zebra_srv6_manager_get_locator_chunk —— 向 SRv6 manager 申请某 locator 的
+ * chunk（同步 zclient）。 */
 int bgp_zebra_srv6_manager_get_locator_chunk(const char *name)
 {
 	return srv6_manager_get_locator_chunk(bgp_zclient, name);
 }
 
+/* 【函数】bgp_zebra_srv6_manager_release_locator_chunk —— 释放之前申请的 locator chunk。 */
 int bgp_zebra_srv6_manager_release_locator_chunk(const char *name)
 {
 	return srv6_manager_release_locator_chunk(bgp_zclient, name);
@@ -4752,6 +5345,7 @@ int bgp_zebra_srv6_manager_release_locator_chunk(const char *name)
  * @param name Locator name
  * @return 0 on success, -1 otherwise
  */
+/* 【函数】bgp_zebra_srv6_manager_get_locator —— 向 SRv6 manager 查询/获取某 locator。 */
 int bgp_zebra_srv6_manager_get_locator(const char *name)
 {
 	if (!name)
@@ -4780,6 +5374,9 @@ int bgp_zebra_srv6_manager_get_locator(const char *name)
  * @param locator_name Name of the locator from which the SID must be allocated
  * @param sid_func SID Function allocated by the SRv6 Manager.
  */
+/* 【函数】bgp_zebra_request_srv6_sid —— 向 SRv6 manager 申请一个 SID。
+ * sid_value 非空=显式请求该地址；为空=从 locator 动态分配。sid_func 回传函数号。
+ * 返回 true 成功。 */
 bool bgp_zebra_request_srv6_sid(const struct srv6_sid_ctx *ctx,
 				struct in6_addr *sid_value,
 				const char *locator_name, uint32_t *sid_func)
@@ -4811,6 +5408,7 @@ bool bgp_zebra_request_srv6_sid(const struct srv6_sid_ctx *ctx,
  * @param ctx Context to be associated with the SID to be released
  * @param locator_name Parent locator of the SID
  */
+/* 【函数】bgp_zebra_release_srv6_sid —— 释放之前申请的 SID。 */
 void bgp_zebra_release_srv6_sid(const struct srv6_sid_ctx *ctx, const char *locator_name)
 {
 	int ret;
@@ -4829,6 +5427,9 @@ void bgp_zebra_release_srv6_sid(const struct srv6_sid_ctx *ctx, const char *loca
 	}
 }
 
+/* 【函数】bgp_zebra_send_nexthop_label —— 直接向 zebra 下发/撤销一个“标签到下一跳”的
+ * 映射(zapi_labels)。用于 MPLS LSP 的标签下发(如 L3VPN 出标签)。
+ * 依赖 p->family 决定下一跳类型(带不带 ifindex)，并按 out_labels 复制标签栈。 */
 void bgp_zebra_send_nexthop_label(int cmd, mpls_label_t label,
 				  ifindex_t ifindex, vrf_id_t vrf_id,
 				  enum lsp_types_t ltype, struct prefix *p,
@@ -4868,6 +5469,9 @@ void bgp_zebra_send_nexthop_label(int cmd, mpls_label_t label,
 	zebra_send_mpls_labels(bgp_zclient, cmd, &zl);
 }
 
+/* 【函数】bgp_zebra_request_label_range —— 通过同步 zclient 向标签管理器申请一段标签区间
+ * [start,end]。label_auto 为真时通知标签池(bgp_lp_event_chunk)可用新区间。
+ * 返回 true 成功（含区间合法性校验）。 */
 bool bgp_zebra_request_label_range(uint32_t base, uint32_t chunk_size,
 				   bool label_auto)
 {
@@ -4902,6 +5506,7 @@ bool bgp_zebra_request_label_range(uint32_t base, uint32_t chunk_size,
 	return true;
 }
 
+/* 【函数】bgp_zebra_release_label_range —— 通过同步 zclient 释放标签区间 [start,end]。 */
 void bgp_zebra_release_label_range(uint32_t start, uint32_t end)
 {
 	int ret;

@@ -3,9 +3,44 @@
  * Copyright (C) 2012 Vincent Bernat <bernat@luffy.cx>
  */
 
+/*
+ * ========================== 文件导读 ==========================
+ * 1. 职责
+ *    在编译期打开 SNMP_AGENTX 时，用 NetSNMP 库实现 SNMP 子代理：
+ *    初始化 AgentX 会话，把 NetSNMP 的 fd 与超时接入 FRR 事件循环，
+ *    并提供 MIB 注册与 trap 发送接口。文件主体被 SNMP_AGENTX
+ *    条件编译包住，未启用时整个文件内容为空。
+ * 2. 核心数据结构
+ *    - agentx_tm：FRR 事件循环句柄。
+ *    - timeout_thr：NetSNMP 下一次超时对应的 FRR 定时器。
+ *    - events：NetSNMP 待监听 fd 的链表，元素指向 struct event。
+ *    - agentx_enabled：本文件定义的 hook，供 hook_call 广播启用事件。
+ * 3. 与其他模块的关系
+ *    - CLI 侧由 libagentx.c 装配命令，并通过 agentx_cli_enabled 等 hook
+ *      回调本文件的 agentx_cli_on / agentx_cli_off。
+ *    - smux.h 提供 smux_init、smux_trap 等对外符号，供各协议 daemon
+ *      注册 MIB 与发送 trap。
+ *    - libfrr.h 提供事件循环，xref.h 提供符号引用追踪。
+ * 4. 阅读顺序
+ *    agentx_events_update 是核心：它把 NetSNMP 的 fd 集合同步成 FRR
+ *    事件。建议顺序：事件注册 / 超时 -> events_update -> 日志回调
+ *    -> CLI 启停 -> smux 对外接口 -> 终止清理。
+ * 5. 易踩的坑
+ *    - events 链表里存的是 struct event 指针的指针，删除时先释放。
+ *    - 两个列表同时遍历使用双指针法，注意 fd 与链表可能错位。
+ *    - smux_trap 的 trapobj 用正负 namelen 区分列对象与标量对象。
+ *    - smux_disable 与 smux_terminate 职责不同，前者只清标志，
+ *      后者才真正释放链表。
+ * ============================================================
+ */
 #include <zebra.h>
 #include <fcntl.h>
 
+/*
+ * NetSNMP 头文件：net-snmp-config / includes 提供库基础，agent 目录
+ * 提供子代理接口，large_fd_set 用于可扩展的 fd 集合。以下全部依赖
+ * SNMP_AGENTX 条件编译，未启用则整段不参与编译。
+ */
 #ifdef SNMP_AGENTX
 #include <net-snmp/net-snmp-config.h>
 #include <net-snmp/net-snmp-includes.h>
@@ -24,18 +59,42 @@
 #include "xref.h"
 #include "lib/libagentx.h"
 
+/*
+ * XREF_SETUP：登记本模块的符号引用表，供 xref 工具生成交叉引用，
+ * 需放在文件作用域靠前位置。
+ */
 XREF_SETUP();
 
+/*
+ * 定义 agentx_enabled hook。启用 AgentX 时通过 hook_call 广播，
+ * 让关心该事件的模块收到通知。
+ */
 DEFINE_HOOK(agentx_enabled, (), ());
 
+/*
+ * 历史遗留：此处原拟定义同名 bool，现已改为 hook，见上方定义。
+ * 保留注释仅为记录演进痕迹。
+ */
 //bool agentx_enabled = false;
 
+/*
+ * agentx_tm：FRR 事件循环句柄，由 smux_init 注入。
+ * timeout_thr：NetSNMP 下一次需要超时处理时挂的 FRR 定时器。
+ * events：NetSNMP 需要监听的 fd 列表，链表元素指向 struct event 指针。
+ */
 static struct event_loop *agentx_tm;
 static struct event *timeout_thr = NULL;
 static struct list *events = NULL;
 
+/*
+ * agentx_events_update 前置声明，供 timeout 与 read 回调互相调用。
+ */
 static void agentx_events_update(void);
 
+/*
+ * agentx_timeout：FRR 定时器回调。驱动 NetSNMP 的超时处理、报警
+ * 处理与未完成请求检查，随后同步 fd 事件集合。
+ */
 static void agentx_timeout(struct event *t)
 {
 	snmp_timeout();
@@ -44,6 +103,11 @@ static void agentx_timeout(struct event *t)
 	agentx_events_update();
 }
 
+/*
+ * agentx_read：某个待监听 fd 可读时的回调。先把该监听项从 events
+ * 链表摘除并释放其记录，再把 fd 临时设为非阻塞，调用 snmp_read2
+ * 读取并处理报文，最后恢复原阻塞标志并做下一轮事件同步。
+ */
 static void agentx_read(struct event *t)
 {
 	netsnmp_large_fd_set lfds;
@@ -91,6 +155,13 @@ static void agentx_read(struct event *t)
 	netsnmp_large_fd_set_cleanup(&lfds);
 }
 
+/*
+ * agentx_events_update：核心同步函数。用 snmp_select_info2 取得
+ * NetSNMP 当前关心的 fd 集合与超时，先取消旧定时器；若需阻塞等待
+ * 则挂新的超时定时器。随后用双指针法同时遍历 fd 序号与 events
+ * 链表：不再被关心的 fd 取消监听并删除节点，新出现的 fd 建立监听
+ * 项，fd 超过 maxfd 的残留项统一清理。
+ */
 static void agentx_events_update(void)
 {
 	int maxfd = 0;
@@ -155,6 +226,11 @@ static void agentx_events_update(void)
 }
 
 /* Logging NetSNMP messages */
+/*
+ * agentx_log_callback：把 NetSNMP 的日志回调桥接到 FRR 日志。按
+ * snmp_log_message 的优先级映射到 flog_err / flog_warn / zlog_*，
+ * 并去掉消息尾部换行。
+ */
 static int agentx_log_callback(int major, int minor, void *serverarg,
 			       void *clientarg)
 {
@@ -193,6 +269,11 @@ static int agentx_log_callback(int major, int minor, void *serverarg,
 	return SNMP_ERR_NOERROR;
 }
 
+/*
+ * agentx_cli_on：agentx 命令的 hook 实现。若尚未启用，则初始化
+ * NetSNMP、创建 events 链表、建立初始监听、置位标志并广播
+ * agentx_enabled hook。返回 1 表示成功。
+ */
 static int agentx_cli_on(void)
 {
 	if (!agentx_enabled) {
@@ -206,6 +287,10 @@ static int agentx_cli_on(void)
 	return 1;
 }
 
+/*
+ * agentx_cli_off：no agentx 命令的 hook 实现。已启用时返回 0 表示
+ * 拒绝禁用，未启用时返回 1。
+ */
 static int agentx_cli_off(void)
 {
 	if (!agentx_enabled)
@@ -213,6 +298,10 @@ static int agentx_cli_off(void)
 	return 0;
 }
 
+/*
+ * smux_disable：进程早期结束流程注册的清理回调，仅复位启用标志，
+ * 不释放 events 链表。始终返回 0。
+ */
 static int smux_disable(void)
 {
 	agentx_enabled = false;
@@ -220,11 +309,19 @@ static int smux_disable(void)
 	return 0;
 }
 
+/*
+ * smux_enabled：对外查询当前 AgentX 是否启用，直接返回全局标志。
+ */
 bool smux_enabled(void)
 {
 	return agentx_enabled;
 }
 
+/*
+ * smux_init：模块初始化。记录事件循环，注册两个 CLI hook，配置
+ * NetSNMP 子代理与日志回调，init_agent 建立子代理会话，并在
+ * frr_early_fini 时注册 smux_disable。
+ */
 void smux_init(struct event_loop *tm)
 {
 	agentx_tm = tm;
@@ -242,6 +339,10 @@ void smux_init(struct event_loop *tm)
 	hook_register(frr_early_fini, smux_disable);
 }
 
+/*
+ * smux_agentx_enable：不经 CLI 直接启用 AgentX，逻辑与 agentx_cli_on
+ * 类似，但不广播 agentx_enabled hook。
+ */
 void smux_agentx_enable(void)
 {
 	if (!agentx_enabled) {
@@ -252,12 +353,20 @@ void smux_agentx_enable(void)
 	}
 }
 
+/*
+ * smux_register_mib：封装 NetSNMP 的 register_mib，供协议模块注册
+ * MIB 子树与变量处理函数。参数含义与 register_mib 一致。
+ */
 void smux_register_mib(const char *descr, struct variable *var, size_t width,
 		       int num, oid name[], size_t namelen)
 {
 	register_mib(descr, var, width, num, name, namelen);
 }
 
+/*
+ * smux_trap：单索引 trap 的便捷封装。把单个索引拷贝成多索引结构，
+ * 再转交 smux_trap_multi_index 处理，保持旧有调用方语义不变。
+ */
 void smux_trap(struct variable *vp, size_t vp_len, const oid *ename,
 	       size_t enamelen, const oid *name, size_t namelen,
 	       const oid *iname, size_t inamelen,
@@ -275,6 +384,13 @@ void smux_trap(struct variable *vp, size_t vp_len, const oid *ename,
 			      trapobjlen, sptrap);
 }
 
+/*
+ * smux_trap_multi_index：构造并发送 SNMPv2 trap。先填充 snmpTrapOID，
+ * 再逐个 trap 绑定对象拼出完整 OID，必要时按索引区分不同对象，
+ * 在 MIB 注册表中找到 findVar 取值后加入变量链表，最后 send_v2trap
+ * 并释放链表、刷新事件集合。index_len 为 1 时所有对象共用同一索引，
+ * 否则按对象序号取各自索引。
+ */
 int smux_trap_multi_index(struct variable *vp, size_t vp_len, const oid *ename,
 			  size_t enamelen, const oid *name, size_t namelen,
 			  struct index_oid *iname, size_t index_len,
@@ -372,16 +488,28 @@ int smux_trap_multi_index(struct variable *vp, size_t vp_len, const oid *ename,
 	return 1;
 }
 
+/*
+ * smux_events_update：对外暴露的事件同步入口，转调
+ * agentx_events_update。
+ */
 void smux_events_update(void)
 {
 	agentx_events_update();
 }
 
+/*
+ * smux_events_delete_thread：events 链表销毁时的元素清理回调，
+ * 释放单个监听记录占用的内存。
+ */
 static void smux_events_delete_thread(void *arg)
 {
 	XFREE(MTYPE_TMP, arg);
 }
 
+/*
+ * smux_terminate：终止清理。设置链表元素删除回调后删除整个 events
+ * 链表，释放所有残留监听项。
+ */
 void smux_terminate(void)
 {
 	if (events) {
@@ -389,4 +517,7 @@ void smux_terminate(void)
 		list_delete(&events);
 	}
 }
+/*
+ * 以上实现仅在启用 SNMP_AGENTX 时编译，否则本文件内容为空。
+ */
 #endif /* SNMP_AGENTX */

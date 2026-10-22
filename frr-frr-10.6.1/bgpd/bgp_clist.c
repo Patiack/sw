@@ -3,6 +3,42 @@
  * Copyright (C) 1999 Kunihiro Ishiguro
  */
 
+/* ============================================================================
+ * 【文件导读】bgp_clist.c —— community-list（团体过滤器）的实现
+ * ============================================================================
+ * 【它是什么】bgp_clist.h 里声明的那一堆接口的实现：提供 `ip community-list`、
+ * `ip extcommunity-list`、`ip large-community-list` 三套过滤器配置的增删改查与
+ * 匹配。route-map 的 `match community / extcommunity / large-community` 最终都会
+ * 落到本文件的匹配函数上。术语与常量一律沿用 bgp_clist.h 的中文注释，请对照阅读。
+ *
+ * 【两类正交维度（头文件已述，此处再点一次）】
+ *   种类 MASTER：standard community / extcommunity / large-community 三类，各有
+ *       独立的命名空间与匹配函数族，由 master 编号 0 1 2 索引（见头文件宏）。
+ *   写法 style：standard（列出具体团体值，要求精确出现）与 expanded（写正则去
+ *       匹配团体的字符串形式）。**同一 list 内不允许混用两种写法**，配置时即被
+ *       拒绝并返回 STANDARD_CONFLICT / EXPANDED_CONFLICT 错误码。
+ *   两个维度相乘即头文件里的 6 个扁平编号（COMMUNITY_LIST_STANDARD 等）。
+ *
+ * 【命名空间与查找】每个 master 维护 num（数字名 1~500）与 str（字符串名）两张
+ * 有序链表，外加一张按名字哈希的 hash。链表保证回显配置时顺序稳定，hash 负责
+ * 高频的名字查找；插入时按名字排序以维持链表有序。
+ *
+ * 【条目 seq 语义】条目按 seq 升序排列，匹配时**第一条命中即定论**（permit 才
+ * 放行、deny 即拒绝）。seq 省略时由 bgp_clist_new_seq_get 按“当前最大 seq 向上
+ * 取 5 的倍数再加 5”自动分配，留出插入空档。
+ *
+ * 【返回值陷阱（务必记住）】..._match 系列返回 bool，含义是“命中了列表里某条规则”
+ * 并已把它换算成 permit / deny 的结论——即 return true 表示该路由被这条 list 放行；
+ * return false 则可能是“没有任何条目命中”，也可能是“命中了 deny 条目”。而
+ * ..._any_match / ..._exact_match / ..._match_delete 是语义不同的变体，不可混用，
+ * 详见各函数上方注释。
+ *
+ * 【阅读顺序】seq 与 hash 辅助 → 生命周期 new / free → 插入 / 查找 / 删除 list
+ *            与 entry → 团体转字符串 → 正则辅助 → 各匹配函数 → 三套 set / unset
+ *            → init / terminate → CLI 补全。
+ * ============================================================================
+ */
+
 #include <zebra.h>
 
 #include "command.h"
@@ -23,6 +59,9 @@
 #include "bgpd/bgp_regex.h"
 #include "bgpd/bgp_clist.h"
 
+/* 【函数】为新条目自动分配 seq：扫描全表取最大 seq，向上取 5 的倍数再加 5，
+ * 使相邻自动值之间保留空档便于后续手工插入。结果被截断到 UINT_MAX 以防越界。
+ * 仅当用户未显式指定 seq（entry->seq == COMMUNITY_SEQ_NUMBER_AUTO）时才调用。 */
 /* Calculate new sequential number. */
 static int64_t bgp_clist_new_seq_get(struct community_list *list)
 {
@@ -42,6 +81,8 @@ static int64_t bgp_clist_new_seq_get(struct community_list *list)
 	return (newseq > UINT_MAX) ? UINT_MAX : newseq;
 }
 
+/* 【函数】线性查找 list 中 seq 与给定值相同的条目；找到返回该条目，否则 NULL。
+ * 供新增条目时判断是否要“替换同号条目”。复杂度 O(n)，最坏全表扫描。 */
 /* Return community-list entry which has same seq number. */
 static struct community_entry *bgp_clist_seq_check(struct community_list *list,
 						   int64_t seq)
@@ -54,6 +95,9 @@ static struct community_entry *bgp_clist_seq_check(struct community_list *list,
 	return NULL;
 }
 
+/* 【函数】hash 回调：算 community_list 的哈希键。名字哈希结果缓存在 name_hash
+ * 字段，已算过即直接返回，避免重复 jhash。注意此缓存“算一次存终身”——若改了
+ * 名字必须同步刷新该字段，否则哈希表查找会失效。 */
 static uint32_t bgp_clist_hash_key_community_list(const void *data)
 {
 	struct community_list *cl = (struct community_list *) data;
@@ -65,6 +109,8 @@ static uint32_t bgp_clist_hash_key_community_list(const void *data)
 	return cl->name_hash;
 }
 
+/* 【函数】hash 回调：判断两个 community_list 是否同一个键（同名）。先比缓存的
+ * name_hash，不等则快速返回 false，再 strcmp 名字，两者都相等才命中。 */
 static bool bgp_clist_hash_cmp_community_list(const void *a1, const void *a2)
 {
 	const struct community_list *cl1 = a1;
@@ -79,6 +125,9 @@ static bool bgp_clist_hash_cmp_community_list(const void *a1, const void *a2)
 	return false;
 }
 
+/* 【函数】按 master 编号取出三类团体容器之一。返回的是 handler 内部的地址，
+ * 不可释放。ch 为 NULL 或 master 非法时返回 NULL。这是所有 set / unset / lookup
+ * 定位“操作哪一类团体”的统一入口。 */
 /* Lookup master structure for community-list or
    extcommunity-list.  */
 struct community_list_master *
@@ -96,6 +145,8 @@ community_list_master_lookup(struct community_list_handler *ch, int master)
 	return NULL;
 }
 
+/* 【函数】分配一个零初始化的 community_entry。注意 memset 后 direct 为 0，
+ * 即 COMMUNITY_DENY——调用方必须显式设 direct，否则规则会变成 deny。 */
 /* Allocate a new community list entry.  */
 static struct community_entry *community_entry_new(void)
 {
@@ -103,6 +154,10 @@ static struct community_entry *community_entry_new(void)
 		       sizeof(struct community_entry));
 }
 
+/* 【函数】释放一条规则，按 style 分别释放 union 里对应的团体对象或正则对象，
+ * 并释放 config 字符串（注意不同 style 用的 config 内存类型不同：standard 的
+ * extcommunity 用 MTYPE_ECOMMUNITY_STR，expanded 用 MTYPE_COMMUNITY_LIST_CONFIG）。
+ * 最后释放条目本身。必须先 free 内部数据再 free 结构体。 */
 /* Free community list entry.  */
 static void community_entry_free(struct community_entry *entry)
 {
@@ -135,12 +190,15 @@ static void community_entry_free(struct community_entry *entry)
 	XFREE(MTYPE_COMMUNITY_LIST_ENTRY, entry);
 }
 
+/* 【函数】分配一个零初始化的 community_list（一个命名的过滤器）。 */
 /* Allocate a new community-list.  */
 static struct community_list *community_list_new(void)
 {
 	return XCALLOC(MTYPE_COMMUNITY_LIST, sizeof(struct community_list));
 }
 
+/* 【函数】释放一个 community_list 结构本身（名字 + 结构体）。注意它**不**负责
+ * 释放链表里的规则条目，那些由 community_list_delete 先行处理。 */
 /* Free community-list.  */
 static void community_list_free(struct community_list *list)
 {
@@ -148,6 +206,11 @@ static void community_list_free(struct community_list *list)
 	XFREE(MTYPE_COMMUNITY_LIST, list);
 }
 
+/* 【函数】新建一个 community_list 并插入对应 master。先判断名字是否“全数字且
+ * 不超过 500”——是则归入 num 链表（sort = NUMBER），否则归入 str 链表
+ * （sort = STRING）；两个命名空间互不相干。同时把新对象放进 hash 便于后续查找。
+ * 链表按名字排序插入（数字名按数值比较、字符串名按字典序），以保证回显顺序稳定。
+ * 返回新建的 list。 */
 static struct community_list *
 community_list_insert(struct community_list_handler *ch, const char *name,
 		      int master)
@@ -239,6 +302,10 @@ community_list_insert(struct community_list_handler *ch, const char *name,
 	return new;
 }
 
+/* 【函数】在指定 master 的 hash 里按名字查找一个 community_list；找不到返回
+ * NULL。name_hash 由调用方提供以避免重复算哈希；**传错哈希会查不到**（哈希表
+ * 按值找桶），务必用 bgp_clist_hash_key 算出的值，或直接传 0 让它按名字重建键
+ * （见 community_list_get 的用法）。name 为 NULL 时直接返回 NULL。 */
 struct community_list *community_list_lookup(struct community_list_handler *ch,
 					     const char *name,
 					     uint32_t name_hash,
@@ -259,6 +326,9 @@ struct community_list *community_list_lookup(struct community_list_handler *ch,
 	return hash_lookup(cm->hash, &lookup);
 }
 
+/* 【函数】取或建：先在 master 中查找名为 name 的 list，不存在则新建一个。配置
+ * 路径用它实现“首次书写某 list 名时自动创建”。注意这里 lookup 传的 name_hash
+ * 为 0，表示让 hash 回调按名字重新计算键。 */
 static struct community_list *
 community_list_get(struct community_list_handler *ch, const char *name,
 		   int master)
@@ -271,6 +341,9 @@ community_list_get(struct community_list_handler *ch, const char *name,
 	return list;
 }
 
+/* 【函数】删除整个 list：先逐条 free 其所有规则条目，再从父链表（num 或 str）
+ * 上摘除，最后从 hash 释放并 free 结构体。list->parent 指出它挂在哪个链表上，
+ * 摘链时用 head / tail 维护边界。调用方必须先确保不再有引用。 */
 static void community_list_delete(struct community_list_master *cm,
 				  struct community_list *list)
 {
@@ -298,11 +371,15 @@ static void community_list_delete(struct community_list_master *cm,
 	community_list_free(list);
 }
 
+/* 【函数】判断 list 是否没有任何规则条目（head 与 tail 均为空）。用于决定是否
+ * 需要删除整个 list，以及配置时检查写法冲突。 */
 static bool community_list_empty_p(struct community_list *list)
 {
 	return list->head == NULL && list->tail == NULL;
 }
 
+/* 【函数】从 list 中删除单条规则：从链表摘除该 entry 并 free，若删完后 list
+ * 变空则连带删除整个 list（cm 供删除 list 时用）。 */
 /* Delete community-list entry from the list.  */
 static void community_list_entry_delete(struct community_list_master *cm,
 					struct community_list *list,
@@ -324,6 +401,9 @@ static void community_list_entry_delete(struct community_list_master *cm,
 		community_list_delete(cm, list);
 }
 
+/* 【函数】用新条目 entry 原地替换旧条目 replace（两者 seq 相同）：把 entry
+ * 接进 replace 在链表中的位置，再 free 掉 replace。注意参数命名——entry 是新的、
+ * replace 是被替换的，容易看反。 */
 /*
  * Replace community-list entry in the list. Note that entry is the new one
  * and replace is one one being replaced.
@@ -351,6 +431,11 @@ static void community_list_entry_replace(struct community_list *list,
 	community_entry_free(replace);
 }
 
+/* 【函数】把新规则 entry 加入 list，是维护“按 seq 升序”不变量的核心：
+ *   1) seq 为 AUTO 时先分配自动序号；
+ *   2) 若已存在同 seq 的条目，则走 entry_replace 原地替换；
+ *   3) 否则找到第一个 seq 不小于它的位置插入，维持升序。
+ * 代码里对“插到尾部 / 头部 / 中间”三种情况分别处理，注意链表 head / tail 的维护。 */
 /* Add community-list entry to the list.  */
 static void community_list_entry_add(struct community_list *list,
 				     struct community_entry *entry,
@@ -401,6 +486,10 @@ static void community_list_entry_add(struct community_list *list,
 	}
 }
 
+/* 【函数】在 list 中查找与给定值匹配且 direct 相同的规则条目，用于 unset 时定位
+ * 要删除的那一条。standard 写法按团体值精确比较（分别走 community_cmp /
+ * ecommunity_cmp / lcommunity_cmp），expanded 写法按 config 字符串比较。
+ * arg 的类型取决于 style：standard 时是团体结构体指针，expanded 时是配置串。 */
 /* Lookup community-list entry from the list.  */
 static struct community_entry *
 community_list_entry_lookup(struct community_list *list, const void *arg,
@@ -439,6 +528,11 @@ community_list_entry_lookup(struct community_list *list, const void *arg,
 	return NULL;
 }
 
+/* 【函数】把 standard community 的第 i 个值转成可读字符串（供 expanded 正则匹配
+ * 与回显使用）。已知的著名团体（no-export、blackhole 等，见 COMMUNITY_* 常量）返回
+ * 名字串，其余按 as:val 格式返回。注意它**总是新分配字符串**（MTYPE_COMMUNITY_STR），
+ * 调用方负责释放；未知团体那条分支里 snprintf 的缓冲区来自 XSTRDUP("65536:65535")，
+ * 长度足够容纳替换后的内容。 */
 static char *community_str_get(struct community *com, int i)
 {
 	uint32_t comval;
@@ -505,6 +599,9 @@ static char *community_str_get(struct community *com, int i)
 	return str;
 }
 
+/* 【函数】对单个 community（第 i 个值）做正则匹配：先取该值的字符串，再用
+ * regexec 匹配 reg。com 为空或 size 为 0 时按空串匹配。命中返回 true。
+ * 供 any_match 这类“逐个值判断”的语义使用。 */
 /* Internal function to perform regular expression match for
  * a single community. */
 static bool community_regexp_include(struct frregex *reg, struct community *com, int i)
@@ -527,6 +624,10 @@ static bool community_regexp_include(struct frregex *reg, struct community *com,
 	return rv == 0;
 }
 
+/* 【函数】对**整个** community 属性做正则匹配：把全部团体拼成一个字符串（用
+ * community_str），再整体 regexec。com 为空/长度为 0 时直接返回 false。
+ * 若配置了 community alias（bgp_ca_alias_hash 非空），会先把别名还原成真实团体串
+ * （bgp_alias2community_str）再匹配——这样正则里可以写别名。还原出的临时串需释放。 */
 /* Internal function to perform regular expression match for community
    attribute.  */
 static bool community_regexp_match(struct community *com, struct frregex *reg)
@@ -561,11 +662,16 @@ static bool community_regexp_match(struct community *com, struct frregex *reg)
 	return rv == 0;
 }
 
+/* 【函数】取扩展团体第 i 个值的字符串形式（DISPLAY 格式）。返回新分配串，调用
+ * 方负责释放。是对 ecommunity_ecom2str_one 的薄封装。 */
 static char *ecommunity_str_get(struct ecommunity *ecom, int i)
 {
 	return ecommunity_ecom2str_one(ecom, ECOMMUNITY_FORMAT_DISPLAY, i);
 }
 
+/* 【函数】取大团体第 i 个值的字符串形式，固定格式为 global:local1:local2
+ * （三段各 32 位）。直接按 LCOMMUNITY_SIZE 偏移定位、大端解析。返回新分配的
+ * 48 字节串（MTYPE_LCOMMUNITY_STR），调用方负责释放。 */
 static char *lcommunity_str_get(struct lcommunity *lcom, int i)
 {
 	struct lcommunity_val lcomval;
@@ -592,6 +698,8 @@ static char *lcommunity_str_get(struct lcommunity *lcom, int i)
 	return str;
 }
 
+/* 【函数】对单个大团体（第 i 个值）做正则匹配。lcom 为空/长度为 0 时按空串匹配。
+ * 命中返回 true。供大团体的 any_match 语义使用。 */
 /* Internal function to perform regular expression match for
  * a single community. */
 static bool lcommunity_regexp_include(struct frregex *reg, struct lcommunity *lcom, int i)
@@ -616,6 +724,8 @@ static bool lcommunity_regexp_include(struct frregex *reg, struct lcommunity *lc
 	return false;
 }
 
+/* 【函数】对单个扩展团体（第 i 个值）做正则匹配。ecom 为空/长度为 0 时按空串
+ * 匹配。命中返回 true。供扩展团体的 any_match 语义使用。 */
 /* Internal function to perform regular expression match for a single ecommunity. */
 static bool ecommunity_regexp_include(struct frregex *reg, struct ecommunity *ecom, int i)
 {
@@ -639,6 +749,9 @@ static bool ecommunity_regexp_include(struct frregex *reg, struct ecommunity *ec
 	return false;
 }
 
+/* 【函数】对**整个**大团体属性做正则匹配：先拼成整串（lcommunity_str），com
+ * 为空/长度为 0 时返回 false。与 community_regexp_match 一样支持 community alias
+ * 还原后再匹配。返回是否命中。 */
 static bool lcommunity_regexp_match(struct lcommunity *com, struct frregex *reg)
 {
 	const char *str;
@@ -672,6 +785,8 @@ static bool lcommunity_regexp_match(struct lcommunity *com, struct frregex *reg)
 }
 
 
+/* 【函数】对**整个**扩展团体属性做正则匹配：取 ecommunity_str 整串后 regexec。
+ * ecom 为空/长度为 0 时按空串匹配。返回是否命中。注意扩展团体不做 alias 还原。 */
 static bool ecommunity_regexp_match(struct ecommunity *ecom, struct frregex *reg)
 {
 	const char *str;
@@ -691,6 +806,10 @@ static bool ecommunity_regexp_match(struct ecommunity *ecom, struct frregex *reg
 	return false;
 }
 
+/* 【函数】常规匹配：按 seq 顺序遍历 list 的条目，standard 走 community_match
+ * （整体包含）、expanded 走 community_regexp_match；**第一条命中即定论**，返回值
+ * 等于该条目的 direct 是否为 permit。全部不中返回 false。注意返回 true 意味着
+ * “被这条 list 放行”，false 可能是没命中也可能是命中 deny，调用方需按语义使用。 */
 /* When given community attribute matches to the community-list return
    1 else return 0.  */
 bool community_list_match(struct community *com, struct community_list *list)
@@ -709,6 +828,9 @@ bool community_list_match(struct community *com, struct community_list *list)
 	return false;
 }
 
+/* 【函数】大团体的常规匹配，逻辑与 community_list_match 相同：standard 走
+ * lcommunity_match，expanded 走 lcommunity_regexp_match，第一条命中即定论，返回
+ * 该条目的 permit 结论。 */
 bool lcommunity_list_match(struct lcommunity *lcom, struct community_list *list)
 {
 	struct community_entry *entry;
@@ -725,6 +847,9 @@ bool lcommunity_list_match(struct lcommunity *lcom, struct community_list *list)
 	return false;
 }
 
+/* 【函数】扩展团体的 exact_match：standard 用 ecommunity_cmp 做**全等**比较
+ * （集合完全一致而非包含），expanded 仍走正则（与常规 match 相同——原注释已说明
+ * 这种写法下二者等价）。第一条命中即返回该条目的 permit 结论。 */
 /* Perform exact matching. In case of expanded extended-community-list, do
  * same thing as ecommunity_list_match().
  */
@@ -744,6 +869,8 @@ bool ecommunity_list_exact_match(struct ecommunity *ecom, struct community_list 
 	return false;
 }
 
+/* 【函数】大团体的 exact_match：standard 用 lcommunity_cmp 做全等比较，expanded
+ * 仍走正则（与常规 match 等价）。命中返回该条目的 permit 结论。 */
 /* Perform exact matching.  In case of expanded large-community-list, do
  * same thing as lcommunity_list_match().
  */
@@ -764,6 +891,8 @@ bool lcommunity_list_exact_match(struct lcommunity *lcom,
 	return false;
 }
 
+/* 【函数】扩展团体的常规匹配：standard 走 ecommunity_match，expanded 走
+ * ecommunity_regexp_match，第一条命中即定论，返回该条目的 permit 结论。 */
 bool ecommunity_list_match(struct ecommunity *ecom, struct community_list *list)
 {
 	struct community_entry *entry;
@@ -780,6 +909,8 @@ bool ecommunity_list_match(struct ecommunity *ecom, struct community_list *list)
 	return false;
 }
 
+/* 【函数】standard community 的 exact_match：standard 用 community_cmp 做全等
+ * 比较，expanded 仍走正则（与常规 match 等价）。命中返回该条目的 permit 结论。 */
 /* Perform exact matching.  In case of expanded community-list, do
    same thing as community_list_match().  */
 bool community_list_exact_match(struct community *com,
@@ -799,6 +930,10 @@ bool community_list_exact_match(struct community *com,
 	return false;
 }
 
+/* 【函数】any_match：**逐值**判断——只要 com 里任意一个团体值命中列表任意一条
+ * 规则就立即返回该规则的 permit 结论。与 community_list_match 的区别在于它是
+ * “值级”匹配（standard 用 community_include 判断某单值是否在规则集合中，expanded
+ * 用 community_regexp_include 对单值做正则），适合“有没有打某个标”的高效判断。 */
 bool community_list_any_match(struct community *com, struct community_list *list)
 {
 	struct community_entry *entry;
@@ -820,6 +955,10 @@ bool community_list_any_match(struct community *com, struct community_list *list
 	return false;
 }
 
+/* 【函数】变换而非查询：把 com 中所有**命中 list 里 permit 条目**的团体值删除，
+ * 返回同一个 com（原地修改）。用于 route-map 的 `set comm-list ... delete`。
+ * 实现要点：先记录要删的下标（com_index_to_delete），**倒序**删除以避免下标错位；
+ * 命中条目后 break（每条值只被第一条命中的规则决定去留）。命中 deny 条目的值不动。 */
 /* Delete all permitted communities in the list from com.  */
 struct community *community_list_match_delete(struct community *com,
 					      struct community_list *list)
@@ -866,6 +1005,10 @@ struct community *community_list_match_delete(struct community *com,
 	return com;
 }
 
+/* 【函数】查重：遍历 list 已有条目，判断新条目 new 是否与之重复。判定要求
+ * **style 与 direct 都相同**，再按 style 比较团体值（standard 三套 *_cmp，expanded
+ * 比 config 串）。重名条件成立返回 true，调用方据此丢弃新条目。避免同一 list 内
+ * 出现功能完全相同的两条规则。 */
 /* To avoid duplicated entry in the community-list, this function
    compares specified entry to existing entry.  */
 static bool community_list_dup_check(struct community_list *list,
@@ -906,6 +1049,10 @@ static bool community_list_dup_check(struct community_list *list,
 	return false;
 }
 
+/* 【函数】新增/覆盖一条 standard community-list 规则。流程：解析可选 seq（NULL
+ * 表示 AUTO）→ 取或建 list → **检查写法一致性**（非空 list 的首条 style 必须与新
+ * 条目相同，否则返回 CONFLICT 错误码）→ 按 style 解析团体值或编译正则 → 查重 →
+ * 加入并按需通知 route-map 依赖刷新。返回 0 成功，负数见 COMMUNITY_LIST_ERR_*。 */
 /* Set community-list.  */
 int community_list_set(struct community_list_handler *ch, const char *name,
 		       const char *str, const char *seq, int direct, int style)
@@ -966,6 +1113,10 @@ int community_list_set(struct community_list_handler *ch, const char *name,
 	return 0;
 }
 
+/* 【函数】删除 standard community-list 规则。str 为 NULL 时删除整个 list 的所有
+ * 条目（并连带删 list）；否则按 style 解析出待删值定位条目后删除。list 或条目不
+ * 存在时**静默返回**（无错误提示）。删除成功会通知 route-map 依赖刷新。
+ * 注意它返回 void，无法告知调用方是否真的删掉了东西。 */
 /* Unset community-list */
 void community_list_unset(struct community_list_handler *ch, const char *name,
 			  const char *str, const char *seq, int direct,
@@ -1005,6 +1156,9 @@ void community_list_unset(struct community_list_handler *ch, const char *name,
 	route_map_notify_dependencies(name, RMAP_EVENT_CLIST_DELETED);
 }
 
+/* 【函数】大团体的 any_match：逐值判断，任意一个大团体值命中任意一条规则即返回
+ * 该规则的 permit 结论。standard 用 lcommunity_include（按 12 字节值比较），
+ * expanded 用 lcommunity_regexp_include。 */
 bool lcommunity_list_any_match(struct lcommunity *lcom,
 			       struct community_list *list)
 {
@@ -1027,6 +1181,9 @@ bool lcommunity_list_any_match(struct lcommunity *lcom,
 	return false;
 }
 
+/* 【函数】扩展团体的 any_match：逐值判断，standard 用 ecommunity_include_one，
+ * expanded 用 ecommunity_regexp_include。任意一值命中即返回该规则的 permit 结论。
+ * 注意这里按 ecom->unit_size 步进（扩展团体的单元长度可变）。 */
 bool ecommunity_list_any_match(struct ecommunity *ecom, struct community_list *list)
 {
 	struct community_entry *entry;
@@ -1048,6 +1205,9 @@ bool ecommunity_list_any_match(struct ecommunity *ecom, struct community_list *l
 	return false;
 }
 
+/* 【函数】把 lcom 中所有命中 list 里 permit 条目的大团体值删除，返回同一个 lcom
+ * （原地修改）。实现同 community 版本：记录待删下标后**倒序**删除避免错位；命中
+ * 即 break，deny 条目不删。 */
 /* Delete all permitted large communities in the list from com.  */
 struct lcommunity *lcommunity_list_match_delete(struct lcommunity *lcom,
 						struct community_list *list)
@@ -1096,6 +1256,11 @@ struct lcommunity *lcommunity_list_match_delete(struct lcommunity *lcom,
 	return lcom;
 }
 
+/* 【函数】把 ecom 中所有命中 list 里 permit 条目的扩展团体值删除，返回同一个 ecom
+ * （原地修改）。这里用了一个临时的单值 ecommunity（local_ecom）来复用 standard 与
+ * expanded 的判断接口：standard 走 ecommunity_include，expanded 走
+ * ecommunity_regexp_match。记录下标后倒序删除；循环内用 ecommunity_strfree 释放
+ * 临时串。 */
 /* Delete all permitted extended communities in the list from ecom.*/
 struct ecommunity *ecommunity_list_match_delete(struct ecommunity *ecom,
 						struct community_list *list)
@@ -1137,6 +1302,10 @@ struct ecommunity *ecommunity_list_match_delete(struct ecommunity *ecom,
 	return ecom;
 }
 
+/* 【函数】校验一个（可能含多个、空格分隔的）大团体字符串在指定 style 下是否
+ * 合法，供 CLI 在写入前拦截坏输入。standard 要求每个值恰好 3 段、每段非负十进制
+ * 且不超过 UINT_MAX；expanded 要求能成功编译为正则。任一不合格即返回 false。
+ * 用 invalid 计数累加，最后 invalid 大于 0 视为非法。注意它只校验不写入。 */
 /* Helper to check if every octet do not exceed UINT_MAX */
 bool lcommunity_list_valid(const char *community, int style)
 {
@@ -1193,6 +1362,10 @@ bool lcommunity_list_valid(const char *community, int style)
 	return (invalid > 0) ? false : true;
 }
 
+/* 【函数】新增/覆盖一条 large-community-list 规则，流程与 community_list_set 相同
+ * （seq 解析 → 取或建 list → 写法一致性检查 → 解析/编译 → 查重 → 加入并通知）。
+ * 区别仅在于操作 LARGE_COMMUNITY_LIST_MASTER，且 str 为 NULL 时跳过解析（允许只
+ * 建空 list）。返回 0 成功，负数错误码见 COMMUNITY_LIST_ERR_*。 */
 /* Set lcommunity-list.  */
 int lcommunity_list_set(struct community_list_handler *ch, const char *name,
 			const char *str, const char *seq, int direct, int style)
@@ -1255,6 +1428,10 @@ int lcommunity_list_set(struct community_list_handler *ch, const char *name,
 	return 0;
 }
 
+/* 【函数】删除 large-community-list 规则。str 为 NULL 时删除整个 list，否则按
+ * style 解析出大团体值或正则，定位条目后删除；list 或条目不存在时静默返回。
+ * 与 community_list_unset 对应，区别是解析用 lcommunity_str2com / bgp_regcomp，
+ * 且删除成功后通知 RMAP_EVENT_LLIST_DELETED。返回 void，无失败提示。 */
 /* Unset community-list.  When str is NULL, delete all of
    community-list entry belongs to the specified name.  */
 void lcommunity_list_unset(struct community_list_handler *ch, const char *name,
@@ -1305,6 +1482,10 @@ void lcommunity_list_unset(struct community_list_handler *ch, const char *name,
 	route_map_notify_dependencies(name, RMAP_EVENT_LLIST_DELETED);
 }
 
+/* 【函数】新增/覆盖一条 extcommunity-list 规则。流程与另两套 set 相同，要点：
+ * str 为 NULL 直接返回 MALFORMED_VAL；standard 用 ecommunity_str2com 解析并额外
+ * 生成 DISPLAY 与 COMMUNITY_LIST 两种字符串（ecom->str 与 entry->config）；
+ * 操作 EXTCOMMUNITY_LIST_MASTER，通知 RMAP_EVENT_ECLIST_ADDED。返回 0 或负错误码。 */
 /* Set extcommunity-list.  */
 int extcommunity_list_set(struct community_list_handler *ch, const char *name,
 			  const char *str, const char *seq, int direct,
@@ -1377,6 +1558,9 @@ int extcommunity_list_set(struct community_list_handler *ch, const char *name,
 	return 0;
 }
 
+/* 【函数】删除 extcommunity-list 规则。str 为 NULL 时删除整个 list，否则解析定位
+ * 后删除；不存在则静默返回。操作 EXTCOMMUNITY_LIST_MASTER，成功后通知
+ * RMAP_EVENT_ECLIST_DELETED。返回 void，无失败提示。 */
 /* Unset extcommunity-list.
  *
  * When str is NULL, delete all extcommunity-list entries belonging to the
@@ -1420,6 +1604,9 @@ void extcommunity_list_unset(struct community_list_handler *ch,
 	route_map_notify_dependencies(name, RMAP_EVENT_ECLIST_DELETED);
 }
 
+/* 【函数】初始化三类团体的总句柄：分配 handler，并为 community / extcommunity /
+ * lcommunity 三个 master 各建一张哈希表（初始桶数 4，名字哈希回调共用同一对）。
+ * 返回句柄，调用方需保存（通常赋给全局 bgp_clist）。链表 num/str 初始为空。 */
 /* Initialize community-list.  Return community-list handler.  */
 struct community_list_handler *community_list_init(void)
 {
@@ -1445,6 +1632,9 @@ struct community_list_handler *community_list_init(void)
 	return ch;
 }
 
+/* 【函数】释放整个句柄：对三类 master 分别清空 num / str 两条链表（逐 list 调
+ * community_list_delete），再释放其 hash，最后释放 handler 本身。注意先删链表
+ * 再 free hash 的顺序——delete 内部还要访问 hash。 */
 /* Terminate community-list.  */
 void community_list_terminate(struct community_list_handler *ch)
 {
@@ -1475,6 +1665,8 @@ void community_list_terminate(struct community_list_handler *ch)
 	XFREE(MTYPE_COMMUNITY_LIST_HANDLER, ch);
 }
 
+/* 【函数】hash 遍历回调：把每个 bucket 里的 list 名字复制一份塞进 vector
+ * （CLI 补全候选集）。data 指向 vector 指针。返回值恒为 1 表示继续遍历。 */
 static int bgp_community_list_vector_walker(struct hash_bucket *bucket,
 					    void *data)
 {
@@ -1486,6 +1678,8 @@ static int bgp_community_list_vector_walker(struct hash_bucket *bucket,
 	return 1;
 }
 
+/* 【函数】CLI 补全：把已配置的全部 standard community-list 名字收集为补全候选
+ * （用于 COMMUNITY_LIST_NAME 令牌的 Tab 提示）。 */
 static void bgp_community_list_cmd_completion(vector comps,
 					      struct cmd_token *token)
 {
@@ -1496,6 +1690,8 @@ static void bgp_community_list_cmd_completion(vector comps,
 	hash_walk(cm->hash, bgp_community_list_vector_walker, &comps);
 }
 
+/* 【函数】CLI 补全：收集已配置的 large-community-list 名字（LCOMMUNITY_LIST_NAME
+ * 令牌的 Tab 提示）。 */
 static void bgp_lcommunity_list_cmd_completion(vector comps,
 					       struct cmd_token *token)
 {
@@ -1507,6 +1703,8 @@ static void bgp_lcommunity_list_cmd_completion(vector comps,
 	hash_walk(cm->hash, bgp_community_list_vector_walker, &comps);
 }
 
+/* 【函数】CLI 补全：收集已配置的 extcommunity-list 名字
+ * （EXTCOMMUNITY_LIST_NAME 令牌的 Tab 提示）。 */
 static void bgp_extcommunity_list_cmd_completion(vector comps,
 						 struct cmd_token *token)
 {
@@ -1517,6 +1715,8 @@ static void bgp_extcommunity_list_cmd_completion(vector comps,
 	hash_walk(cm->hash, bgp_community_list_vector_walker, &comps);
 }
 
+/* 【数据】三套 CLI 补全处理器注册表：把令牌名（COMMUNITY_LIST_NAME 等）绑定到
+ * 对应的补全回调。每个数组以一条 {.completions = NULL} 作为结束哨兵。 */
 static const struct cmd_variable_handler community_list_handlers[] = {
 	{.tokenname = "COMMUNITY_LIST_NAME",
 	 .completions = bgp_community_list_cmd_completion},
@@ -1532,6 +1732,8 @@ static const struct cmd_variable_handler extcommunity_list_handlers[] = {
 	 .completions = bgp_extcommunity_list_cmd_completion},
 	{.completions = NULL}};
 
+/* 【函数】向 CLI 框架注册上面三张补全表，让 community / large-community /
+ * extcommunity 三种列表名在命令里支持 Tab 补全。进程启动时调用一次即可。 */
 void bgp_community_list_command_completion_setup(void)
 {
 	cmd_variable_handler_register(community_list_handlers);

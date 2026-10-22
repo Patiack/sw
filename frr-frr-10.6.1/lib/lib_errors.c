@@ -5,6 +5,30 @@
  *                     Donald Sharp
  */
 
+/*
+ * 文件导读: lib_errors.c
+ * ----------------------------------------------------------------------------
+ * 本文件是 lib 子系统的错误码文本表, 属于 FRR 统一错误码体系(ferr)的注册数据.
+ * 说明: 文件中两张表由脚本根据错误码枚举自动生成, 一般不要手工编辑; 如需调整
+ *   错误码文本应修改生成器并重新生成.
+ * 作用: 为 lib_errors.h 中每个 EC_LIB_* 错误码提供展示给用户的标题, 描述与建议.
+ *
+ * 核心数据结构:
+ *   - static struct log_ref ferr_lib_warn[]: 警告级错误表.
+ *   - static struct log_ref ferr_lib_err[]:  错误级错误表.
+ *   每个元素是 struct log_ref 的字面量初始化, 含 .code(错误码), .title(短标题),
+ *   .description(描述), .suggestion(处置建议); 每张表以 .code = END_FERR 的哨兵
+ *   项结束.
+ *
+ * 与其他模块关系: 使用 ferr.h 的 struct log_ref 与 END_FERR; 由 lib_error_init
+ *   调用 log_ref_add 注册进全局错误哈希表, 之后可用 show error 命令查询.
+ *
+ * 阅读顺序: 先看两张表的结构与哨兵, 再看文件末尾 lib_error_init 的注册逻辑.
+ *
+ * 易踩的坑: 每张表必须以 END_FERR 结尾, 否则 log_ref_add 会越界扫描; 两张表被
+ *   clang-format off 与 on 包裹, 以保持自动生成的排版不被格式化工具改动.
+ */
+
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
@@ -12,6 +36,13 @@
 #include "lib_errors.h"
 
 /* clang-format off */
+/*
+ * lib 子系统警告级错误表.
+ * 每项给出错误码与面向用户的标题, 描述, 建议; 最后以 END_FERR 哨兵结束.
+ * 覆盖 SNMP 警告, stream 校验, Linux 命名空间解析, 事件子系统的慢 CPU / 慢墙钟
+ * 线程与线程饥饿, 定时器过久, 路由映射递归上限, 备份配置, VRF 名称长度, 以及
+ * 大量 YANG 与北向(northbound)相关的警告.
+ */
 static struct log_ref ferr_lib_warn[] = {
 	{
 		.code = EC_LIB_SNMP,
@@ -174,6 +205,13 @@ static struct log_ref ferr_lib_warn[] = {
 	},
 };
 
+/*
+ * lib 子系统错误级错误表.
+ * 每项给出错误码与标题, 描述, 建议; 最后以 END_FERR 哨兵结束.
+ * 覆盖权限升降, VRF 启动, socket 与 ZAPI 错误, 系统调用, VTY, 接口与命名空间,
+ * ZMQ, YANG 模块加载与数据转换, 北向回调与候选配置, libyang / sysrepo / gRPC
+ * 初始化, DNS 解析等错误.
+ */
 static struct log_ref ferr_lib_err[] = {
 	{
 		.code = EC_LIB_PRIVILEGES,
@@ -355,6 +393,11 @@ static struct log_ref ferr_lib_err[] = {
 };
 /* clang-format on */
 
+/*
+ * 注册 lib 子系统的两张错误表到全局错误哈希表.
+ * 实现: 依次调用 log_ref_add, 把 ferr_lib_warn 与 ferr_lib_err 中的每一项(直到
+ *   END_FERR 哨兵)加入 refs 哈希表, 供 log_ref_get 与 show error 查询.
+ */
 void lib_error_init(void)
 {
 	log_ref_add(ferr_lib_warn);

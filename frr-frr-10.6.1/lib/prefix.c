@@ -4,6 +4,33 @@
  * Copyright (C) 1997, 98, 99 Kunihiro Ishiguro
  */
 
+/*
+ * 文件导读：prefix.c —— IP 前缀运算底座
+ *
+ * 本文件实现 struct prefix（见 prefix.h）的全部运算原语，是 FRR 各协议模块
+ * 处理“网络前缀 / 地址”时共同的底层依赖。它与 plist.c 的分工是：
+ *   prefix.c ：前缀本身怎么算——掩码长度、包含关系、相等比较、字符串互转、
+ *              掩码应用、跨地址族（IPv4 / IPv6 / EVPN / flowspec）的统一处理。
+ *   plist.c  ：在此地基之上实现 prefix-list 的按条目匹配引擎。
+ *
+ * 主要函数族（按出现顺序）：
+ *   - 地址族转换与显示：str2family / family2str / afi2family / family2afi /
+ *     afi2str / safi2str 等，负责 AFI 与 family、字符串之间的映射。
+ *   - 包含与相等：prefix_match（n 是否包含 p）、prefix_same、prefix_cmp、
+ *     prefix_common_bits、evpn_type5_prefix_match。
+ *   - 掩码与规整：apply_mask / apply_mask_ipv4 / apply_mask_ipv6、ip_masklen /
+ *     masklen2ip、ip6_masklen / masklen2ip6 等。
+ *   - 字符串互转：str2prefix / prefix2str / str2prefix_ipv4 / str2prefix_ipv6、
+ *     MAC 与 ESI 的互转。
+ *   - 内存与哈希：prefix_new / prefix_free、prefix_hash_key。
+ *
+ * 贯穿全文件的关键点：
+ *   1) prefixlen 一律是“位数”；换算字节用 PSIZE，取某一位用 prefix_bit。
+ *   2) maskbit 数组把“取前 k 位掩码”的头部字节做成了查表，避免逐位运算。
+ *   3) 因为所有 prefix_* 结构都以 family 开头，函数常用 union prefixconstptr
+ *      接收，再按 family 强转成具体类型处理。
+ */
+
 #include <zebra.h>
 
 #include "command.h"
@@ -21,6 +48,10 @@
 DEFINE_MTYPE_STATIC(LIB, PREFIX, "Prefix");
 DEFINE_MTYPE_STATIC(LIB, PREFIX_FLOWSPEC, "Prefix Flowspec");
 
+/*
+ * maskbit 查表：maskbit[k] 给出“保留高 k 位、其余清零”时头部字节的掩码值。
+ * 例如 k=0 得 0x00，k=8 得 0xff，k=1 得 0x80。按位比较时直接查表避免逐位循环。
+ */
 /* Maskbit. */
 static const uint8_t maskbit[] = {0x00, 0x80, 0xc0, 0xe0, 0xf0,
 				  0xf8, 0xfc, 0xfe, 0xff};
@@ -30,8 +61,15 @@ static const uint8_t maskbit[] = {0x00, 0x80, 0xc0, 0xe0, 0xf0,
 #define PNBBY 8
 #endif /* PNBBY */
 
+/*
+ * PNBBY：每个“前缀单元”的位数，此处按字节处理，取 8。
+ * MASKBIT(offset)：由偏移量（1..8）算出掩码字节，等价于 maskbit[offset]。
+ */
 #define MASKBIT(offset)  ((0xff << (PNBBY - (offset))) & 0xff)
 
+/*
+ * 判断 MAC 是否为全 0。返回非 0 表示全 0。
+ */
 int is_zero_mac(const struct ethaddr *mac)
 {
 	int i = 0;
@@ -44,6 +82,9 @@ int is_zero_mac(const struct ethaddr *mac)
 	return 1;
 }
 
+/*
+ * 判断 MAC 是否为广播地址（6 字节全 0xFF）。
+ */
 bool is_bcast_mac(const struct ethaddr *mac)
 {
 	int i = 0;
@@ -55,6 +96,9 @@ bool is_bcast_mac(const struct ethaddr *mac)
 	return true;
 }
 
+/*
+ * 判断 MAC 是否为组播：以太网首字节的最低位（I/G 位）为 1。
+ */
 bool is_mcast_mac(const struct ethaddr *mac)
 {
 	if ((mac->octet[0] & 0x01) == 0x01)
@@ -63,6 +107,10 @@ bool is_mcast_mac(const struct ethaddr *mac)
 	return false;
 }
 
+/*
+ * 取字节缓冲 prefix 中第 bit_index 位的值（0 或 1）。
+ * offset 定位到字节，shift 定位到该字节从高位起的那一位。
+ */
 unsigned int prefix_bit(const uint8_t *prefix, const uint16_t bit_index)
 {
 	unsigned int offset = bit_index / 8;
@@ -71,6 +119,10 @@ unsigned int prefix_bit(const uint8_t *prefix, const uint16_t bit_index)
 	return (prefix[offset] >> shift) & 1;
 }
 
+/*
+ * 把字符串地址族名（ipv4 / ipv6 / ethernet / evpn）转成内部 family 编号；
+ * 无法识别时返回 -1。
+ */
 int str2family(const char *string)
 {
 	if (!strcmp("ipv4", string))
@@ -84,6 +136,10 @@ int str2family(const char *string)
 	return -1;
 }
 
+/*
+ * 把内部 family 编号转成显示用字符串（IPv4 / IPv6 / Ethernet / Evpn），
+ * 未知族返回 "?"。
+ */
 const char *family2str(int family)
 {
 	switch (family) {
@@ -100,6 +156,10 @@ const char *family2str(int family)
 }
 
 /* Address Family Identifier to Address Family converter. */
+/*
+ * AFI 到 family 的映射：AFI_IP 到 AF_INET，AFI_IP6 到 AF_INET6，
+ * AFI_L2VPN 到 AF_ETHERNET；其余返回 0（注意 EVPN 代码不应走此接口）。
+ */
 int afi2family(afi_t afi)
 {
 	if (afi == AFI_IP)
@@ -112,6 +172,10 @@ int afi2family(afi_t afi)
 	return 0;
 }
 
+/*
+ * family 到 AFI 的逆映射：AF_INET 到 AFI_IP，AF_INET6 到 AFI_IP6，
+ * AF_ETHERNET / AF_EVPN 都归为 AFI_L2VPN；其余返回 0。
+ */
 afi_t family2afi(int family)
 {
 	if (family == AF_INET)
@@ -123,6 +187,10 @@ afi_t family2afi(int family)
 	return 0;
 }
 
+/*
+ * 把 AFI 转成小写显示名（ipv4 / ipv6 / l2vpn）。
+ * 对 AFI_MAX / AFI_UNSPEC 返回 "bad-value"，其余非法值触发 assert。
+ */
 const char *afi2str_lower(afi_t afi)
 {
 	switch (afi) {
@@ -141,6 +209,9 @@ const char *afi2str_lower(afi_t afi)
 	return "DEV ESCAPE";
 }
 
+/*
+ * 把 AFI 转成显示名（IPv4 / IPv6 / l2vpn）；AFI_MAX / AFI_UNSPEC 返回 "bad-value"。
+ */
 const char *afi2str(afi_t afi)
 {
 	switch (afi) {
@@ -159,6 +230,10 @@ const char *afi2str(afi_t afi)
 	return "DEV ESCAPE";
 }
 
+/*
+ * 把 SAFI 转成显示名（unicast / multicast / vpn / encap / evpn /
+ * labeled-unicast / flowspec）；未知值返回 "unknown"。
+ */
 const char *safi2str(safi_t safi)
 {
 	switch (safi) {
@@ -186,6 +261,12 @@ const char *safi2str(safi_t safi)
 }
 
 /* If n includes p prefix then return 1 else return 0. */
+/*
+ * 判断前缀 n 是否包含前缀 p（即 p 落在 n 所表示的网络内），包含返回 1。
+ * 规则：n 的掩码长度必须不大于 p 的掩码长度，且两者在 n 前缀长度内逐位相同。
+ * 特例：flowspec 前缀不使用 prefixlen，而比较 u.prefix_flowspec 内的有效字节。
+ * 这是最常用的“路由是否属于某网段”判定，是大量协议模块的基础调用。
+ */
 int prefix_match(union prefixconstptr unet, union prefixconstptr upfx)
 {
 	const struct prefix *n = unet.p;
@@ -243,6 +324,10 @@ int prefix_match(union prefixconstptr unet, union prefixconstptr upfx)
  * ip-prefix within n which matches prefix p
  * If n includes p prefix then return 1 else return 0.
  */
+/*
+ * 判断 EVPN type-5（IP-Prefix）前缀 n 内嵌的 IP 前缀是否包含前缀 p，包含返回 1。
+ * 依据 n 内嵌地址的族（v4 / v6）选用不同长度做按位比较。
+ */
 int evpn_type5_prefix_match(const struct prefix *n, const struct prefix *p)
 {
 	int offset;
@@ -285,6 +370,10 @@ int evpn_type5_prefix_match(const struct prefix *n, const struct prefix *p)
 }
 
 /* If n includes p then return 1 else return 0. Prefix mask is not considered */
+/*
+ * 与 prefix_match 类似，判断 n 是否包含 p，但不考虑前缀掩码（长度）约束，
+ * 只比较 n 前缀长度范围内的位。用于网络语句式的匹配场景。
+ */
 int prefix_match_network_statement(union prefixconstptr unet,
 				   union prefixconstptr upfx)
 {
@@ -311,10 +400,20 @@ int prefix_match_network_statement(union prefixconstptr unet,
 	return 1;
 }
 
+/*
+ * 静态分析时撤销 prefix.h 里 prefix_copy 的宏包装，避免递归展开，
+ * 保证下面这份真实实现能被分析到。
+ */
 #ifdef __clang_analyzer__
 #undef prefix_copy	/* cf. prefix.h */
 #endif
 
+/*
+ * 把源前缀 src 完整复制到目标 dest（含 family、prefixlen 与地址负载）。
+ * 按 family 分派：v4 / v6 直接赋值，以太网与 EVPN 用 memcpy，AF_UNSPEC 复制
+ * lp 的两个字段；flowspec 会为新 dest 单独分配一份负载内存并拷贝（记得释放）。
+ * 未识别的族会记录错误并 assert。
+ */
 void prefix_copy(union prefixptr udest, union prefixconstptr usrc)
 {
 	struct prefix *dest = udest.p;
@@ -358,6 +457,10 @@ void prefix_copy(union prefixptr udest, union prefixconstptr usrc)
 	}
 }
 
+/*
+ * 比较两个 EVPN 地址是否完全相同：先比 route_type，再按类型逐字段比较
+ * （ESI、以太网标签、MAC、IP、掩码长度等）。类型一致但未列出的情况返回 true。
+ */
 bool evpn_addr_same(const struct evpn_addr *e1, const struct evpn_addr *e2)
 {
 	if (e1->route_type != e2->route_type)
@@ -400,6 +503,12 @@ bool evpn_addr_same(const struct evpn_addr *e1, const struct evpn_addr *e2)
  * but also the host part.  Thus, 10.0.0.1/8 and 10.0.0.2/8 are not
  * the same.  Note that this routine has the same return value sense
  * as '==' (which is different from prefix_cmp).
+ */
+/*
+ * 判断两前缀是否“完全相同”，相同返回 1（返回语义等同 ==，与 prefix_cmp 不同）。
+ * 这里的“相同”不仅要求前缀长度与网络位一致，主机位也须一致，
+ * 因此 10.0.0.1/8 与 10.0.0.2/8 并不相同。
+ * 允许指针为 NULL：一空一非空返回 0，两者都空返回 1。
  */
 int prefix_same(union prefixconstptr up1, union prefixconstptr up2)
 {
@@ -453,6 +562,13 @@ int prefix_same(union prefixconstptr up1, union prefixconstptr up2)
  * 10.0.0.2/8 are considered equivalent by this routine.  Note that
  * this routine has the same return sense as strcmp (which is different
  * from prefix_same).
+ */
+/*
+ * 按“全序 / 线性序”比较两前缀，返回 -1 / 0 / 1（语义同 strcmp，与 prefix_same 不同）。
+ * 只要前缀长度相等且网络位相同即视为等价，主机位被掩码忽略，
+ * 因此 10.0.0.1/8 与 10.0.0.2/8 在本题下等价。
+ * 先比 family，再比 prefixlen，最后逐字节比较网络位（不足一字节时用 maskbit 取高位）。
+ * 是多种有序容器（如前缀表）的排序 / 查找比较函数。
  */
 int prefix_cmp(union prefixconstptr up1, union prefixconstptr up2)
 {
@@ -519,6 +635,11 @@ int prefix_cmp(union prefixconstptr up1, union prefixconstptr up2)
  * address families don't match, return -1; otherwise the return value is
  * in range 0 ... maximum prefix length for the address family.
  */
+/*
+ * 计算两前缀从最高位起连续相同的比特数。忽略前缀长度，比较整个前缀地址。
+ * family 不同返回 -1；否则返回值在 0 到该族最大比特数之间。
+ * 常用于聚合 / 最长前缀相关判断。
+ */
 int prefix_common_bits(union prefixconstptr ua, union prefixconstptr ub)
 {
 	const struct prefix *p1 = ua.p;
@@ -558,6 +679,9 @@ int prefix_common_bits(union prefixconstptr ua, union prefixconstptr ub)
 }
 
 /* Return prefix family type string. */
+/*
+ * 返回前缀地址族的短字符串名（inet / inet6 / ether / evpn），未知返回 "unspec"。
+ */
 const char *prefix_family_str(union prefixconstptr pu)
 {
 	const struct prefix *p = pu.p;
@@ -574,6 +698,11 @@ const char *prefix_family_str(union prefixconstptr pu)
 }
 
 /* Allocate new prefix_ipv4 structure. */
+/*
+ * 分配一个 IPv4 前缀结构（family 置为 AF_INET）。
+ * 内部调用 prefix_new 分配完整的 struct prefix 大小，避免后续被强转成
+ * struct prefix 时引用到未分配的字节。
+ */
 struct prefix_ipv4 *prefix_ipv4_new(void)
 {
 	struct prefix_ipv4 *p;
@@ -588,12 +717,20 @@ struct prefix_ipv4 *prefix_ipv4_new(void)
 }
 
 /* Free prefix_ipv4 structure. */
+/*
+ * 释放 IPv4 前缀并把 *p 置 NULL（转调 prefix_free）。
+ */
 void prefix_ipv4_free(struct prefix_ipv4 **p)
 {
 	prefix_free((struct prefix **)p);
 }
 
 /* If given string is valid return 1 else return 0 */
+/*
+ * 解析 IPv4 前缀字符串到 struct prefix_ipv4。
+ * 含斜杠时按 "a.b.c.d/len" 解析长度（超 32 判非法）；不含斜杠时按主机地址处理，
+ * 前缀长度置为 32。成功返回 1，失败返回 0。注意临时串用 MTYPE_TMP 分配后已释放。
+ */
 int str2prefix_ipv4(const char *str, struct prefix_ipv4 *p)
 {
 	int ret;
@@ -639,6 +776,11 @@ int str2prefix_ipv4(const char *str, struct prefix_ipv4 *p)
 }
 
 /* When string format is invalid return 0. */
+/*
+ * 解析以太网前缀字符串到 struct prefix_eth。
+ * "any" 表示全 0 前缀且长度 0；"aa:bb:...:ff" 或带 "/len" 形式解析 MAC 与长度。
+ * 未带斜杠且 MAC 为全 0 时约定长度为 0（兼容旧配置）。成功返回 1。
+ */
 int str2prefix_eth(const char *str, struct prefix_eth *p)
 {
 	int ret = 0;
@@ -705,6 +847,10 @@ done:
 }
 
 /* Convert masklen into IP address's netmask (network byte order). */
+/*
+ * 把掩码长度转成 IPv4 点分掩码（网络字节序），结果写入 *netmask。
+ * 掩码长度须在 0 到 32 之间（由 assert 保证）；用 64 位左移规避移位越界 UB。
+ */
 void masklen2ip(const int masklen, struct in_addr *netmask)
 {
 	assert(masklen >= 0 && masklen <= IPV4_MAX_BITLEN);
@@ -722,6 +868,10 @@ void masklen2ip(const int masklen, struct in_addr *netmask)
 
 /* Convert IP address's netmask into integer. We assume netmask is
  * sequential one. Argument netmask should be network byte order. */
+/*
+ * 把 IPv4 点分掩码（网络字节序、假定为连续的 1）转成掩码长度。
+ * 用 __builtin_clz 数前导零；因 clz(0) 行为未定义，全 1 掩码单独返回 32。
+ */
 uint8_t ip_masklen(struct in_addr netmask)
 {
 	uint32_t tmp = ~ntohl(netmask.s_addr);
@@ -734,6 +884,9 @@ uint8_t ip_masklen(struct in_addr netmask)
 }
 
 /* Apply mask to IPv4 prefix (network byte order). */
+/*
+ * 把 IPv4 前缀的主机位清零（用掩码与地址做按位与），得到规范前缀。
+ */
 void apply_mask_ipv4(struct prefix_ipv4 *p)
 {
 	struct in_addr mask;
@@ -742,12 +895,18 @@ void apply_mask_ipv4(struct prefix_ipv4 *p)
 }
 
 /* If prefix is 0.0.0.0/0 then return 1 else return 0. */
+/*
+ * 判断是否为 0.0.0.0/0（默认路由），是则返回 1。
+ */
 int prefix_ipv4_any(const struct prefix_ipv4 *p)
 {
 	return (p->prefix.s_addr == INADDR_ANY && p->prefixlen == 0);
 }
 
 /* Allocate a new ip version 6 route */
+/*
+ * 分配一个 IPv6 前缀结构（family 置为 AF_INET6）。同样按完整 struct prefix 分配。
+ */
 struct prefix_ipv6 *prefix_ipv6_new(void)
 {
 	struct prefix_ipv6 *p;
@@ -760,12 +919,20 @@ struct prefix_ipv6 *prefix_ipv6_new(void)
 }
 
 /* Free prefix for IPv6. */
+/*
+ * 释放 IPv6 前缀并把 *p 置 NULL。
+ */
 void prefix_ipv6_free(struct prefix_ipv6 **p)
 {
 	prefix_free((struct prefix **)p);
 }
 
 /* If given string is valid return 1 else return 0 */
+/*
+ * 解析 IPv6 前缀字符串到 struct prefix_ipv6。
+ * 无斜杠按主机地址处理（长度 128），有斜杠解析长度（超 128 判非法）。
+ * 成功返回 1，失败返回 0。
+ */
 int str2prefix_ipv6(const char *str, struct prefix_ipv6 *p)
 {
 	char *pnt;
@@ -802,6 +969,12 @@ int str2prefix_ipv6(const char *str, struct prefix_ipv6 *p)
 
 /* Convert struct in6_addr netmask into integer.
  * FIXME return uint8_t as ip_maskleni() does. */
+/*
+ * 把 IPv6 掩码（in6_addr）转成掩码长度。
+ * 逐 32 位字检查是否为全 1，定位到第一个非全 1 的字后用 clz 算出该字内的位数，
+ * 再加上前面 32 的整数倍；全 1 掩码返回 128（因为 clz(0) 行为未定义）。
+ * 注意返回值类型为 int（英文注释提到本应统一为 uint8_t）。
+ */
 int ip6_masklen(struct in6_addr netmask)
 {
 	if (netmask.s6_addr32[0] != 0xffffffffU)
@@ -816,6 +989,10 @@ int ip6_masklen(struct in6_addr netmask)
 	return 128;
 }
 
+/*
+ * 把掩码长度转成 IPv6 掩码（in6_addr）。按长度落在哪个 32 位字分段处理，
+ * 该字左移出掩码位，其余字置全 1 或 0。长度应在 0 到 128（assert 保证）。
+ */
 void masklen2ip6(const int masklen, struct in6_addr *netmask)
 {
 	assert(masklen >= 0 && masklen <= IPV6_MAX_BITLEN);
@@ -846,6 +1023,10 @@ void masklen2ip6(const int masklen, struct in6_addr *netmask)
 	}
 }
 
+/*
+ * 把 IPv6 前缀的主机位清零：定位到前缀长度所在的字节，
+ * 用 maskbit 保留其高位，之后所有字节置 0。
+ */
 void apply_mask_ipv6(struct prefix_ipv6 *p)
 {
 	uint8_t *pnt;
@@ -866,6 +1047,10 @@ void apply_mask_ipv6(struct prefix_ipv6 *p)
 	}
 }
 
+/*
+ * 通用把前缀主机位清零：按 family 分派到 apply_mask_ipv4 / apply_mask_ipv6，
+ * 其余族不做处理。
+ */
 void apply_mask(union prefixptr pu)
 {
 	struct prefix *p = pu.p;
@@ -884,6 +1069,11 @@ void apply_mask(union prefixptr pu)
 }
 
 /* Utility function of convert between struct prefix <=> union sockunion. */
+/*
+ * 把套接字地址 su 转成对应族的“主机前缀”（长度 32 或 128）。
+ * 若传入 prefix 非空则复用该缓冲区，否则新建一个；返回该前缀指针。
+ * 遇到既非 IPv4 也非 IPv6 的地址族返回 NULL。
+ */
 struct prefix *sockunion2hostprefix(const union sockunion *su,
 				    struct prefix *prefix)
 {
@@ -909,6 +1099,9 @@ struct prefix *sockunion2hostprefix(const union sockunion *su,
 	return NULL;
 }
 
+/*
+ * 把前缀 p 写进套接字地址 su：先清零，再按 family 填 sa_family 与地址字段。
+ */
 void prefix2sockunion(const struct prefix *p, union sockunion *su)
 {
 	memset(su, 0, sizeof(*su));
@@ -921,6 +1114,9 @@ void prefix2sockunion(const struct prefix *p, union sockunion *su)
 		       sizeof(struct in6_addr));
 }
 
+/*
+ * 返回前缀地址族的字节长度：IPv4 为 4、IPv6 为 16、以太网为 6；未知返回 0。
+ */
 int prefix_blen(union prefixconstptr pu)
 {
 	const struct prefix *p = pu.p;
@@ -937,6 +1133,10 @@ int prefix_blen(union prefixconstptr pu)
 }
 
 /* Generic function for conversion string to struct prefix. */
+/*
+ * 通用字符串转前缀：依次尝试按 IPv4、IPv6、以太网解析，哪个成功用哪个，
+ * 全部失败返回 0。注意会依次覆写同一个 *p。
+ */
 int str2prefix(const char *str, struct prefix *p)
 {
 	int ret;
@@ -962,6 +1162,10 @@ int str2prefix(const char *str, struct prefix *p)
 	return 0;
 }
 
+/*
+ * 把 EVPN A-D 路由前缀格式化为字符串：
+ * 形如 [type]:[eth_tag]:[esi]:[bitlen]:[ip]:[frag_id]。返回 str。
+ */
 static const char *prefixevpn_ead2str(const struct prefix_evpn *p, char *str,
 				      int size)
 {
@@ -981,6 +1185,10 @@ static const char *prefixevpn_ead2str(const struct prefix_evpn *p, char *str,
 	return str;
 }
 
+/*
+ * 把 EVPN MAC/IP 路由前缀格式化为字符串；
+ * 无 IP 时只输出 [type]:[eth_tag]:[bitlen]:[mac]，有 IP 时再追加掩码长度与地址。
+ */
 static const char *prefixevpn_macip2str(const struct prefix_evpn *p, char *str,
 					int size)
 {
@@ -1007,6 +1215,9 @@ static const char *prefixevpn_macip2str(const struct prefix_evpn *p, char *str,
 	return str;
 }
 
+/*
+ * 把 EVPN IMET 路由前缀格式化为字符串。
+ */
 static const char *prefixevpn_imet2str(const struct prefix_evpn *p, char *str,
 				       int size)
 {
@@ -1023,6 +1234,9 @@ static const char *prefixevpn_imet2str(const struct prefix_evpn *p, char *str,
 	return str;
 }
 
+/*
+ * 把 EVPN ES 路由前缀格式化为字符串。
+ */
 static const char *prefixevpn_es2str(const struct prefix_evpn *p, char *str,
 				     int size)
 {
@@ -1040,6 +1254,9 @@ static const char *prefixevpn_es2str(const struct prefix_evpn *p, char *str,
 	return str;
 }
 
+/*
+ * 把 EVPN IP-Prefix（type-5）路由前缀格式化为字符串。
+ */
 static const char *prefixevpn_prefix2str(const struct prefix_evpn *p, char *str,
 					 int size)
 {
@@ -1055,6 +1272,9 @@ static const char *prefixevpn_prefix2str(const struct prefix_evpn *p, char *str,
 	return str;
 }
 
+/*
+ * EVPN 前缀格式化总入口：按 route_type 分派到对应格式函数，未知类型输出提示串。
+ */
 static const char *prefixevpn2str(const struct prefix_evpn *p, char *str,
 				  int size)
 {
@@ -1077,6 +1297,11 @@ static const char *prefixevpn2str(const struct prefix_evpn *p, char *str,
 }
 
 /* Helper function to format the prefix length in the format /xx */
+/*
+ * 把前缀长度以 "/xx" 形式追加写入 buf（从偏移 l 处），返回新的写入位置。
+ * 为容纳最长 "/128"（含结尾）预留足够空间，空间不足时原样返回 l 不做写入。
+ * 手写十进制以避免依赖 printf，属性能敏感的小工具。
+ */
 static size_t format_prefixlen(char *buf, size_t l, int prefixlen, size_t buf_size)
 {
 	int byte, tmp, a, b;
@@ -1113,6 +1338,12 @@ static size_t format_prefixlen(char *buf, size_t l, int prefixlen, size_t buf_si
 	return l;
 }
 
+/*
+ * 把任意前缀格式化到字符串 str（容量 size），返回 str。
+ * 按 family 分派：IPv4 / IPv6 用 inet_ntop 后追加 /len；IPv4-mapped 的 IPv6
+ * 特判为 "::ffff:a.b.c.d/len"；以太网输出 "mac/len"；EVPN 转调 prefixevpn2str；
+ * flowspec / 未知族输出占位字符串。
+ */
 const char *prefix2str(union prefixconstptr pu, char *str, int size)
 {
 	const struct prefix *p = pu.p;
@@ -1173,6 +1404,10 @@ const char *prefix2str(union prefixconstptr pu, char *str, int size)
 	return str;
 }
 
+/*
+ * 把组播地址 addr 格式化进 buf；若地址为全零则写 "*"（表示“任意”）。
+ * onfail 为解析失败时使用的替代文本。
+ */
 void prefix_mcast_ip_dump(const char *onfail, const struct ipaddr *addr,
 			  char *buf, int buf_size)
 {
@@ -1182,6 +1417,10 @@ void prefix_mcast_ip_dump(const char *onfail, const struct ipaddr *addr,
 		(void)snprintfrr(buf, buf_size, "%pIA", addr);
 }
 
+/*
+ * 把前缀当作“主机地址”格式化（不带 /len）写入 fbuf，返回写入长度。
+ * IPv4 / IPv6 走 inet_ntop，以太网走 MAC 字符串，其余输出带 family 的占位串。
+ */
 static ssize_t prefixhost2str(struct fbuf *fbuf, union prefixconstptr pu)
 {
 	const struct prefix *p = pu.p;
@@ -1202,6 +1441,10 @@ static ssize_t prefixhost2str(struct fbuf *fbuf, union prefixconstptr pu)
 	}
 }
 
+/*
+ * 把 IPv4 组播地址 addr 格式化进 buf；地址为 0.0.0.0 时写 "*"。
+ * inet_ntop 失败且提供了 onfail 时写入 onfail 文本。会保存并恢复 errno。
+ */
 void prefix_mcast_inet4_dump(const char *onfail, struct in_addr addr,
 		char *buf, int buf_size)
 {
@@ -1219,6 +1462,9 @@ void prefix_mcast_inet4_dump(const char *onfail, struct in_addr addr,
 	errno = save_errno;
 }
 
+/*
+ * 把 (S,G) 结构格式化为 "(src,grp)" 字符串（源 / 组可能显示为 *），返回 sg_str。
+ */
 const char *prefix_sg2str(const struct prefix_sg *sg, char *sg_str)
 {
 	char src_str[INET6_ADDRSTRLEN];
@@ -1231,6 +1477,10 @@ const char *prefix_sg2str(const struct prefix_sg *sg, char *sg_str)
 	return sg_str;
 }
 
+/*
+ * 释放 flowspec 前缀里动态分配的负载（u.prefix_flowspec.ptr）并置空。
+ * 非 flowspec 或指针为空时直接返回。
+ */
 void prefix_flowspec_ptr_free(struct prefix *p)
 {
 	void *temp;
@@ -1243,6 +1493,9 @@ void prefix_flowspec_ptr_free(struct prefix *p)
 	p->u.prefix_flowspec.ptr = (uintptr_t)NULL;
 }
 
+/*
+ * 分配并清零一个 struct prefix（MTYPE_PREFIX）。是各 prefix_*_new 的基础。
+ */
 struct prefix *prefix_new(void)
 {
 	struct prefix *p;
@@ -1251,6 +1504,10 @@ struct prefix *prefix_new(void)
 	return p;
 }
 
+/*
+ * 作为列表释放回调：参数是元素本身（非指针的指针），取其地址后调用 prefix_free。
+ * 用于需要“回调只提供元素值”的容器清空场景。
+ */
 void prefix_free_lists(void *arg)
 {
 	struct prefix *p = arg;
@@ -1259,12 +1516,20 @@ void prefix_free_lists(void *arg)
 }
 
 /* Free prefix structure. */
+/*
+ * 释放 *p（MTYPE_PREFIX）。XFREE 宏会在释放后把 *p 置 NULL，可避免悬垂与重复释放。
+ */
 void prefix_free(struct prefix **p)
 {
 	XFREE(MTYPE_PREFIX, *p);
 }
 
 /* Utility function to convert ipv4 prefixes to Classful prefixes */
+/*
+ * 把 IPv4 前缀转成有类（classful）前缀：主机路由（/32）不变，
+ * 否则按地址所属的 A / B / C 类把掩码长度设为 8 / 16 / 24 并应用掩码。
+ * 用于兼容旧式按类划分网络的配置。
+ */
 void apply_classful_mask_ipv4(struct prefix_ipv4 *p)
 {
 
@@ -1287,6 +1552,11 @@ void apply_classful_mask_ipv4(struct prefix_ipv4 *p)
 	}
 }
 
+/*
+ * 由主机地址 hostaddr 与掩码长度 masklen 算出该网络的广播地址。
+ * 常规为“地址或上掩码取反”；/31 按 RFC3021 3.3 特殊返回 255.255.255.255。
+ * 地址与返回值均为网络字节序。
+ */
 in_addr_t ipv4_broadcast_addr(in_addr_t hostaddr, int masklen)
 {
 	struct in_addr mask;
@@ -1304,6 +1574,11 @@ in_addr_t ipv4_broadcast_addr(in_addr_t hostaddr, int masklen)
 /* Utility function to convert ipv4 netmask to prefixes
    ex.) "1.1.0.0" "255.255.0.0" => "1.1.0.0/16"
    ex.) "1.0.0.0" NULL => "1.0.0.0/8"                   */
+/*
+ * 把“网络地址 + 可选掩码字符串”转成 "prefix/len" 字符串写入 prefix_str。
+ * 提供 mask_str 时用 ip_masklen 求长度；未提供掩码时按有类规则推断
+ * （0.0.0.0 为 0，C / B / A 类为 24 / 16 / 8）。成功返回 1，失败返回 0。
+ */
 int netmask_str2prefix_str(const char *net_str, const char *mask_str,
 			   char *prefix_str, size_t prefix_str_len)
 {
@@ -1348,6 +1623,10 @@ int netmask_str2prefix_str(const char *net_str, const char *mask_str,
  * format accepted: AA:BB:CC:DD:EE:FF
  * if mac parameter is null, then check only
  */
+/*
+ * 解析 "AA:BB:CC:DD:EE:FF" 形式的 MAC 字符串到 struct ethaddr，成功返回 1。
+ * mac 为 NULL 时只做格式校验不写入。属内部分解表示。
+ */
 int prefix_str2mac(const char *str, struct ethaddr *mac)
 {
 	unsigned int a[6];
@@ -1370,6 +1649,11 @@ int prefix_str2mac(const char *str, struct ethaddr *mac)
 	return 1;
 }
 
+/*
+ * 把 struct ethaddr 格式化为 "aa:bb:cc:dd:ee:ff" 字符串。
+ * 若 buf 为空则内部按 ETHER_ADDR_STRLEN 分配（调用方负责释放），否则要求
+ * size 足够大；mac 为 NULL 返回 NULL。
+ */
 char *prefix_mac2str(const struct ethaddr *mac, char *buf, int size)
 {
 	char *ptr;
@@ -1389,6 +1673,11 @@ char *prefix_mac2str(const struct ethaddr *mac, char *buf, int size)
 	return ptr;
 }
 
+/*
+ * 计算前缀的哈希键：先把副本清零再拷贝一份，确保对齐 / 填充与未用字节都为零
+ * （否则相同前缀会因垃圾字节得到不同哈希）。flowspec 前缀额外对负载指针指向的
+ * 内容做 jhash，并释放临时拷贝。返回哈希值。
+ */
 unsigned prefix_hash_key(const void *pp)
 {
 	struct prefix copy;
@@ -1423,6 +1712,10 @@ unsigned prefix_hash_key(const void *pp)
  * format accepted: aa:aa:aa:aa:aa:aa:aa:aa:aa:aa
  * if esi parameter is null, then check only
  */
+/*
+ * 解析 "aa:aa:...:aa"（10 组两位十六进制）形式的 ESI 字符串到 esi_t，成功返回 1。
+ * esi 为 NULL 时只做格式校验。属内部分解表示。
+ */
 int str_to_esi(const char *str, esi_t *esi)
 {
 	int i;
@@ -1448,6 +1741,10 @@ int str_to_esi(const char *str, esi_t *esi)
 	return 1;
 }
 
+/*
+ * 把 esi_t 格式化成冒号分隔的十六进制字符串。
+ * buf 为空时内部按 ESI_STR_LEN 分配（调用方负责释放），否则要求 size 足够大。
+ */
 char *esi_to_str(const esi_t *esi, char *buf, int size)
 {
 	char *ptr;
@@ -1470,6 +1767,10 @@ char *esi_to_str(const esi_t *esi, char *buf, int size)
 	return ptr;
 }
 
+/*
+ * 把 EVPN ES 的 DF 选举算法编号转成名字字符串（service-carving / HRW /
+ * preference，其余为 "unknown N"），结果写入 buf 并返回 buf。
+ */
 char *evpn_es_df_alg2str(uint8_t df_alg, char *buf, int buf_len)
 {
 	switch (df_alg) {
@@ -1493,6 +1794,11 @@ char *evpn_es_df_alg2str(uint8_t df_alg, char *buf, int buf_len)
 	return buf;
 }
 
+/*
+ * 按 IETF 草稿（unicast-0 / 127 / 240）口径判断 IPv4 是否可作为公网单播。
+ * 排除 0.0.0.0；240/4 视为可用；127/8 中仅 127.0.0.0/16 与环回不可用，
+ * 其余 127.x 可用；组播（224/4）不可用。
+ */
 bool ipv4_ietf_unicast_valid(const struct in_addr *addr)
 {
 	/* New reserved ranges:
@@ -1524,6 +1830,10 @@ bool ipv4_ietf_unicast_valid(const struct in_addr *addr)
 	return true;
 }
 
+/*
+ * 判断 IPv4 是否为合法单播：240/4 可用，224/4 组播不可用，
+ * 0/8 与 127/8 是否可用取决于配置项 cmd_allow_reserved_ranges。
+ */
 bool ipv4_unicast_valid(const struct in_addr *addr)
 {
 	in_addr_t ip = ntohl(addr->s_addr);
@@ -1544,6 +1854,10 @@ bool ipv4_unicast_valid(const struct in_addr *addr)
 	return true;
 }
 
+/*
+ * 把 struct ipaddr 转成 struct prefix：按 ipa_type 填 v4 / v6 的地址与掩码长度，
+ * IPADDR_NONE 时 family 置 AF_UNSPEC。始终返回 0。
+ */
 static int ipaddr2prefix(const struct ipaddr *ip, uint16_t prefixlen,
 			 struct prefix *p)
 {
@@ -1570,6 +1884,11 @@ static int ipaddr2prefix(const struct ipaddr *ip, uint16_t prefixlen,
  * Convert type-2 and type-5 evpn route prefixes into the more
  * general ipv4/ipv6 prefix types so we can match prefix lists
  * and such.
+ */
+/*
+ * 把 EVPN type-2（MAC/IP）与 type-5（IP-Prefix）路由前缀提取成普通的
+ * IPv4 / IPv6 前缀，便于套用 prefix-list 等通用匹配。
+ * 非 EVPN、不支持的类型或缺失 IP 均返回 -1；成功返回 0。
  */
 int evpn_prefix2prefix(const struct prefix *evpn, struct prefix *to)
 {
@@ -1604,6 +1923,9 @@ int evpn_prefix2prefix(const struct prefix *evpn, struct prefix *to)
 }
 
 printfrr_ext_autoreg_p("EA", printfrr_ea);
+/*
+ * printfrr 扩展 %pEA：把 struct ethaddr 渲染为 MAC 字符串；空指针输出 "(null)"。
+ */
 static ssize_t printfrr_ea(struct fbuf *buf, struct printfrr_eargs *ea,
 			   const void *ptr)
 {
@@ -1619,6 +1941,9 @@ static ssize_t printfrr_ea(struct fbuf *buf, struct printfrr_eargs *ea,
 }
 
 printfrr_ext_autoreg_p("IA", printfrr_ia);
+/*
+ * printfrr 扩展 %pIA：渲染 struct ipaddr。格式串后可跟 's' 表示“零地址显示为 *”。
+ */
 static ssize_t printfrr_ia(struct fbuf *buf, struct printfrr_eargs *ea,
 			   const void *ptr)
 {
@@ -1659,6 +1984,9 @@ static ssize_t printfrr_ia(struct fbuf *buf, struct printfrr_eargs *ea,
 }
 
 printfrr_ext_autoreg_p("I4", printfrr_i4);
+/*
+ * printfrr 扩展 %pI4：渲染 IPv4 地址。格式串后可跟 's' 表示零地址显示为 *。
+ */
 static ssize_t printfrr_i4(struct fbuf *buf, struct printfrr_eargs *ea,
 			   const void *ptr)
 {
@@ -1682,6 +2010,10 @@ static ssize_t printfrr_i4(struct fbuf *buf, struct printfrr_eargs *ea,
 }
 
 printfrr_ext_autoreg_p("I6", printfrr_i6);
+/*
+ * printfrr 扩展 %pI6：渲染 IPv6 地址；对 IPv4-mapped 地址特判为 "::ffff:a.b.c.d"。
+ * 格式串后可跟 's' 表示零地址显示为 *。
+ */
 static ssize_t printfrr_i6(struct fbuf *buf, struct printfrr_eargs *ea,
 			   const void *ptr)
 {
@@ -1727,6 +2059,9 @@ static ssize_t printfrr_i6(struct fbuf *buf, struct printfrr_eargs *ea,
 }
 
 printfrr_ext_autoreg_p("FX", printfrr_pfx);
+/*
+ * printfrr 扩展 %pFX：渲染前缀。格式串后可跟 'h' 表示只渲染主机地址（不带 /len）。
+ */
 static ssize_t printfrr_pfx(struct fbuf *buf, struct printfrr_eargs *ea,
 			    const void *ptr)
 {
@@ -1751,6 +2086,9 @@ static ssize_t printfrr_pfx(struct fbuf *buf, struct printfrr_eargs *ea,
 }
 
 printfrr_ext_autoreg_p("PSG", printfrr_psg);
+/*
+ * printfrr 扩展 %pPSG：把 (S,G) 结构渲染为 "(src,grp)"，源 / 组为零时显示为 *。
+ */
 static ssize_t printfrr_psg(struct fbuf *buf, struct printfrr_eargs *ea,
 			    const void *ptr)
 {

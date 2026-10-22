@@ -4,6 +4,39 @@
  * Copyright (C) 1997, 98 Kunihiro Ishiguro
  */
 
+/*
+ * 【文件导读】command.h —— FRR 命令树（command tree）的公共接口
+ *
+ * 本头文件定义了 FRR 整个命令行解析引擎对外暴露的数据结构与宏，是
+ * lib/command.c、lib/command_match.c、lib/command_graph.c 三个实现文件的
+ * 公共契约。FRR 每个守护进程（bgpd / ospfd / zebra ...）都通过这里的
+ * DEFUN / DEFPY 宏把命令注册进命令树，再由 vty 会话实时解析。
+ *
+ * 核心概念：
+ *   cmd_node   —— 一个“配置模式”，例如 CONFIG_NODE（全局配置）、
+ *                 INTERFACE_NODE（接口模式）、BGP_NODE 等。它绑定提示串、
+ *                 写配置回调，并持有该模式下的命令集合。
+ *   node_type  —— 上面的枚举，列出所有已知的配置节点类型。
+ *   cmd_element—— 一条具体命令（命令串 + 回调 + 帮助串 + 属性）。
+ *   cmd_token  —— 命令行按空格切分、并经过词法类型判定的最小单元；
+ *                 命令图（command_graph）由 token 构成有向图。
+ *   graph      —— cmd_node 内的命令图，支持并行分支与类型化 token。
+ *
+ * 一条命令从源码到可执行的流程：
+ *   1) 编译期：DEFUN / DEFPY 宏展开成静态的 cmd_element 结构体；
+ *   2) 初始化：install_node / install_element 把命令挂到对应 cmd_node，
+ *      首次进入节点时由 command.c 调用 command_graph 构建 token 图；
+ *   3) 运行期：vty 读到一行 -> cmd_make_strvec 切词 -> cmd_execute_command
+ *      在图中匹配 token -> 命中后调用 cmd_element->func 回调。
+ *   4) 补全：command_match.c 遍历同一张图，用 token 的类型信息给候选词。
+ *
+ * 关键易踩的坑：
+ *   - 节点类型枚举顺序不能随意改动，command.c 中维护了同名数组；
+ *   - 命令串里形如 A.B.C.D / WORD / IPV4 的记号是 token 类型编码，
+ *     代表类型化占位符，而不是字面量；
+ *   - 帮助串按行用换行符分隔，行数必须与 token 数一一对应。
+ */
+
 #ifndef _ZEBRA_COMMAND_H
 #define _ZEBRA_COMMAND_H
 
@@ -22,6 +55,11 @@ extern "C" {
 DECLARE_MTYPE(COMPLETION);
 
 /*
+ * HOSTNAME_LEN —— 主机名允许的最大长度。按 RFC 1123，主机软件必须能处理
+ * 最多 63 字符、并应能容纳最多 255 字符的主机名，这里取 255。
+ * 下面的英文块是对应 RFC 原文摘录，原样保留。
+ */
+/*
  * From RFC 1123 (Requirements for Internet Hosts), Section 2.1 on hostnames:
  * One aspect of host name syntax is hereby changed: the restriction on
  * the first character is relaxed to allow either a letter or a digit.
@@ -32,6 +70,14 @@ DECLARE_MTYPE(COMPLETION);
  */
 #define HOSTNAME_LEN   255
 
+/*
+ * struct host —— 本机（路由器）的全局主机信息缓存。
+ *
+ * 命令模块持有唯一的 host 实例，保存主机名、域名、版本串、vty 口令、
+ * banner(motd) 文件等，多用于 “show version / show running-config” 的只读展示。
+ * 注意：password 与 password_encrypt、enable 与 enable_encrypt 成对存在，
+ * 分别对应明文与密文；配置回写时优先使用加密版本。lines 是系统级 vty 终端行数。
+ */
 /* Host configuration variable */
 struct host {
 	/* Host name of this router. */
@@ -74,6 +120,14 @@ struct host {
 	bool allow_reserved_ranges;
 };
 
+/*
+ * enum node_type —— 所有 CLI 节点（配置模式）的枚举。
+ *
+ * 每一项对应一种 vty 提示符模式，枚举值即节点索引，被全局向量 cmdvec 直接下标访问。
+ * command.c 里维护了一份同序的节点名字符串数组，新增节点时两处都要同步更新
+ * （见上面第 77 行附近的英文提示）。
+ * 注意：不要把新节点插到中间，只能追加在 NODE_TYPE_MAX 之前，否则会打乱既有索引。
+ */
 /* List of CLI nodes. Please remember to update the name array in command.c. */
 /* clang-format off */
 enum node_type {
@@ -191,6 +245,18 @@ extern const struct message tokennames[];
 /* for external users depending on struct layout */
 #define FRR_CMD_NODE_20200416
 
+/*
+ * struct cmd_node —— 描述一个 CLI 节点（配置模式）的全部元数据。
+ *
+ * node / parent_node：本节点类型与父节点类型（用于 “exit” 时回退到哪一级）。
+ * prompt：该模式下的提示符字符串，例如 “(config-if)#”。
+ * config_write：用户执行 write / show running-config 时被调用，负责输出本节点配置。
+ * node_exit：离开本节点时的钩子，返回 1 表示继续走正常的退栈处理，0 表示抑制。
+ * cmdgraph：本节点的命令图（token 有向图），首条命令安装时由 command_graph 构建。
+ * cmd_vector / cmd_hash：命令元素列表及去重用的哈希（安装命令时避免重复）。
+ * graph_built：命令图是否已经构建完成。
+ * no_xpath：离开本节点时是否不要回退 vty->xpath_index（MGMTD / 特殊节点用）。
+ */
 /* Node which has some commands and prompt string and configuration
    function pointer . */
 struct cmd_node {
@@ -227,6 +293,14 @@ struct cmd_node {
 	bool no_xpath;
 };
 
+/*
+ * 命令回调与解析器的返回码。
+ *
+ * CMD_SUCCESS / CMD_WARNING ... 是命令回调函数的通用返回值；
+ * CMD_COMPLETE_* 是解析器对“本行已输入完整、可执行/可补全”的匹配结论；
+ * CMD_ERR_* 表示各类失败（无匹配 / 歧义 / 未完整 / argc 溢出 / 无此实例等）。
+ * 命令行层最终根据这些返回值决定是执行、继续补全还是给出错误提示。
+ */
 /* Return value of the commands. */
 #define CMD_SUCCESS              0
 #define CMD_WARNING              1
@@ -247,10 +321,23 @@ struct cmd_node {
 #define CMD_ERR_NO_DAEMON 16
 
 /* Argc max counts. */
+/* CMD_ARGC_MAX —— 单条命令允许的最大 token（参数）个数；超出即报 CMD_ERR_EXEED_ARGC_MAX。 */
 #define CMD_ARGC_MAX   256
 
 /* clang-format off */
 
+/*
+ * DEFUN / DEFPY 系列宏 —— 让一条命令“声明 + 定义”一步到位。
+ *
+ * DEFUN(函数名, 命令变量名, 命令串, 帮助串) 展开出三部分：
+ *   1) 函数前置声明          —— DEFUN_CMD_FUNC_DECL；
+ *   2) 静态 cmd_element 结构体 —— DEFUN_CMD_ELEMENT，含 .string/.func/.doc 等；
+ *   3) 函数体头部            —— DEFUN_CMD_FUNC_TEXT。
+ * DEFPY 会再经 clippy 预处理，把命令串中的 $变量 抽取成函数的具名形参。
+ * DEFSH / DEFUNSH 只注册命令、不实现（给 vtysh 转发用）；ALIAS 为已存在的
+ * 回调再挂一条命令字符串。
+ * 注意：命令变量名（cmdname）即 struct cmd_element 的变量名，必须全局唯一。
+ */
 /* helper defines for end-user DEFUN* macros */
 #define DEFUN_CMD_ELEMENT(funcname, cmdname, cmdstr, helpstr, attrs, dnum)     \
 	const struct cmd_element cmdname = {                                   \
@@ -277,6 +364,10 @@ struct cmd_node {
 			    int argc __attribute__((unused)),                  \
 			    struct cmd_token *argv[] __attribute__((unused)))
 
+/*
+ * DEFPY 变体 —— 与 DEFUN 用法相同，但产生的是 DEFPY_ATTR：内部以
+ * DEFUN_CMD_ELEMENT 加 daemon=0 注册，函数体形参由 clippy 依据命令串自动生成。
+ */
 /* DEFPY variants */
 
 #define DEFPY_ATTR(funcname, cmdname, cmdstr, helpstr, attr)                   \
@@ -303,6 +394,10 @@ struct cmd_node {
 	DEFPY_ATTR(funcname, cmdname, cmdstr, helpstr,                         \
 		   CMD_ATTR_YANG | CMD_ATTR_NOSH)
 
+/*
+ * DEFUN 变体 —— DEFUN_ATTR 是基础形式；DEFUN 无属性，其余 *_HIDDEN / *_YANG /
+ * *_NOSH 分别附加 CMD_ATTR_HIDDEN / CMD_ATTR_YANG / CMD_ATTR_NOSH 属性位。
+ */
 /* DEFUN variants */
 
 #define DEFUN_ATTR(funcname, cmdname, cmdstr, helpstr, attr)                   \
@@ -331,6 +426,11 @@ struct cmd_node {
 	DEFUN_ATTR(funcname, cmdname, cmdstr, helpstr,                         \
 		   CMD_ATTR_YANG | CMD_ATTR_NOSH)
 
+/*
+ * DEFSH / DEFUNSH 变体 —— 面向 vtysh 的“只注册靠山”命令。
+ * daemon 参数指明该命令属于哪个守护进程；func 为 NULL 时表示命令只被登记
+ * （DEFSH），由 vtysh 转发给真正的守护进程执行；DEFUNSH 则同时提供本地函数体。
+ */
 /* DEFSH for vtysh. */
 #define DEFSH_ATTR(daemon, cmdname, cmdstr, helpstr, attr)                     \
 	DEFUN_CMD_ELEMENT(NULL, cmdname, cmdstr, helpstr, attr, daemon)
@@ -355,6 +455,11 @@ struct cmd_node {
 	DEFUNSH_ATTR(daemon, funcname, cmdname, cmdstr, helpstr,               \
 		     CMD_ATTR_HIDDEN)
 
+/*
+ * ALIAS 系列 —— 为一条“已存在的回调函数”再挂上一条新的命令字符串，
+ * 属于同一命令的别名/历史写法，不产生新的回调。
+ * ALIAS_DEPRECATED 隐含 HIDDEN，仅用于表达“即将废弃”的意图（见上方英文注释）。
+ */
 /* ALIAS macro which define existing command's alias. */
 #define ALIAS_ATTR(funcname, cmdname, cmdstr, helpstr, attr)                   \
 	static DEFUN_CMD_ELEMENT(funcname, cmdname, cmdstr, helpstr, attr, 0)
@@ -378,6 +483,10 @@ struct cmd_node {
 
 /* clang-format on */
 
+/*
+ * CMD_CREATE_STR / CMD_RANGE_STR —— 把宏常量“字符串化”，以便命令解析时按字面匹配。
+ * 例：CMD_CREATE_STR(64) 得到 "64"；CMD_RANGE_STR(a,s) 生成 "(a-s)" 形式的区间 token。
+ */
 /* Some macroes */
 
 /*
@@ -390,6 +499,12 @@ struct cmd_node {
 #define CMD_CREATE_STR_HELPER(s) #s
 #define CMD_RANGE_STR(a,s) "(" CMD_CREATE_STR(a) "-" CMD_CREATE_STR(s) ")"
 
+/*
+ * 常用帮助串宏 —— 这些字符串用于命令的 .doc（帮助），在 “?” 补全时逐行显示。
+ * 帮助串的行数/顺序必须与被描述命令的 token 一一对应，故许多命令会直接
+ * 复用这些预定义串（如 SHOW_STR / NO_STR / INTERFACE_STR）。
+ * 带 "str" 后缀的 *_STR 结尾都带换行，注意别在拼接时漏掉分隔。
+ */
 /* Common descriptions. */
 #define SHOW_STR "Show running system information\n"
 #define IP_STR "IP information\n"
@@ -473,6 +588,7 @@ struct cmd_node {
 #define BGP_AF_MODIFIER_STR "Address Family modifier\n"
 
 /* Command warnings. */
+/* 命令级警告文案：例如删除口令时要提示安全风险。 */
 #define NO_PASSWD_CMD_WARNING                                                  \
 	"Please be aware that removing the password is a security risk and you should think twice about this command.\n"
 
@@ -525,10 +641,25 @@ struct cmd_node {
 #define BFD_INTEGRATION_SOURCEV4_STR "Use IPv4 source for BFD session\n"
 #define BFD_INTEGRATION_SOURCEV6_STR "Use IPv4 source for BFD session\n"
 
+/*
+ * 命令树对外主要接口原型。
+ *
+ * install_node / install_default：注册一个配置节点、并为其安装默认命令。
+ * install_element / _install_element：把一条命令挂到指定节点，是 DEFUN 生效的入口。
+ * cmd_execute / cmd_execute_command / cmd_execute_command_strict：解析并执行整行命令。
+ * cmd_describe_command / cmd_complete_command：给 “?” 与 TAB 补全使用。
+ * config_from_file / command_config_read_one_line：从配置文件逐行回放命令。
+ * cmd_make_strvec / cmd_free_strvec：把一行字符串切成 token 向量及释放。
+ */
 /* Prototypes. */
 extern void install_node(struct cmd_node *node);
 extern void install_default(enum node_type node);
 
+/*
+ * struct xref_install_element —— install_element 宏生成的静态交叉引用记录。
+ * 把命令元素与节点类型登记到 xref 表，便于开发/调试构建下回溯来源，
+ * 以及 XREF_LINK 生成带源码位置信息的引用，正常运行时不影响命令逻辑。
+ */
 struct xref_install_element {
 	struct xref xref;
 
@@ -536,6 +667,11 @@ struct xref_install_element {
 	enum node_type node_type;
 };
 
+/*
+ * install_element —— 安装命令的推荐宏。它在编译期构造一份 static 交叉引用
+ * 记录（xref_install_element），再调用 _install_element 真正把命令挂到节点。
+ * 之所以包一层，是为了给每条命令留下可追溯的源码位置。
+ */
 #define install_element(node_type_, cmd_element_) do {                         \
 		static const struct xref_install_element _xref                 \
 				__attribute__((used)) = {                      \
@@ -642,6 +778,11 @@ extern void print_version(const char *progname);
 extern int cmd_banner_motd_file(const char *file);
 extern void cmd_banner_motd_line(const char *line);
 
+/*
+ * struct cmd_variable_handler —— 变量型 token（如 $ifname / $vrf）的补全处理器注册项。
+ * tokenname 是命令串中的变量名；completions 产出候选值填充 vector out；
+ * xpath 可选，表示从某个 YANG xpath 的取值集合来生成补全候选。
+ */
 struct cmd_variable_handler {
 	const char *tokenname, *varname;
 	const char *xpath;	/* fill comps from set of values at xpath */

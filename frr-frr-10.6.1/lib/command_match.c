@@ -6,6 +6,33 @@
  * Copyright (C) 2016 Cumulus Networks, Inc.
  */
 
+/*
+ * 【文件导读】command_match.c —— 命令行输入在命令图上的匹配与补全
+ *
+ * 本文件实现 command_match.h 的两个入口，是整个 CLI 后端的核心算法：
+ *
+ *   command_match   —— 判断一整行输入能否精确命中一条命令。做法是给输入行
+ *                      最前面塞一个 dummy token（对应图的 START 结点），再调用
+ *                      递归的 command_match_r 沿图做深度优先搜索。命中时返回的
+ *                      顺序表最后一项是 cmd_element，前面每一项是被消耗的 token
+ *                      （其 arg 保存对应的输入副本）。
+ *   command_complete—— 为未打完的一行生成“下一个可取词”，供 “?” 与 TAB 补全。
+ *                      它按 BFS 逐词推进，维护 current / next 两个结点集合，
+ *                      最后把下一步可达的 token 收集成候选列表。
+ *
+ * 几个关键概念：
+ *   match_type（trivial / no_match / partly / exact）—— 单个 token 的匹配程度；
+ *   min_match_level —— 每种 token “算作匹配”所需的最低程度（WORD 允许前缀
+ *                      缩写，所以只需 partly_match）；
+ *   score_precedence —— 多条路径都命中时，按类型优先级挑更具体的那个；
+ *   disambiguate / disambiguate_tokens —— 两条候选路径的仲裁，平手则判歧义。
+ *
+ * 易踩的坑：
+ *   - 图里可能有环（allowrepeat 的 token），故用 stack 记录已访问结点避免死循环；
+ *   - arglist 的最后一个元素是 cmd_element 而非 token，删除要用 del_arglist 善后；
+ *   - 命令行首的 "no" 由 is_neg 识别，用于 NEG_ONLY_TKN 的条件匹配。
+ */
+
 #include <zebra.h>
 
 #include "command_match.h"
@@ -14,6 +41,10 @@
 
 DEFINE_MTYPE_STATIC(LIB, CMD_MATCHSTACK, "Command Match Stack");
 
+/*
+ * TRACE_MATCHER —— 编译期打开后，会向 stdout 打印每一次 token 匹配的详细过程，
+ * 排查 CLI 匹配问题时非常有用。TM 是开关常量，trace_matcher 是配套的打印宏。
+ */
 #ifdef TRACE_MATCHER
 #define TM 1
 #else
@@ -65,6 +96,10 @@ static enum match_type match_variable(struct cmd_token *, const char *);
 
 static enum match_type match_mac(const char *, bool);
 
+/*
+ * is_neg —— 判断输入行下标 idx 处的词是否为 "no"（用于识别 “no ...” 命令）。
+ * idx 越界或该位置为空时返回 false。
+ */
 static bool is_neg(vector vline, size_t idx)
 {
 	if (idx >= vector_active(vline) || !vector_slot(vline, idx))
@@ -72,6 +107,15 @@ static bool is_neg(vector vline, size_t idx)
 	return !strcmp(vector_slot(vline, idx), "no");
 }
 
+/*
+ * command_match —— 命令图上的整行匹配入口。
+ * 入参：cmdgraph 命令图；vline 切词后的输入；argv 出参返回命中的 token 列表；
+ *       el 出参返回命中的 cmd_element。
+ * 实现：先在最前面插入一个 dummy token 以喂给 START 结点，再调用 command_match_r。
+ * 成功（MATCHER_OK）时，从结果表里删掉 dummy 头、取出尾部 cmd_element 并摘除，
+ * 于是 *argv 变成纯 token 序列表；失败时清空 *argv 且 *el 为 NULL。
+ * 注意：*el 指向启动时初始化的静态实例，切勿释放或改写。
+ */
 enum matcher_rv command_match(struct graph *cmdgraph, vector vline,
 			      struct list **argv, const struct cmd_element **el)
 {
@@ -127,6 +171,18 @@ enum matcher_rv command_match(struct graph *cmdgraph, vector vline,
 	return status;
 }
 
+/*
+ * command_match_r —— 匹配的递归主体（本文件核心）。
+ * 参数：start 当前结点；vline 输入；n 待匹配输入的下标；stack 已访问结点栈；
+ *       currbest 出参，累积当前找到的最佳匹配表。
+ * 步骤：用 match_token 判断当前结点能否吃下 vline[n]（低于 min_match_level 即失败）；
+ *   通过后压栈；取出所有可直达的 nexthop（add_nexthops）；
+ *   若输入已到尾，则寻找 END_TKN 收尾（出现多于一个 END 即判为歧义）；
+ *   否则对每个后继递归，并用 disambiguate 在多条候选之间仲裁、选出最优；
+ *   最后把当前 token 复制一份（arg = 输入）插到结果表头。
+ * 返回 MATCHER_OK / INCOMPLETE / AMBIGUOUS / NO_MATCH。
+ * 下方英文注释对算法有详尽说明，可对照阅读。
+ */
 /**
  * Builds an argument list given a DFA and a matching input line.
  *
@@ -332,11 +388,23 @@ static enum matcher_rv command_match_r(struct graph_node *start, vector vline,
 	return status;
 }
 
+/*
+ * stack_del —— 匹配栈元素的析构回调，供链表删除时释放由 MTYPE_CMD_MATCHSTACK 分配的结点栈。
+ */
 static void stack_del(void *val)
 {
 	XFREE(MTYPE_CMD_MATCHSTACK, val);
 }
 
+/*
+ * command_complete —— 生成“下一个可取词”的候选。
+ * 入参：graph 命令图；vline 输入；completions 出参返回候选 token 列表。
+ * 做法：以 BFS 逐词推进，current 为上一轮命中的结点集合，next 为它们一跳可达的集合；
+ *   对每个当前 token 调用 match_token，按 trivial / partly / exact / no_match
+ *   决定是否把其后继加入 next。全部输入处理完后，把 next 里的 token 收进 *completions。
+ *   若整行都走完且还有后继则返回 MATCHER_OK。
+ * 注意：中途把 gstack 这类“结点栈”当链表元素存放，删除时统一走 stack_del。
+ */
 enum matcher_rv command_complete(struct graph *graph, vector vline,
 				 struct list **completions)
 {
@@ -457,6 +525,15 @@ enum matcher_rv command_complete(struct graph *graph, vector vline,
 	return mrv;
 }
 
+/*
+ * add_nexthops —— 收集从 node 出发、一跳可达的“实际 token 结点”。
+ * 结构 token（FORK / JOIN / START，即 >= SPECIAL_TKN 且非 END_TKN）被当作透明，
+ * 直接穿透继续下探；END_TKN 与可变化 token 作为叶子加入 list。
+ * stack / stackpos 给出来路，用于跳过已访问过的、allowrepeat 为假的结点；
+ * neg 控制 NEG_ONLY_TKN 是否参与（对应 “no” 命令）。
+ * 若传入非空 stack，则加入 list 的是“结点栈”副本（栈顶为当前结点），
+ * 否则直接加结点指针。返回加入的元素个数。
+ */
 /**
  * Adds all children that are reachable by one parser hop to the given list.
  * special tokens except END_TKN are treated as transparent.
@@ -514,6 +591,11 @@ static int add_nexthops(struct list *list, struct graph_node *node,
 	return added;
 }
 
+/*
+ * min_match_level —— 各 token 类型“算作匹配”所需的最低匹配程度。
+ * START 放行一切（连 no_match 也接受，便于递归起步）；WORD 允许前缀缩写，
+ * 故为 partly_match；其余类型都要求 exact_match。
+ */
 /**
  * Determines the node types for which a partial match may count as a full
  * match. Enables command abbrevations.
@@ -550,6 +632,11 @@ static enum match_type min_match_level(enum cmd_token_type type)
 	return no_match;
 }
 
+/*
+ * score_precedence —— 给 token 类型打分，用于仲裁“哪条路径更具体”。
+ * 分值越小越具体：IP / 前缀 / 数字区间为 2，AS 号与 WORD 为 3，变量为 4，
+ * 结构 token 为 10（最不具体）。多条路径都命中时保留分值更小者。
+ */
 /**
  * Assigns precedence scores to node types.
  *
@@ -586,6 +673,11 @@ static int score_precedence(enum cmd_token_type type)
 	return -1;
 }
 
+/*
+ * disambiguate_tokens —— 在两个 token 候选之间取更优者。
+ * 类型不同则按 score_precedence 取分小者；分值相同视为无法区分，返回 NULL。
+ * 类型相同时取 match_type 更高（更精确）的那个；仍相同则返回 NULL（歧义）。
+ */
 /**
  * Picks the better of two possible matches for a token.
  *
@@ -617,6 +709,11 @@ static struct cmd_token *disambiguate_tokens(struct cmd_token *first,
 	return NULL;
 }
 
+/*
+ * disambiguate —— 在两条完整匹配路径（token 列表）之间取更优者。
+ * 要求两条列表等长（长度应等于 vline 剩余 token 数加一）。逐 token 用
+ * disambiguate_tokens 比较，谁先在某一位胜出就返回谁的列表；全程不分胜负返回 NULL。
+ */
 /**
  * Picks the better of two possible matches for an input line.
  *
@@ -655,6 +752,11 @@ static struct list *disambiguate(struct list *first, struct list *second,
 }
 
 /*
+ * del_arglist —— 删除一个匹配结果表（arglist）。
+ * 该表的尾部存的是 cmd_element（不是 token，且是全局唯一实例不可复制），
+ * 因此先把尾结点的 data 置空、摘掉尾结点，再把其余元素按通常方式删除，避免误释放。
+ */
+/*
  * Deletion function for arglist.
  *
  * Since list->del for arglists expects all listnode->data to hold cmd_token,
@@ -676,8 +778,17 @@ static void del_arglist(struct list *list)
 	list_delete(&list);
 }
 
+/*
+ * 以下为一组“token 级”匹配函数：每个负责一种 cmd_token_type 的输入校验，
+ * 统一返回 enum match_type（no_match / partly_match / exact_match）。
+ */
 /*---------- token level matching functions ----------*/
 
+/*
+ * match_token —— token 级匹配的总调度：按 token->type 分派到具体匹配函数。
+ * 输入为 NULL 时返回 trivial_match（空输入匹配一切）。结构 token（END / FORK /
+ * JOIN / START / NEG_ONLY）一律返回 no_match，因为它们不消耗用户输入。
+ */
 static enum match_type match_token(struct cmd_token *token, char *input_token)
 {
 	// nothing trivially matches everything
@@ -717,9 +828,17 @@ static enum match_type match_token(struct cmd_token *token, char *input_token)
 	return no_match;
 }
 
+/*
+ * IPv4 匹配允许出现的字符集：地址用前者；前缀额外允许斜杠，用后者。
+ */
 #define IPV4_ADDR_STR   "0123456789."
 #define IPV4_PREFIX_STR "0123456789./"
 
+/*
+ * match_ipv4 —— 校验输入是否是点分十进制的 IPv4 地址（如 10.0.0.1）。
+ * 逐段解析：点号不超过 3 个、每段 1~3 位数字、数值 <= 255、不允许前导零（"0" 除外）。
+ * 段数不足 4 视为 partly_match（可继续输入），满 4 段且格式正确为 exact_match。
+ */
 static enum match_type match_ipv4(const char *str)
 {
 	const char *sp;
@@ -775,6 +894,11 @@ static enum match_type match_ipv4(const char *str)
 	return exact_match;
 }
 
+/*
+ * match_ipv4_prefix —— 校验输入是否是 IPv4 前缀（如 10.0.0.0/24）。
+ * 前半段与 match_ipv4 类似地解析点分地址；第 4 段之后可跟 “/掩码”，掩码为十进制
+ * 且不得超过 32（IPV4_MAX_BITLEN）。地址不完整或掩码缺位返回 partly_match。
+ */
 static enum match_type match_ipv4_prefix(const char *str)
 {
 	const char *sp;
@@ -848,6 +972,11 @@ static enum match_type match_ipv4_prefix(const char *str)
 	return exact_match;
 }
 
+/*
+ * IPv6 匹配字符集（地址 / 前缀），以及 match_ipv6_prefix 状态机的状态常量：
+ * START 起始、COLON 单冒号后、DOUBLE 双冒号(::)后、ADDR 十六进制段内、
+ * DOT 内嵌 IPv4 点分、SLASH 出现斜杠、MASK 进入掩码解析。
+ */
 #define IPV6_ADDR_STR   "0123456789abcdefABCDEF:."
 #define IPV6_PREFIX_STR "0123456789abcdefABCDEF:./"
 #define STATE_START     1
@@ -858,6 +987,13 @@ static enum match_type match_ipv4_prefix(const char *str)
 #define STATE_SLASH     6
 #define STATE_MASK      7
 
+/*
+ * match_ipv6_prefix —— 校验输入是 IPv6 地址（prefix=false）还是前缀（prefix=true）。
+ * 用状态机（STATE_START / COLON / DOUBLE / ADDR / DOT / SLASH / MASK）逐字符解析，
+ * 统计冒号数与段数，校验 “::” 只出现一次、每段不超过 4 位十六进制等规则。
+ * prefix=false 时最终用 inet_pton 复核；prefix=true 时还需 “/” 后接合法掩码
+ * （0 ~ 128，IPV6_MAX_BITLEN）。不完整返回 partly_match，非法返回 no_match。
+ */
 static enum match_type match_ipv6_prefix(const char *str, bool prefix)
 {
 	int state = STATE_START;
@@ -982,6 +1118,10 @@ static enum match_type match_ipv6_prefix(const char *str, bool prefix)
 	return exact_match;
 }
 
+/*
+ * match_range —— 校验输入是否落在 token->min / token->max 指定的整数区间内。
+ * 用 strtoll 解析，若尾随非数字字符或数值越界则 no_match，否则 exact_match。
+ */
 static enum match_type match_range(struct cmd_token *token, const char *str)
 {
 	assert(token->type == RANGE_TKN);
@@ -999,6 +1139,11 @@ static enum match_type match_range(struct cmd_token *token, const char *str)
 		return exact_match;
 }
 
+/*
+ * match_word —— 字面词的匹配（支持前缀缩写）。
+ * 输入为空 -> partly_match；输入是完整词的前缀（更短）-> partly_match；
+ * 等长且完全相同 -> exact_match；其余 no_match。
+ */
 static enum match_type match_word(struct cmd_token *token, const char *word)
 {
 	assert(token->type == WORD_TKN);
@@ -1021,14 +1166,24 @@ static enum match_type match_word(struct cmd_token *token, const char *word)
 	return no_match;
 }
 
+/*
+ * match_variable —— 变量型 token（VARIABLE_TKN）匹配任意非空输入，恒为 exact_match。
+ * 注意其“是否为合法值”（如接口名是否存在）由补全 / 校验阶段负责，匹配层不做判断。
+ */
 static enum match_type match_variable(struct cmd_token *token, const char *word)
 {
 	assert(token->type == VARIABLE_TKN);
 	return exact_match;
 }
 
+/* MAC 地址允许出现的字符：十六进制数字与冒号。 */
 #define MAC_CHARS "ABCDEFabcdef0123456789:"
 
+/*
+ * match_mac —— 校验输入是 MAC 地址（prefix=false）还是 MAC 前缀（prefix=true）。
+ * 期望形如 “xx:xx:xx:xx:xx:xx”，共 12 位十六进制数字与 5 个冒号；前缀形式可再跟
+ * “/掩码”，掩码为十进制且不超过 48。地址未写完返回 partly_match，格式非法 no_match。
+ */
 static enum match_type match_mac(const char *word, bool prefix)
 {
 	/* 6 2-digit hex numbers separated by 5 colons */

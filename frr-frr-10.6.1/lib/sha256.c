@@ -4,9 +4,37 @@
  * All rights reserved.
  */
 
+/*
+ * 文件导读: sha256.c
+ * ----------------------------------------------------------------------------
+ * 本文件实现 SHA-256 摘要(RFC 6234)、HMAC-SHA256 与 PBKDF2-SHA256, 源自
+ *   Colin Percival 的 FreeBSD 实现.
+ * 作用: 提供 256 位 SHA-2 摘要, 以及基于它的消息认证码与密钥派生.
+ *
+ * 核心实现:
+ *   - be32dec / be32enc 及其向量版本 be32dec_vect / be32enc_vect: 大端字节序
+ *     与 32 位字之间的转换(平台未提供时自带实现).
+ *   - 一批位运算宏(Ch, Maj, SHR, ROTR, S0, S1, s0, s1)与轮宏 RND / RNDr:
+ *     描述 SHA-256 的消息扩展与压缩.
+ *   - SHA256_Transform: 对 512 位分块做一次压缩, 是算法核心.
+ *   - PAD: 填充常量; SHA256_Pad: 填充并写入比特长度.
+ *
+ * 与其他模块关系: 实现 sha256.h 的接口; 被需要强摘要或密钥派生的模块调用.
+ *
+ * 阅读顺序: 先看大端转换辅助函数, 再读位运算与轮宏, 然后看 SHA256_Transform,
+ *   接着按 Init / Update / Final 理解对外接口, 最后看 HMAC 与 PBKDF2.
+ *
+ * 易踩的坑: 各处 explicit_bzero 用于擦除栈上敏感中间值; 更新比特计数时需区分
+ *   低 32 位的进位; PBKDF2 内层 HMAC 复用 PShctx 以减少重复计算.
+ */
+
 #include <zebra.h>
 #include "sha256.h"
 
+/*
+ * 大端字节序转 32 位字(平台未提供时使用).
+ * pp 指向 4 个字节; 返回按大端解析出的 32 位值.
+ */
 #if !HAVE_DECL_BE32DEC
 static inline uint32_t be32dec(const void *pp)
 {
@@ -17,6 +45,10 @@ static inline uint32_t be32dec(const void *pp)
 }
 #endif
 
+/*
+ * 32 位字转大端字节序写出(平台未提供时使用).
+ * pp 指向输出 4 字节; x 为待写值.
+ */
 #if !HAVE_DECL_BE32ENC
 static inline void be32enc(void *pp, uint32_t x)
 {
@@ -33,6 +65,10 @@ static inline void be32enc(void *pp, uint32_t x)
  * Encode a length len/4 vector of (uint32_t) into a length len vector of
  * (unsigned char) in big-endian form.  Assumes len is a multiple of 4.
  */
+/*
+ * 把 len 除以 4 个 32 位字按大端写成长度 len 的字节向量.
+ * dst: 输出字节; src: 输入字数组; len: 字节数(须为 4 的倍数).
+ */
 static void be32enc_vect(unsigned char *dst, const uint32_t *src, size_t len)
 {
 	size_t i;
@@ -45,6 +81,10 @@ static void be32enc_vect(unsigned char *dst, const uint32_t *src, size_t len)
  * Decode a big-endian length len vector of (unsigned char) into a length
  * len/4 vector of (uint32_t).  Assumes len is a multiple of 4.
  */
+/*
+ * 把大端字节向量解析成长度 len 除以 4 的 32 位字数组.
+ * dst: 输出字数组; src: 输入字节; len: 字节数(须为 4 的倍数).
+ */
 static void be32dec_vect(uint32_t *dst, const unsigned char *src, size_t len)
 {
 	size_t i;
@@ -54,6 +94,11 @@ static void be32dec_vect(uint32_t *dst, const unsigned char *src, size_t len)
 }
 
 /* Elementary functions used by SHA256 */
+/*
+ * SHA-256 基本运算宏.
+ * Ch 为选择函数, Maj 为多数函数, SHR 为逻辑右移, ROTR 为循环右移;
+ * S0 与 S1 为轮函数所用的 Sigma 变换, s0 与 s1 为消息扩展所用的 sigma 变换.
+ */
 #define Ch(x, y, z)     ((x & (y ^ z)) ^ z)
 #define Maj(x, y, z)    ((x & (y | z)) | (y & z))
 #define SHR(x, n)       (x >> n)
@@ -64,6 +109,11 @@ static void be32dec_vect(uint32_t *dst, const unsigned char *src, size_t len)
 #define s1(x)           (ROTR(x, 17) ^ ROTR(x, 19) ^ SHR(x, 10))
 
 /* SHA256 round function */
+/*
+ * SHA-256 轮函数宏.
+ * RND: 单轮运算, 用消息字与轮常数 k 参与, 更新工作变量 d 与 h.
+ * RNDr: 对状态数组 S 取旋转索引后的单轮运算, 供 64 轮依次调用.
+ */
 #define RND(a, b, c, d, e, f, g, h, k)                                         \
 	t0 = h + S1(e) + Ch(e, f, g) + k;                                      \
 	t1 = S0(a) + Maj(a, b, c);                                             \
@@ -79,6 +129,13 @@ static void be32dec_vect(uint32_t *dst, const unsigned char *src, size_t len)
 /*
  * SHA256 block compression function.  The 256-bit state is transformed via
  * the 512-bit input block to produce a new state.
+ */
+/*
+ * SHA-256 压缩函数.
+ * state: 8 个 32 位状态字; block: 一个 64 字节分块.
+ * 实现: 1) 用 be32dec_vect 与 s0 / s1 生成 64 字消息扩展 W;
+ *   2) 把状态复制到工作变量 S; 3) 执行 64 轮 RNDr; 4) 把 S 累加回 state;
+ *   5) 用 explicit_bzero 擦除栈上中间量.
  */
 static void SHA256_Transform(uint32_t *state, const unsigned char block[64])
 {
@@ -172,12 +229,21 @@ static void SHA256_Transform(uint32_t *state, const unsigned char block[64])
 	explicit_bzero(&t1, sizeof(t0));
 }
 
+/*
+ * 填充常量: 首字节 0x80, 其余全为 0. SHA256_Pad 时按需引用.
+ */
 static unsigned char PAD[64] = {
 	0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 	0,    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 	0,    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 
 /* Add padding and terminating bit-count. */
+/*
+ * 填充并写入终止的比特计数.
+ * ctx: 上下文.
+ * 步骤: 先把当前比特长度按大端编码成 8 字节; 再补 1 至 64 字节使长度满足
+ *   56 模 64; 最后追加那 8 字节长度.
+ */
 static void SHA256_Pad(SHA256_CTX *ctx)
 {
 	unsigned char len[8];
@@ -199,6 +265,11 @@ static void SHA256_Pad(SHA256_CTX *ctx)
 }
 
 /* SHA-256 initialization.  Begins a SHA-256 operation. */
+/*
+ * 初始化 SHA-256 上下文.
+ * ctx: 上下文.
+ * 比特计数清零, 并装载 8 个标准初始状态字(0x6A09E667 等).
+ */
 void SHA256_Init(SHA256_CTX *ctx)
 {
 
@@ -217,6 +288,11 @@ void SHA256_Init(SHA256_CTX *ctx)
 }
 
 /* Add bytes into the hash */
+/*
+ * 向 SHA-256 上下文追加数据(可多次调用).
+ * ctx: 上下文; in: 数据; len: 字节数.
+ * 副作用: 更新 64 位比特计数; 先补齐当前分块, 再对整块循环压缩, 余下拷入缓冲.
+ */
 void SHA256_Update(SHA256_CTX *ctx, const void *in, size_t len)
 {
 	uint32_t bitlen[2];
@@ -262,6 +338,11 @@ void SHA256_Update(SHA256_CTX *ctx, const void *in, size_t len)
  * SHA-256 finalization.  Pads the input data, exports the hash value,
  * and clears the context state.
  */
+/*
+ * 结束 SHA-256 计算并输出摘要.
+ * digest: 输出 32 字节; ctx: 上下文.
+ * 步骤: 填充; 把 8 个状态字按大端写出为 32 字节摘要; 最后清空上下文.
+ */
 void SHA256_Final(unsigned char digest[32], SHA256_CTX *ctx)
 {
 
@@ -276,6 +357,12 @@ void SHA256_Final(unsigned char digest[32], SHA256_CTX *ctx)
 }
 
 /* Initialize an HMAC-SHA256 operation with the given key. */
+/*
+ * 初始化 HMAC-SHA256.
+ * ctx: HMAC 上下文; _K: 密钥; Klen: 密钥长度.
+ * 说明: 密钥超过 64 字节时先摘要为 32 字节; 内层吸收 K 异或 0x36 的填充块,
+ *   外层吸收 K 异或 0x5c 的填充块; 结束时擦除栈上密钥散列.
+ */
 void HMAC__SHA256_Init(HMAC_SHA256_CTX *ctx, const void *_K, size_t Klen)
 {
 	unsigned char pad[64];
@@ -311,6 +398,10 @@ void HMAC__SHA256_Init(HMAC_SHA256_CTX *ctx, const void *_K, size_t Klen)
 }
 
 /* Add bytes to the HMAC-SHA256 operation. */
+/*
+ * 向 HMAC-SHA256 追加数据.
+ * 只喂给内层 SHA-256(ictx), 外层在 Final 时才吸收内层结果.
+ */
 void HMAC__SHA256_Update(HMAC_SHA256_CTX *ctx, const void *in, size_t len)
 {
 
@@ -319,6 +410,11 @@ void HMAC__SHA256_Update(HMAC_SHA256_CTX *ctx, const void *in, size_t len)
 }
 
 /* Finish an HMAC-SHA256 operation. */
+/*
+ * 结束 HMAC-SHA256 并输出认证码.
+ * digest: 输出 32 字节; ctx: 上下文.
+ * 实现: 取内层摘要后交给外层 SHA-256 完成, 结束时擦除栈上内层摘要.
+ */
 void HMAC__SHA256_Final(unsigned char digest[32], HMAC_SHA256_CTX *ctx)
 {
 	unsigned char ihash[32];
@@ -336,6 +432,13 @@ void HMAC__SHA256_Final(unsigned char digest[32], HMAC_SHA256_CTX *ctx)
 	explicit_bzero(ihash, 32);
 }
 
+/*
+ * PBKDF2 密钥派生, 使用 HMAC-SHA256 作为伪随机函数.
+ * passwd / passwdlen: 口令及长度; salt / saltlen: 盐及长度; c: 迭代次数;
+ * buf: 输出缓冲; dkLen: 期望派生字节数.
+ * 说明: 先对 HMAC(P, S) 状态做预计算并复用(PShctx)以减少重复; 每块做 c 次
+ *   迭代异或; 结束时擦除 PShctx.
+ */
 /**
  * PBKDF2_SHA256(passwd, passwdlen, salt, saltlen, c, buf, dkLen):
  * Compute PBKDF2(passwd, salt, c, dkLen) using HMAC-SHA256 as the PRF, and

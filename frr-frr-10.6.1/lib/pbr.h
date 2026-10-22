@@ -6,6 +6,32 @@
  *      Copyright (c) 2023 LabN Consulting, L.L.C.
  */
 
+/*
+ * 文件导读（lib/pbr.h）
+ *
+ * 本文件定义策略路由（Policy Based Routing，PBR）的核心数据结构与常量。
+ * PBR 允许按流特征（源 / 目的 IP、端口、协议、fwmark、DSCP、VLAN 等）
+ * 匹配报文，并执行非传统查表动作（指向指定路由表、设队列、改 DSCP、
+ * 丢弃等），是实现基于策略转发的基础。转发面实现仅支持 Linux。
+ *
+ * 核心数据结构：
+ *   - struct pbr_filter：匹配条件集合，filter_bm 位图标记哪些条件生效，
+ *     具体条件包括 IP / 端口 / 协议 / fwmark / DSCP / ECN / VLAN 等。
+ *   - struct pbr_action：命中后执行的动作，flags 位图标记生效动作，含
+ *     目标表、队列、VLAN 改写、源 / 目的地址改写、DSCP / ECN、丢弃等。
+ *   - struct pbr_rule：一条完整规则，即 filter 加 action 再加序号、优先级、
+ *     所属 VRF 与入接口。
+ *
+ * 大量 PBR_FILTER_* / PBR_ACTION_* / MATCH_* / TCP_HEADER_* 宏是上述位图
+ * 的取值，用于 zebra 与上层（如 bgpd flowspec）之间的编解码匹配。
+ *
+ * 与其他模块的关系：bgpd 的 flowspec 将其转换为 PBR 规则，经 zclient /
+ * ZAPI 下发给 zebra，由 zebra 落到 Linux 的规则与路由表。
+ *
+ * 阅读顺序：PBR_STR 宏 -> pbr_filter（含 filter 位图宏）-> pbr_action
+ * （含 action 位图宏）-> pbr_rule -> TCP / MATCH 宏 -> 两个编解码函数声明。
+ */
+
 #ifndef _PBR_H
 #define _PBR_H
 
@@ -17,6 +43,7 @@
 extern "C" {
 #endif
 
+/* PBR 的字符串常量，用于 CLI 帮助文本。 */
 #define PBR_STR "Policy Based Routing\n"
 
 /*
@@ -27,6 +54,9 @@ extern "C" {
  * than delineating further. A bitmask denotes which filters are actually
  * specified.
  */
+/* 一条 PBR 规则的匹配条件集合。filter_bm 的每个二进制位对应一个是否
+ * 生效的条件；下方 PBR_FILTER_* 即各条件对应的位。所有条件并列放在
+ * 一个结构里，避免再细分嵌套结构。 */
 struct pbr_filter {
 	uint32_t filter_bm;
 #define PBR_FILTER_SRC_IP         (1 << 0)
@@ -85,6 +115,9 @@ struct pbr_filter {
  * route table and the rule then point to that route table; in some cases,
  * the user criteria may directly point to a table too.
  */
+/* 一条 PBR 规则命中后执行的动作集合。flags 位图标记生效动作；Linux 转发
+ * 面要求把目标动作编码进一张路由表，再由规则指向该表；某些情况下用户
+ * 也可直接指定表号。 */
 struct pbr_action {
 	uint32_t flags;
 
@@ -128,6 +161,8 @@ struct pbr_action {
  * Rules also have a user-defined sequence number which defines the relative
  * order amongst rules.
  */
+/* 一条 PBR 规则 = 匹配条件 + 对应动作，另带用户自定义序号 seq（决定规则
+ * 之间的相对顺序）、priority、unique 标识、所属 VRF 与入接口名。 */
 struct pbr_rule {
 	vrf_id_t vrf_id;
 	uint8_t family; /* netlink: select which rule database */
@@ -141,6 +176,7 @@ struct pbr_rule {
 	char ifname[IFNAMSIZ + 1];
 };
 
+/* TCP 首部各标志位取值，见 RFC 793；TCP_HEADER_ALL_FLAGS 为其并集。 */
 /* TCP flags value shared
  * those are values of byte 13 of TCP header
  * as mentioned in rfc793
@@ -155,6 +191,8 @@ struct pbr_rule {
 			      | TCP_HEADER_RST | TCP_HEADER_PSH \
 			      | TCP_HEADER_ACK | TCP_HEADER_URG)
 
+/* 匹配条件位定义，BGP（flowspec）与 Zebra 之间共用；与 filter_bm 类似，
+ * 用于标记 IP / 端口 / DSCP / 协议 / 流标签等条件是否设置及其反义形式。 */
 /* Pbr IPTable defines
  * those are common flags shared between BGP and Zebra
  */
@@ -173,6 +211,8 @@ struct pbr_rule {
 #define MATCH_FLOW_LABEL_SET		(1 << 12)
 #define MATCH_FLOW_LABEL_INVERSE_SET	(1 << 13)
 
+/* PBR 规则的 ZAPI 编解码接口：encode 把规则写入流，decode 从流还原规则；
+ * 供 zclient 与 zebra 之间的消息收发使用。 */
 extern int zapi_pbr_rule_encode(struct stream *s, struct pbr_rule *r);
 extern bool zapi_pbr_rule_decode(struct stream *s, struct pbr_rule *r);
 

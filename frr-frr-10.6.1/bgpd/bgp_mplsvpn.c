@@ -2,6 +2,53 @@
 /* MPLS-VPN
  * Copyright (C) 2000 Kunihiro Ishiguro <kunihiro@zebra.org>
  */
+/* ============================================================================
+ * 【文件导读】bgp_mplsvpn.c —— BGP 的 MPLS VPN / BGP-LU 数据面：VPN NLRI 解析、
+ *              VRF<->VPN 双向路由泄漏(leak)、SRv6/MPLS 标签与 SID 处理
+ * ============================================================================
+ * 【职责与定位】
+ *   本文件处理 RFC4364 的 VPNv4/VPNv6(SAFI_MPLS_VPN)，是 bgp_mplsvpn.h 的实现，
+ *   并与 bgp_label.h（标签编解码/共享）、bgp_rd.h（RD）配套。它承担三块职责：
+ *     1) 收方向：bgp_nlri_parse_vpn() 把对端 UPDATE 里 "长度|标签|RD|前缀" 的
+ *        NLRI 解成 (前缀, RD, 标签) 并交给 bgp_update/bgp_withdraw。
+ *     2) 本地 VRF 与 VPN(全局)表之间的路由泄漏：vpn_leak_from_vrf_* 负责把 VRF
+ *        单播路由导出到 VPN 表(加 RD/RT/标签)；vpn_leak_to_vrf_* 负责把 VPN 表
+ *        路由按 RT 命中导入各 VRF。这是 "import vrf / export vpn" 的核心。
+ *     3) 与 zebra 交互的 MPLS/SRv6 数据面：为 VRF 申请出标签(per-vrf 或
+ *        per-nexthop)、SRv6 End.DT4/6/46 的 SID 分配与下发、以及 l3vpn 多域
+ *        转接(nexthop-label bind)的新标签分配。
+ *
+ * 【核心数据结构 / 关键概念】
+ *   - RD(Route Distinguisher, 8 字节)：VPN 表按 RD 再分一层子表，使不同 VPN 的
+ *     相同前缀互不冲突。VPN 前缀的 table key = (前缀, RD)。
+ *   - RT(Route Target)：扩展团体。导出时写入、导入时比较交集(ecommunity_include)
+ *     决定该 VPN 路由能否进入某 VRF。
+ *   - 标签：per-vrf(每个 VRF 一个出口标签) 或 per-nexthop(每个下一跳一个标签，用于
+ *     l3vpn 多域转接)。标签走 interned 共享，见 bgp_label.h。
+ *   - vrfleak 记录：挂在 bgp_path_info->extra->vrfleak，用 parent 指针把 "VPN 表中
+ *     的导入项" 与 "源 VRF 中的原始项" 关联，是判断是否需要撤回/更新的依据。
+ *   - SRv6：旁路 MPLS，用 SID (LOC:FUNC) 代替标签；本文件有 ensure/delete_vrf_tovpn_sid
+ *     及 srv6_sid_compose/transpose_sid 等，移植自 RFC9252 transposition 方案。
+ *
+ * 【本文件在主流程中的位置】
+ *   谁调它：bgp_route.c/bgp_packet.c 在收到 VPN UPDATE 时调 bgp_nlri_parse_vpn；
+ *           bgp_zebra.c / vty 配置变更时调 vpn_leak_*；zebra 回标签时调 *_cb 回调。
+ *   它调谁：bgp_update/bgp_withdraw（路由注入）、bgp_attr_intern（属性共享）、
+ *           bgp_afi_node_get/bgp_safi_node_lookup（表查询/插入）、
+ *           bgp_lp_get/bgp_vpn_lp_release（标签池）、
+ *           bgp_zebra_send_nexthop_label/zclient_send_vrf_label/zclient_send_localsid（下发）。
+ *
+ * 【易错点 / 阅读建议】
+ *   - 注意 leak 的 "parent" 关系与引用计数（bgp_path_info_lock / bgp_dest_lock_node）；
+ *     漏 unlock 会泄漏，误锁会 dangling。
+ *   - per-nexthop 标签的异步特性：申请是异步的，回调未返回前 label 为
+ *     MPLS_INVALID_LABEL，此时不导出，等回调再次触发。
+ *   - RD/RT 会比较字节序；RD 用 memcmp 直接比 8 字节 val。
+ *   建议阅读顺序：argv_find_and_parse_vpnvx → bgp_nlri_parse_vpn
+ *     → leak_update / leak_update_nexthop_valid（核心）→ vpn_leak_from_vrf_update
+ *     → vpn_leak_to_vrf_update_onevrf → 末尾的 nexthop-label-bind 与 show/init。
+ * ============================================================================
+ */
 
 #include <zebra.h>
 
@@ -46,8 +93,15 @@ DEFINE_MTYPE_STATIC(BGPD, MPLSVPN_NH_LABEL_BIND_CACHE,
 /*
  * Definitions and external declarations.
  */
+/* 【外部声明】bgp_zclient 是 bgpd 与 zebra 通信的客户端句柄（在 bgp_zebra.c 中
+ * 定义）。本文件所有 zclient_send_vrf_label / zclient_send_localsid 都经由它发出。 */
 extern struct zclient *bgp_zclient;
 
+/* 【函数】argv_find_and_parse_vpnvx —— 从命令行参数里识别 vpnv4/vpnv6 关键字。
+ * 参数：argv/argc 为 vty 命令词表；index 为输入输出参数，命中时回写该关键字的下标；
+ *       afi 为输出参数，命中 "vpnv4" 置 AFI_IP，命中 "vpnv6" 置 AFI_IP6。
+ * 返回：命中返回 1，否则 0。
+ * 调用时机：show 命令中解析 "<vpnv4|vpnv6>" 时使用；注意 afi 允许为 NULL，用前需判空。 */
 extern int argv_find_and_parse_vpnvx(struct cmd_token **argv, int argc,
 				     int *index, afi_t *afi)
 {
@@ -64,6 +118,20 @@ extern int argv_find_and_parse_vpnvx(struct cmd_token **argv, int argc,
 	return ret;
 }
 
+/* 【函数】bgp_nlri_parse_vpn —— 解析 VPNv4/VPNv6(SAFI_MPLS_VPN) 的 NLRI 列表。
+ * 参数：peer 报文来源；attr 非空表示 UPDATE(通告)，为空表示 WITHDRAW(撤销)；
+ *       packet 内 nlri/length 指向本段 NLRI 原始字节。
+ * 返回：BGP_NLRI_PARSE_ERROR_* 之一的错误码，成功返回 0。
+ * 调用时机：bgp_packet.c 解析 UPDATE 的 MP_REACH/MP_UNREACH 里 SAFI_MPLS_VPN 段时调用。
+ * 线上 NLRI 布局（每条，按顺序）：[AddPath ID(可选,4B)] 前缀长度(1B,单位bit)
+ *       → 标签(3B) → RD(8B) → 前缀字节(去掉标签+RD后的长度)。
+ * 关键点：
+ *   - 前缀长度单位是 bit，且最小值 = (标签3 + RD8)=11 字节 = 88 bit(VPN_PREFIXLEN_MIN_BYTES)。
+ *   - 真正的 IP 前缀长度 = prefixlen - 88，需再做多项边界检查防止越界读。
+ *   - 解出的标签用 bgp_set_valid_label() 置内部“有效”标记位，然后连同 RD 一起交给
+ *     bgp_update/bgp_withdraw（VPN 表的 key 由前缀 + RD 共同决定）。
+ *   - 使用 STREAM_GET* 宏，任一读取越界会 goto stream_failure。
+ * 易错点：psize 与 sizeof(p.u)/prefix_blen 的比较都是防溢出；这几处阈值不可随意放宽。 */
 int bgp_nlri_parse_vpn(struct peer *peer, struct attr *attr,
 		       struct bgp_nlri *packet)
 {
@@ -81,6 +149,8 @@ int bgp_nlri_parse_vpn(struct peer *peer, struct attr *attr,
 	uint32_t addpath_id;
 	int ret = 0;
 
+	/* 【中文补充】prd 是 RD 容器：prefixlen 固定 64(=8 字节)，family 置 AF_UNSPEC
+	 * 表示随后由 decode_rd_* 按 RD 类型填充；这里先初始化，避免残留脏值。 */
 	/* Make prefix_rd */
 	prd.family = AF_UNSPEC;
 	prd.prefixlen = 64;
@@ -93,6 +163,8 @@ int bgp_nlri_parse_vpn(struct peer *peer, struct attr *attr,
 
 	addpath_capable = bgp_addpath_encode_rx(peer, afi, safi);
 
+/* 【约定】VPN NLRI 里除 IP 前缀外固定含 3 字节标签 + 8 字节 RD，共 11 字节。
+ * 故“前缀长度”字段的最小值 = 11*8 = 88 bit；低于此值即为非法报文。 */
 #define VPN_PREFIXLEN_MIN_BYTES (3 + 8) /* label + RD */
 	while (STREAM_READABLE(data) > 0) {
 		/* Clear prefix structure. */
@@ -170,6 +242,8 @@ int bgp_nlri_parse_vpn(struct peer *peer, struct attr *attr,
 			goto done;
 		}
 
+		/* 【标签】取出 3 字节线上标签；立即置 FRR 内部“有效”标记位(见 bgp_label.h)，
+		 * 表示该标签已校验可接受，后续据此快速判断。 */
 		STREAM_GET(&label, data, BGP_LABEL_BYTES);
 		bgp_set_valid_label(&label);
 
@@ -184,6 +258,8 @@ int bgp_nlri_parse_vpn(struct peer *peer, struct attr *attr,
 		}
 		STREAM_GET(&prd.val, data, 8);
 
+		/* 【RD】拷贝 8 字节 RD 到 prd.val；首 2 字节是按类型编码的类型字段。
+		 * decode_rd_type 只取类型做 switch，具体解析由 decode_rd_as/ip 等完成。 */
 		/* Decode RD type. */
 		type = decode_rd_type(prd.val);
 
@@ -210,6 +286,8 @@ int bgp_nlri_parse_vpn(struct peer *peer, struct attr *attr,
 			break; /* just report */
 		}
 
+		/* 【前缀】真正的 IP 前缀长度 = 总长 - 88bit；u.val 只读入去掉标签+RD后的字节数。
+		 * 前面几处 sanity check 已保证 psize - 11 不超过 u 的容量与地址族最大位数。 */
 		/* exclude label & RD */
 		p.prefixlen = prefixlen - VPN_PREFIXLEN_MIN_BYTES * 8;
 		STREAM_GET(p.u.val, data, psize - VPN_PREFIXLEN_MIN_BYTES);
@@ -263,6 +341,28 @@ done:
  * for this vrf, which zebra interprets to mean "delete this vrf-label
  * association."
  */
+/* 【函数】vpn_leak_zebra_vrf_label_update —— 把本 VRF 的“出口(per-vrf)标签”下发
+ * 给 zebra，使内核对该 VRF 标记为 “pop 标签后按本 VRF 的 IP FIB 转发”。
+ * 参数：bgp 为 VRF 实例；afi 影响下发时携带的 AFI。
+ * 返回：无。副作用：更新 bgp->vpn_policy[afi].tovpn_zebra_vrf_label_last_sent 记录。
+ * 调用时机：VPN 导出配置就绪/路由器 ID 变化/postchange 等需要重新同步标签时。
+ * 关键分支：只有 vpn_leak_to_vpn_active() 为真且 VRF 回环口 up 时才带上真实标签，
+ *   否则发 MPLS_LABEL_NONE(=删除该 vrf-label 关联)。BGP_PREVENT_VRF_2_VRF_LEAK
+ *   是内部哨兵值，同样当作删除处理，防止 VRF 间误泄漏。 */
+/*
+ * This function informs zebra of the label this vrf sets on routes
+ * leaked to VPN. Zebra should install this label in the kernel with
+ * an action of "pop label and then use this vrf's IP FIB to route the PDU."
+ *
+ * Sending this vrf-label association is qualified by a) whether vrf->vpn
+ * exporting is active ("export vpn" is enabled, vpn-policy RD and RT list
+ * are set), b) whether vpn-policy label is set and c) the vrf loopback
+ * interface is up.
+ *
+ * If any of these conditions do not hold, then we send MPLS_LABEL_NONE
+ * for this vrf, which zebra interprets to mean "delete this vrf-label
+ * association."
+ */
 void vpn_leak_zebra_vrf_label_update(struct bgp *bgp, afi_t afi)
 {
 	struct interface *ifp;
@@ -296,6 +396,8 @@ void vpn_leak_zebra_vrf_label_update(struct bgp *bgp, afi_t afi)
 	bgp->vpn_policy[afi].tovpn_zebra_vrf_label_last_sent = label;
 }
 
+/* 【函数】vpn_leak_zebra_vrf_label_withdraw —— 通知 zebra 删除本 VRF 的出口标签关联
+ * （VRF 被反配置/删除时调用）。即发送 MPLS_LABEL_NONE，并同步 last_sent 记录。 */
 /*
  * If zebra tells us vrf has become unconfigured, tell zebra not to
  * use this label to forward to the vrf anymore
@@ -328,6 +430,11 @@ void vpn_leak_zebra_vrf_label_withdraw(struct bgp *bgp, afi_t afi)
  * leaked to VPN. Zebra should install this srv6-function in the kernel with
  * an action of "End.DT4/6's IP FIB to route the PDU."
  */
+/* 【函数】vpn_leak_zebra_vrf_sid_update_per_af —— per-AFI 的 SRv6 场景：把该 AFI 下
+ * 的 tovpn_sid 作为 End.DT4/DT6 localsid 下发给 zebra，让内核按 VRF 表做 SRv6 转发。
+ * 参数：bgp 为 VRF 实例；afi 决定行为端(END_DT4/END_DT6)。
+ * 关键点：未设 sid 或找不到 VRF/回环口则直接返回；下发成功后备份一份 sid 到
+ *   tovpn_zebra_vrf_sid_last_sent（供 tovpn 变更比较/撤回用）。 */
 void vpn_leak_zebra_vrf_sid_update_per_af(struct bgp *bgp, afi_t afi)
 {
 	int debug = BGP_DEBUG(vpn, VPN_LEAK_LABEL);
@@ -401,6 +508,8 @@ void vpn_leak_zebra_vrf_sid_update_per_af(struct bgp *bgp, afi_t afi)
  * leaked to VPN. Zebra should install this srv6-function in the kernel with
  * an action of "End.DT46's IP FIB to route the PDU."
  */
+/* 【函数】vpn_leak_zebra_vrf_sid_update_per_vrf —— per-VRF 的 SRv6 场景(END.DT46)，
+ * 与 per_af 版类似，但使用 bgp->tovpn_sid，行为端固定为 END_DT46。 */
 void vpn_leak_zebra_vrf_sid_update_per_vrf(struct bgp *bgp)
 {
 	int debug = BGP_DEBUG(vpn, VPN_LEAK_LABEL);
@@ -467,6 +576,8 @@ void vpn_leak_zebra_vrf_sid_update_per_vrf(struct bgp *bgp)
  * leaked to VPN. Zebra should install this srv6-function in the kernel with
  * an action of "End.DT4/6/46's IP FIB to route the PDU."
  */
+/* 【函数】vpn_leak_zebra_vrf_sid_update —— SRv6 SID 下发的分发入口：
+ * 若配置了 per-AFI SID 走 _per_af，否则若配置了 per-VRF SID 走 _per_vrf，否则只打印调试。 */
 void vpn_leak_zebra_vrf_sid_update(struct bgp *bgp, afi_t afi)
 {
 	int debug = BGP_DEBUG(vpn, VPN_LEAK_LABEL);
@@ -486,6 +597,8 @@ void vpn_leak_zebra_vrf_sid_update(struct bgp *bgp, afi_t afi)
  * If zebra tells us vrf has become unconfigured, tell zebra not to
  * use this srv6-function to forward to the vrf anymore
  */
+/* 【函数】vpn_leak_zebra_vrf_sid_withdraw_per_af —— 撤销 per-AFI 的 SRv6 localsid：
+ * 向 zebra 发 ZEBRA_ROUTE_DELETE，释放本地备份的 sid，并向 zebra 归还 SRv6 SID 资源。 */
 void vpn_leak_zebra_vrf_sid_withdraw_per_af(struct bgp *bgp, afi_t afi)
 {
 	int debug = BGP_DEBUG(vpn, VPN_LEAK_LABEL);
@@ -540,6 +653,8 @@ void vpn_leak_zebra_vrf_sid_withdraw_per_af(struct bgp *bgp, afi_t afi)
  * If zebra tells us vrf has become unconfigured, tell zebra not to
  * use this srv6-function to forward to the vrf anymore
  */
+/* 【函数】vpn_leak_zebra_vrf_sid_withdraw_per_vrf —— 撤销 per-VRF(END.DT46) 的 localsid，
+ * 与 per_af 版类似。 */
 void vpn_leak_zebra_vrf_sid_withdraw_per_vrf(struct bgp *bgp)
 {
 	int debug = BGP_DEBUG(vpn, VPN_LEAK_LABEL);
@@ -590,6 +705,8 @@ void vpn_leak_zebra_vrf_sid_withdraw_per_vrf(struct bgp *bgp)
  * If zebra tells us vrf has become unconfigured, tell zebra not to
  * use this srv6-function to forward to the vrf anymore
  */
+/* 【函数】vpn_leak_zebra_vrf_sid_withdraw —— 按“哪个 last_sent 非空”分别调用
+ * per_af / per_vrf 的撤销路径（两者都有备份时都会撤销）。 */
 void vpn_leak_zebra_vrf_sid_withdraw(struct bgp *bgp, afi_t afi)
 {
 	if (bgp->vpn_policy[afi].tovpn_zebra_vrf_sid_last_sent)
@@ -599,6 +716,15 @@ void vpn_leak_zebra_vrf_sid_withdraw(struct bgp *bgp, afi_t afi)
 		vpn_leak_zebra_vrf_sid_withdraw_per_vrf(bgp);
 }
 
+/* 【函数】vpn_leak_label_callback —— 标签池(LabelPool)异步分配“per-VRF 出口标签”
+ * 的回调。参数 labelid 实际是 struct vpn_policy *（含 afi/bgp 反指）。
+ * 参数：label 分配到的新标签；allocated=false 表示标签被回收/失效。
+ * 返回：0 表示接受(或无需处理)，非 0 表示拒绝本次分配。
+ * 调用时机：bgp_lp_get(LP_TYPE_VRF,...) 的异步结果回来时。
+ * 关键分支：
+ *   - 失效(allocated=false)且此前是 auto 分配：清 NONE 并 prechange/postchange 触发重算。
+ *   - 新分配但当前非 auto 模式：返回 -1 拒绝（可能配置已改）。
+ *   - 有标签且未分配过/同一标签：无需动作或用新值(prechange→改label→postchange)。 */
 int vpn_leak_label_callback(
 	mpls_label_t label,
 	void *labelid,
@@ -660,6 +786,9 @@ int vpn_leak_label_callback(
 	return 0;
 }
 
+/* 【函数】sid_register —— 记录本 bgp 实例已占用一个 SRv6 SID：把 (sid, locator_name)
+ * 打包成 bgp_srv6_function 追加到 bgp->srv6_functions 链表，供冲突检测( sid_exist )。
+ * 参数：bgp 通常为默认实例(bgp_get_default)；sid 为 16 字节 SID；locator_name 为所属 locator 名。 */
 void sid_register(struct bgp *bgp, const struct in6_addr *sid,
 		  const char *locator_name)
 {
@@ -672,11 +801,14 @@ void sid_register(struct bgp *bgp, const struct in6_addr *sid,
 	listnode_add(bgp->srv6_functions, func);
 }
 
+/* 【函数】srv6_function_free —— 释放一个 bgp_srv6_function 记录。 */
 void srv6_function_free(struct bgp_srv6_function *func)
 {
 	XFREE(MTYPE_BGP_SRV6_FUNCTION, func);
 }
 
+/* 【函数】sid_unregister —— 从 srv6_functions 链表中删除并释放与给定 sid 匹配的
+ * 记录（SID 被释放时调用）。注意使用了 _SAFE 遍历，因为循环内会删除节点。 */
 void sid_unregister(struct bgp *bgp, const struct in6_addr *sid)
 {
 	struct listnode *node, *nnode;
@@ -689,6 +821,8 @@ void sid_unregister(struct bgp *bgp, const struct in6_addr *sid)
 		}
 }
 
+/* 【函数】sid_exist —— 判断给定 SID 是否已被本实例占用（只读遍历 srv6_functions）。
+ * 供 srv6_sid_compose() 分配前做冲突检查，防止两个 VRF 分到同一 SID。 */
 static bool sid_exist(struct bgp *bgp, const struct in6_addr *sid)
 {
 	struct listnode *node;
@@ -700,6 +834,15 @@ static bool sid_exist(struct bgp *bgp, const struct in6_addr *sid)
 	return false;
 }
 
+/* 【函数】srv6_sid_compose —— 由 LOCATOR 前缀与 FUNCTION 部分组合出完整 SRv6 SID
+ * (布局 LOC:FUNC::)。参数 sid_value 为出参(SID 值)；locator 提供前缀与各段位宽；
+ * sid_func 为功能号。返回 true 成功。
+ * 关键概念（RFC9252 SID Transposition）：
+ *   - 若 function 位宽 <= 20bit，则把 FUNC 左移到 20bit 标签的最高位作为“标签”，
+ *     再按 transposition 方案摆放到 SID 中（该标签会随 SRv6 Service TLV 的 label
+ *     字段一起通告，见 vpn_leak_from_vrf_fill_srv6）。
+ *   - 位宽更大或 f3216/f4816 超出 16bit 时，直接把 FUNC 摆进 SID 的相应偏移。
+ *   - 组合前会用 sid_exist() 检查冲突、并核对 function 位宽不超过上限。 */
 /**
  * Return the SRv6 SID value obtained by composing the LOCATOR and FUNCTION.
  *
@@ -767,6 +910,7 @@ bool srv6_sid_compose(struct in6_addr *sid_value, struct srv6_locator *locator, 
 	 * Then, we compute the offset at which we have to place the function (FUNC).
 	 * FUNC will be placed immediately after LOC, i.e. at block_bits_length + node_bits_length
 	 */
+	/* FUNC 紧接 LOC 之后，偏移 = block + node 位宽（从 SID 最高位起算）。 */
 	offset = locator->block_bits_length + locator->node_bits_length;
 
 	if (store_in_label)
@@ -780,6 +924,7 @@ bool srv6_sid_compose(struct in6_addr *sid_value, struct srv6_locator *locator, 
 		 * Therefore, we need to encode the FUNC in the most significant bits of the
 		 * 20-bit label.
 		 */
+		/* 把 FUNC 左移到 20bit 标签的最高有效位（右对齐到 20bit 顶端）。 */
 		shift_len = BGP_PREFIX_SID_SRV6_MAX_FUNCTION_LENGTH_FOR_LABEL - func_len;
 		label = sid_func << shift_len;
 		if (label < MPLS_LABEL_UNRESERVED_MIN) {
@@ -800,6 +945,12 @@ bool srv6_sid_compose(struct in6_addr *sid_value, struct srv6_locator *locator, 
 	return true;
 }
 
+/* 【函数】ensure_vrf_tovpn_sid_per_af —— per-AFI 场景：为某 VRF 的某 AFI 申请/确保
+ * 一个发往 VPN 的出向 SRv6 SID。参数 bgp_vpn 为默认实例(提供 locator)，bgp_vrf 为
+ * 目标 VRF，afi 为目标地址族。
+ * 三种模式互斥：index-mode(tovpn_sid_index)、auto-mode(SID_AUTO)、explicit-mode(SID_EXPLICIT)。
+ * 关键点：已存在则跳过；按模式算/取 SID 后调 bgp_zebra_request_srv6_sid 向 zebra 申请
+ *   (异步，真正落地在回调里)。配置冲突/缺值/无 locator 等异常均提前 return。 */
 void ensure_vrf_tovpn_sid_per_af(struct bgp *bgp_vpn, struct bgp *bgp_vrf,
 				 afi_t afi)
 {
@@ -891,6 +1042,8 @@ void ensure_vrf_tovpn_sid_per_af(struct bgp *bgp_vpn, struct bgp *bgp_vrf,
 			   bgp_vrf->name_pretty, afi2str(afi), locator_bgp->name);
 }
 
+/* 【函数】ensure_vrf_tovpn_sid_per_vrf —— per-VRF 场景，为整个 VRF 申请一个
+ * END.DT46 的出向 SID（vrf_flags 上的 index/auto/explicit 模式）。逻辑与 per_af 版同构。 */
 void ensure_vrf_tovpn_sid_per_vrf(struct bgp *bgp_vpn, struct bgp *bgp_vrf)
 {
 	int debug = BGP_DEBUG(vpn, VPN_LEAK_FROM_VRF);
@@ -980,6 +1133,8 @@ void ensure_vrf_tovpn_sid_per_vrf(struct bgp *bgp_vpn, struct bgp *bgp_vrf)
 			   bgp_vrf->name_pretty, locator_bgp->name);
 }
 
+/* 【函数】ensure_vrf_tovpn_sid —— 分发：优先 per-AFI(若该 afi 启用 SRv6 VPN)，
+ * 否则 per-VRF(若整个 VRF 启用)。 */
 void ensure_vrf_tovpn_sid(struct bgp *bgp_vpn, struct bgp *bgp_vrf, afi_t afi)
 {
 	/* per-af sid */
@@ -991,6 +1146,9 @@ void ensure_vrf_tovpn_sid(struct bgp *bgp_vpn, struct bgp *bgp_vrf, afi_t afi)
 		return ensure_vrf_tovpn_sid_per_vrf(bgp_vpn, bgp_vrf);
 }
 
+/* 【函数】delete_vrf_tovpn_sid_per_af —— per-AFI 释放：仅当该 afi 不再配置任何
+ * index/auto/explicit 模式时才真正释放 SID、注销(sid_unregister)、释放 locator。
+ * 会向 zebra 归还 SRv6 SID 资源并清 BGP_VPN_POLICY_TOVPN_SID_FUNC_WIDE 标志。 */
 void delete_vrf_tovpn_sid_per_af(struct bgp *bgp_vpn, struct bgp *bgp_vrf,
 				 afi_t afi)
 {
@@ -1040,6 +1198,7 @@ void delete_vrf_tovpn_sid_per_af(struct bgp *bgp_vpn, struct bgp *bgp_vrf,
 	bgp_vrf->vpn_policy[afi].tovpn_sid_locator = NULL;
 }
 
+/* 【函数】delete_vrf_tovpn_sid_per_vrf —— per-VRF(END.DT46) 的释放路径，与 per_af 同构。 */
 void delete_vrf_tovpn_sid_per_vrf(struct bgp *bgp_vpn, struct bgp *bgp_vrf)
 {
 	int debug = BGP_DEBUG(vpn, VPN_LEAK_FROM_VRF);
@@ -1086,12 +1245,17 @@ void delete_vrf_tovpn_sid_per_vrf(struct bgp *bgp_vpn, struct bgp *bgp_vrf)
 	bgp_vrf->tovpn_sid_locator = NULL;
 }
 
+/* 【函数】delete_vrf_tovpn_sid —— 无条件调用 per_af 与 per_vrf 两个释放路径
+ * （各自内部会判断是否真的配置了对应模式）。 */
 void delete_vrf_tovpn_sid(struct bgp *bgp_vpn, struct bgp *bgp_vrf, afi_t afi)
 {
 	delete_vrf_tovpn_sid_per_af(bgp_vpn, bgp_vrf, afi);
 	delete_vrf_tovpn_sid_per_vrf(bgp_vpn, bgp_vrf);
 }
 
+/* 【函数】transpose_sid —— 把 label 的高 len 位写入 sid 中从 offset(以 MSB 为 0)起
+ * 的位置；len_max 为 label 的有效位宽。逐位操作：先把目标位清零，再按 label 的对应
+ * 位设置。注意 offset 以“从最高位起算”计，写入时换算成字节下标 tidx/8 与位 7-(tidx%8)。 */
 /*
  * This function embeds upper `len` bits of `label` in `sid`,
  * starting at offset `offset` as seen from the MSB of `sid`.
@@ -1129,6 +1293,15 @@ void transpose_sid(struct in6_addr *sid, uint32_t label, uint8_t offset, uint8_t
 	}
 }
 
+/* 【函数】leak_update_nexthop_valid —— 判断一条即将泄漏的路径其下一跳是否“有效”。
+ * 参数：to_bgp 目标实例；bn 目标节点；source_bpi 源路径；bpi 目标路径(可空)；p 前缀；
+ *       bgp_orig 源实例。返回 true 表示下一跳可达/有效，可置 BGP_PATH_VALID。
+ * 关键分支：
+ *   - 源实例 VRF 不存在或回环口 down ⇒ 无效。
+ *   - 重分发/Zebra 静态(network 命令)/聚合/EVPN/accepted-own 等特例：不走 NHT 或按标志定。
+ *   - 其余情况用 bgp_find_or_add_nexthop() 做下一跳跟踪(NHT)。
+ *   - 若启用了 SRv6 locator，还要再叠加 is_pi_srv6_valid() 的 SID 有效性判断。
+ * 易错点：这里对“重分发/静态/accepted-own”等直接判定有效，绕开了常规 NHT，是历史特例。 */
 static bool leak_update_nexthop_valid(struct bgp *to_bgp, struct bgp_dest *bn,
 				      struct attr *new_attr, afi_t afi,
 				      safi_t safi,
@@ -1217,6 +1390,23 @@ static bool leak_update_nexthop_valid(struct bgp *to_bgp, struct bgp_dest *bn,
 	return nh_valid;
 }
 
+/* 【函数】leak_update —— 泄漏核心：把 source_bpi 以 new_attr/标签的形式写入目标实例
+ * to_bgp 的某前缀节点 bn，存在则更新、不存在则新建一条 BGP_ROUTE_IMPORTED 路径。
+ * 参数：new_attr 已 interned 的属性(本函数接管其引用)；source_bpi 源路径；label/num_labels
+ *       标签栈；bgp_orig 源实例；nexthop_orig 保存的原始下一跳；nexthop_self_flag 是否自设下一跳。
+ * 返回：成功时返回目标 bgp_path_info*；无需变更/失败返回 NULL（NULL 时调用方负责 unlock bn）。
+ * 调用时机：vpn_leak_from_vrf_update / vpn_leak_to_vrf_update_onevrf 等泄漏路径。
+ * 关键分支与易错点：
+ *   - 先用 vrfleak->parent == source_bpi 在 bn 上找已存在的导入项；找到则比对
+ *     (标签是否相同 + attr 是否相同 + 下一跳有效性与现存 VALID 位是否一致)，全同则
+ *     释放 new_attr 并返回 NULL（“无变化”）。
+ *   - attr 变化时若 RT 扩展团体变了，会先把旧路径从各 VRF 隐式撤回。
+ *   - 更新路径时：标记 ATTR_CHANGED、替换 labels、按需置 ANNC_NH_SELF/ACCEPT_OWN、
+ *     重算 VALID 位，最后 bgp_process 触发下沉。
+ *   - 新建路径时：info_make(...BGP_ROUTE_IMPORTED...)，建立 vrfleak 关系(parent/bgp_orig/
+ *     nexthop_orig)、对 source 做引用计数(bgp_path_info_lock + bgp_dest_lock_node + bgp_lock)。
+ *   - SRv6 与 MPLS 路径互不覆盖（见循环里的 continue）。
+ *   - 注意 bn 的 lock/unlock：本函数某些返回路径已经对称 unlock，调用方不要再重复处理。 */
 /*
  * returns pointer to new bgp_path_info upon success
  */
@@ -1260,6 +1450,8 @@ leak_update(struct bgp *to_bgp, struct bgp_dest *bn,
 	 *
 	 */
 
+	/* 【匹配已有导入项】在 bn 上找“由 source_bpi 派生”的那条路径(vrfleak->parent 相等)。
+	 * 循环内还跳过 SRv6/MPLS 互相覆盖的情况，找不到则 bpi 为 NULL 走新建分支。 */
 	/*
 	 * match parent
 	 */
@@ -1311,6 +1503,8 @@ leak_update(struct bgp *to_bgp, struct bgp_dest *bn,
 			return NULL;
 		}
 
+		/* 【无变化判定】标签相同 + 未在删除 + 属性相同 + 下一跳有效性与现存一致
+		 * ⇒ 无需更新，释放新属性并返回 NULL。 */
 		if (labelssame && !CHECK_FLAG(bpi->flags, BGP_PATH_REMOVED) &&
 		    attrhash_cmp(bpi->attr, new_attr) &&
 		    leak_update_nexthop_valid(to_bgp, bn, new_attr, afi, safi, source_bpi, bpi,
@@ -1408,6 +1602,8 @@ leak_update(struct bgp *to_bgp, struct bgp_dest *bn,
 		return NULL;
 	}
 
+	/* 【新建导入项】以 BGP_ROUTE_IMPORTED 子类型建路径，peer 用 peer_self(本地)，
+	 * 随后建立 vrfleak 反向关系并对 source 引用计数。 */
 	new = info_make(ZEBRA_ROUTE_BGP, BGP_ROUTE_IMPORTED, 0,
 			to_bgp->peer_self, new_attr, bn);
 
@@ -1459,6 +1655,9 @@ leak_update(struct bgp *to_bgp, struct bgp_dest *bn,
 	return new;
 }
 
+/* 【函数】bgp_mplsvpn_path_nh_label_unlink —— 把一条路径从其 per-nexthop 标签缓存
+ * (blnc) 的 paths 链表上解绑：LIST_REMOVE、递减 path_count、清 pi 上的
+ * BGP_PATH_MPLSVPN_LABEL_NH 标志；若缓存已空则释放它。pi 为空或未绑定则直接返回。 */
 void bgp_mplsvpn_path_nh_label_unlink(struct bgp_path_info *pi)
 {
 	struct bgp_label_per_nexthop_cache *blnc;
@@ -1483,6 +1682,11 @@ void bgp_mplsvpn_path_nh_label_unlink(struct bgp_path_info *pi)
 		bgp_label_per_nexthop_free(blnc);
 }
 
+/* 【函数】bgp_mplsvpn_get_label_per_nexthop_cb —— zebra 回复“per-nexthop 出标签”
+ * 的异步回调(context=blnc)。allocated=false 表示老标签失效(置 MPLS_INVALID_LABEL)。
+ * 若标签真的变了：向 zebra 下发 <label → nexthop> 的 MPLS 绑定(ADD)，然后遍历该
+ * 缓存下的所有路径重新泄漏(vpn_leak_from_vrf_update)，使导出的标签得以刷新。
+ * 注意：label 未变化时直接返回，避免无谓的重复刷新。 */
 /* Called upon reception of a ZAPI Message from zebra, about
  * a new available label.
  */
@@ -1532,6 +1736,13 @@ static int bgp_mplsvpn_get_label_per_nexthop_cb(mpls_label_t label,
 	return 0;
 }
 
+/* 【函数】_vpn_leak_from_vrf_get_per_nexthop_label —— 取/申请某路径下一跳对应的
+ * per-nexthop 标签。逻辑：
+ *   - 从 pi->nexthop(BNC) 提取下一跳地址(区分递归/直连)，构造成 prefix。
+ *   - 在 from_bgp->mpls_labels_per_nexthop[afi] 树中查找 blnc；没有则新建并向
+ *     标签池申请标签(bgp_lp_get → 异步回调 bgp_mplsvpn_get_label_per_nexthop_cb)。
+ *   - 把 pi 绑定到 blnc(必要时先解绑旧的)，同步 nexthop；
+ *   - 首次返回的 label 可能是 MPLS_INVALID_LABEL(申请中)，调用方据此推迟导出。 */
 /* Get a per label nexthop value:
  *  - Find and return a per label nexthop from the cache
  *  - else allocate a new per label nexthop cache entry and request a
@@ -1619,6 +1830,9 @@ _vpn_leak_from_vrf_get_per_nexthop_label(struct bgp_path_info *pi,
 	return blnc->label;
 }
 
+/* 【函数】bgp_mplsvpn_get_vpn_label —— 取该 VRF/策略当前的“per-VRF 出口标签”。
+ * 若为 auto 模式且尚未分配，则发起异步申请(bgp_lp_get→vpn_leak_label_callback)并
+ * 返回 MPLS_INVALID_LABEL(调用方需等待回调)；否则返回已配置的 tovpn_label。 */
 static mpls_label_t bgp_mplsvpn_get_vpn_label(struct vpn_policy *bgp_policy)
 {
 	if (bgp_policy->tovpn_label == MPLS_LABEL_NONE &&
@@ -1630,6 +1844,11 @@ static mpls_label_t bgp_mplsvpn_get_vpn_label(struct vpn_policy *bgp_policy)
 	return bgp_policy->tovpn_label;
 }
 
+/* 【函数】vpn_leak_from_vrf_get_per_nexthop_label —— per-nexthop 标签模式的“守门”：
+ * 先排除所有不支持 per-nexthop 的场景（非法下一跳、IPV4/IPV6 无法用/为 any/非单播、
+ * ECMP/黑洞、network 静态等），这些一律回退到 per-VRF 标签(bgp_mplsvpn_get_vpn_label)；
+ * 下一跳无效时返回 MPLS_INVALID_LABEL(由回调稍后重试)；否则转入
+ * _vpn_leak_from_vrf_get_per_nexthop_label() 真正取/申请 per-nexthop 标签。 */
 /* Filter out all the cases where a per nexthop label is not possible:
  * - return an invalid label when the nexthop is invalid
  * - return the per VRF label when the per nexthop label is not supported
@@ -1744,6 +1963,13 @@ vpn_leak_from_vrf_get_per_nexthop_label(afi_t afi, struct bgp_path_info *pi,
 							afi);
 }
 
+/* 【函数】vpn_leak_from_vrf_fill_srv6 —— 若该 VRF 配置了 SRv6 VPN(per-AFI 或 per-VRF
+ * 的 locator+SID)，则为导出属性填充 SRv6 L3 Service 部分，并把派生出的“标签”
+ * (SID transposition 得到的 20bit 值)写入 *label。
+ * 返回 true 表示已填 SRv6(应走 SRv6 导出)，false 表示未配置 SRv6。
+ * 关键点：把 SID 的 block/node/func/arg 位宽、transposition 偏移与端点行为(END.DT4/6/46
+ * 及其 USID 变体)记入 attr->srv6_l3service；若 func 位宽超过 20bit 则不使用 label
+ * 承载 FUNC(transposition_len/offset 置 0，直接写整段 SID)。 */
 static bool vpn_leak_from_vrf_fill_srv6(struct attr *attr, struct bgp *from_bgp, afi_t afi,
 					mpls_label_t *label)
 {
@@ -1831,6 +2057,10 @@ static bool vpn_leak_from_vrf_fill_srv6(struct attr *attr, struct bgp *from_bgp,
 	return false;
 }
 
+/* 【函数】_vpn_leak_from_vrf_update_leak_attr —— VRF→VPN 导出的“落库”步骤：
+ * 把 static_attr intern 后写入 VPN 表(以 from_bgp 的 tovpn_rd 为 RD)，调用 leak_update
+ * 完成插入/更新；成功后还要把该 VPN 路由再“回灌”给所有 VRF(vpn_leak_to_vrf_update)，
+ * 因为它现在也源自 VPN 表了（能否被各 VRF 接受仍取决于 RT 交集）。 */
 static void _vpn_leak_from_vrf_update_leak_attr(struct attr *static_attr, struct bgp *to_bgp,
 						struct bgp *from_bgp, afi_t afi, safi_t safi,
 						struct bgp_path_info *path_vrf,
@@ -1863,6 +2093,18 @@ static void _vpn_leak_from_vrf_update_leak_attr(struct attr *static_attr, struct
 }
 
 /* cf vnc_import_bgp_add_route_mode_nvegroup() and add_vnc_route() */
+/* 【函数】vpn_leak_from_vrf_update —— VRF(或默认实例)→ VPN 表的单条路由导出入口。
+ * 参数：to_bgp 目标(通常是默认/VPN 实例)；from_bgp 源 VRF；path_vrf 待导出的源路径。
+ * 调用时机：VRF 路由产生/变化(路由下发、policy 变更、标签回调等)时由各处调用。
+ * 处理流程(顺序重要)：
+ *   1. 取 afi，检查是否可导出(is_route_injectable_into_vpn)、VPN 导出是否激活；
+ *   2. 聚合抑制检查；shallow copy 属性；合并/剥离 RT(VRF-2-VRF 时先剥 RT)；
+ *   3. 跑 tovpn route-map(可能 DENY)；校验必须含 RT；
+ *   4. 下一跳策略(vpn export nexthop 或自动 mp_nexthop)；取出口标签
+ *      (per-nexthop 或 per-VRF；MPLS_LABEL_NONE 时用 implicit-null)；
+ *   5. 置 originator-id 为自身；分别按 MPLS / SRv6 调用 _leak_attr 落库。
+ * 易错点：标签为 MPLS_INVALID_LABEL(申请中)时提前返回并 flush 临时属性，等回调重来；
+ *   末尾务必 bgp_attr_flush(&static_attr) 释放本地临时申请的部分。 */
 void vpn_leak_from_vrf_update(struct bgp *to_bgp,	     /* to */
 			      struct bgp *from_bgp,	   /* from */
 			      struct bgp_path_info *path_vrf) /* route */
@@ -2091,6 +2333,7 @@ void vpn_leak_from_vrf_update(struct bgp *to_bgp,	     /* to */
 		bgp_attr_flush(&static_attr);
 		return;
 	}
+	/* 【标签编码】label_val==NONE(未配置/回退)用 implicit-null；否则编码实际标签。 */
 	if (label_val == MPLS_LABEL_NONE)
 		encode_label(MPLS_LABEL_IMPLICIT_NULL, &label);
 	else
@@ -2125,6 +2368,10 @@ void vpn_leak_from_vrf_update(struct bgp *to_bgp,	     /* to */
 	bgp_attr_flush(&static_attr); /* free locally-allocated parts */
 }
 
+/* 【函数】vpn_leak_from_vrf_withdraw —— VRF→VPN 的单条路由撤回：在 VPN 表中按
+ * (前缀, from_bgp->tovpn_rd) 定位节点，遍历其上由 path_vrf 派生的导入项(parent==path_vrf)，
+ * 逐条先 vpn_leak_to_vrf_withdraw(从各 VRF 撤)再标记删除并 bgp_process。
+ * 仅导出仍处于激活态时才撤(此处用 ignore_export_rt_list=true 强制撤)。 */
 void vpn_leak_from_vrf_withdraw(struct bgp *to_bgp,		/* to */
 				struct bgp *from_bgp,		/* from */
 				struct bgp_path_info *path_vrf) /* route */
@@ -2201,6 +2448,9 @@ void vpn_leak_from_vrf_withdraw(struct bgp *to_bgp,		/* to */
 	bgp_dest_unlock_node(bn);
 }
 
+/* 【函数】vpn_leak_from_vrf_withdraw_all —— 批量撤回 from_bgp 导出到 VPN 表的所有路由：
+ * 遍历 VPN 表的 per-RD 子表，删除 bgp_orig==from_bgp 的 BGP_ROUTE_IMPORTED 项
+ * （同时从各 VRF 撤回、并解绑其 per-nexthop 标签）。 */
 void vpn_leak_from_vrf_withdraw_all(struct bgp *to_bgp, struct bgp *from_bgp,
 				    afi_t afi)
 {
@@ -2262,6 +2512,8 @@ void vpn_leak_from_vrf_withdraw_all(struct bgp *to_bgp, struct bgp *from_bgp,
 	}
 }
 
+/* 【函数】vpn_leak_from_vrf_update_all —— 把 from_bgp 单播表中的所有路径重新导出到
+ * VPN 表（postchange：如 RT/label 变化后全量刷新）。 */
 void vpn_leak_from_vrf_update_all(struct bgp *to_bgp, struct bgp *from_bgp,
 				  afi_t afi)
 {
@@ -2290,6 +2542,9 @@ void vpn_leak_from_vrf_update_all(struct bgp *to_bgp, struct bgp *from_bgp,
 	}
 }
 
+/* 【函数】bgp_lookup_by_rd —— 依据 RD 值在配置中反查“源 VRF”实例。
+ * 仅对带 ACCEPT_OWN 的路径有意义：遍历所有 VRF 实例，找其 vpn_policy[afi].tovpn_rd
+ * 与给定 rd 相同(逐字节 memcmp)的那个。用于 VRF-2-VRF 泄漏时确定来源 VRF。 */
 static struct bgp *bgp_lookup_by_rd(struct bgp_path_info *bpi,
 				    struct prefix_rd *rd, afi_t afi)
 {
@@ -2320,6 +2575,22 @@ static struct bgp *bgp_lookup_by_rd(struct bgp_path_info *bpi,
 	return NULL;
 }
 
+/* 【函数】vpn_leak_to_vrf_update_onevrf —— VPN 表 → 单个目标 VRF 的导入核心。
+ * 参数：to_bgp 目标 VRF；from_bgp VPN 实例；path_vpn 源 VPN 路径；prd 其 RD；from 来源 peer。
+ * 返回：无。调用时机：vpn_leak_to_vrf_update 遍历所有 VRF 时对每个目标调用。
+ * 主要步骤：
+ *   1. 确认目标可导入(vpn_leak_from_vpn_active)；确定源 VRF(src_vrf：优先 vrfleak->bgp_orig，
+ *      否则 ACCEPT_OWN 反查 src_bgp，再否则 from_bgp)；
+ *   2. RT 交集检查(ecommunity_include)，未命中直接跳过；
+ *   3. accepted-own 防回环：RD 与目标自身 RD 相同则拒绝导入；
+ *   4. allowas-in 处理：若 AS_PATH 中已有本 AS 且超出允许次数，则撤销已导入项并返回；
+ *   5. shallow copy 属性，VRF-2-VRF 时剥离 RT；
+ *   6. 预判下一跳有效性设 NH_VALID；暂存并清零下一跳(改写成 “me”)，按需把 nh_ifindex
+ *      改写为目标 VRF 回环口；
+ *   7. 跑 fromvpn route-map；按需补 AS_PATH(源 VRF 的 AS)以助回环检测；
+ *   8. intern 属性；决定是否带标签(来源为本地单播则不带标签)；leak_update 落库。
+ * 易错点：标签拷贝的 origin_local 特例——若是本机另一 VRF 原创(未过 VPN)，走 IP 转发无 LSP，
+ *   故导入 VRF 的这条不应挂标签；这也影响 NHT 对非标签下一跳的判定。 */
 static void vpn_leak_to_vrf_update_onevrf(struct bgp *to_bgp,	/* to */
 					  struct bgp *from_bgp, /* from */
 					  struct bgp_path_info *path_vpn, struct prefix_rd *prd,
@@ -2486,6 +2757,8 @@ static void vpn_leak_to_vrf_update_onevrf(struct bgp *to_bgp,	/* to */
 	else
 		UNSET_FLAG(static_attr.nh_flags, BGP_ATTR_NH_VALID);
 
+	/* 【下一跳处理】VPN 里的下一跳在核心网有效、但在目标 VRF 里无意义：先暂存原始
+	 * 下一跳(nexthop_orig)供后续按标签解析，再把通告用下一跳改写成 0(=me)。 */
 	/*
 	 * Nexthop: stash and clear
 	 *
@@ -2614,6 +2887,9 @@ static void vpn_leak_to_vrf_update_onevrf(struct bgp *to_bgp,	/* to */
 	new_attr = bgp_attr_intern(&static_attr);
 	bgp_attr_flush(&static_attr);
 
+	/* 【标签拷贝策略】非 VRF-2-VRF 导入时：若源路径的本源是单播表(即本机另一 VRF 原创、
+	 * 未经 VPN)，则走纯 IP 转发无 LSP，故导入 VRF 的这条不带标签(num_labels=0)；
+	 * 否则按源 VPN 路径的标签数拷贝。 */
 	/*
 	 * ensure labels are copied
 	 *
@@ -2655,6 +2931,10 @@ static void vpn_leak_to_vrf_update_onevrf(struct bgp *to_bgp,	/* to */
 		bgp_dest_unlock_node(bn);
 }
 
+/* 【函数】vpn_leak_to_vrf_no_retain_filter_check —— 判断某条 VPN 属性是否“无人需要”
+ * （应当过滤掉、不保留）。遍历所有目标 VRF，只要有一个 VRF 可导入且 RT 命中，就
+ * 返回 false(需要)；全部不命中则返回 true(可过滤)。用于 no-retain 优化：源实例删除时
+ * 把没人要的 VPN 路由清理掉。 */
 bool vpn_leak_to_vrf_no_retain_filter_check(struct bgp *from_bgp,
 					    struct attr *attr, afi_t afi)
 {
@@ -2701,6 +2981,9 @@ bool vpn_leak_to_vrf_no_retain_filter_check(struct bgp *from_bgp,
 	return true;
 }
 
+/* 【函数】vpn_leak_to_vrf_update —— VPN 表路由变化时，向所有 VRF 扩散更新：
+ * 遍历 bm->bgp 中的每个实例，跳过“正是其来源实例”(避免回环)，其余逐个调用
+ * vpn_leak_to_vrf_update_onevrf 让它们按 RT 决定是否导入。prd/peer 透传。 */
 void vpn_leak_to_vrf_update(struct bgp *from_bgp, struct bgp_path_info *path_vpn,
 			    struct prefix_rd *prd, struct peer *peer)
 {
@@ -2722,6 +3005,9 @@ void vpn_leak_to_vrf_update(struct bgp *from_bgp, struct bgp_path_info *path_vpn
 	}
 }
 
+/* 【函数】vpn_leak_to_vrf_withdraw —— VPN 路由被删除时，从所有导入了它的 VRF 中撤掉：
+ * 遍历所有实例，对可导入且 RT 命中的 VRF，在其单播表中找到 parent==path_vpn 的导入项
+ * 并标记删除+process。path_vpn->net 为空(特定 VNC 场景除外)则直接返回。 */
 void vpn_leak_to_vrf_withdraw(struct bgp_path_info *path_vpn)
 {
 	const struct prefix *p;
@@ -2807,6 +3093,8 @@ void vpn_leak_to_vrf_withdraw(struct bgp_path_info *path_vpn)
 	}
 }
 
+/* 【函数】vpn_leak_to_vrf_withdraw_all —— 清空某 VRF 中“来自 VPN”的所有导入项：
+ * 遍历其单播表，删除 bgp_orig != to_bgp 且 parent 属于 VPN 族(is_pi_family_vpn)的路径。 */
 void vpn_leak_to_vrf_withdraw_all(struct bgp *to_bgp, afi_t afi)
 {
 	struct bgp_dest *bn;
@@ -2838,6 +3126,9 @@ void vpn_leak_to_vrf_withdraw_all(struct bgp *to_bgp, afi_t afi)
 	}
 }
 
+/* 【函数】vpn_leak_no_retain —— no-retain 优化：遍历 VPN 表，把没有任何 VRF 需要
+ * (no_retain_filter_check 为真)、且非本机原创(bgp_orig != to_bgp)的普通 BGP 路由
+ * 从 VPN 表里移除(rib_remove)，以免在源 VRF 删除后留下无人认领的残留。 */
 void vpn_leak_no_retain(struct bgp *to_bgp, struct bgp *vpn_from, afi_t afi)
 {
 	struct bgp_dest *pdest;
@@ -2885,6 +3176,8 @@ void vpn_leak_no_retain(struct bgp *to_bgp, struct bgp *vpn_from, afi_t afi)
 	}
 }
 
+/* 【函数】vpn_leak_to_vrf_update_all —— postchange 全量导入：遍历 VPN 表所有路由，
+ * 对每个非本机原创项调用 vpn_leak_to_vrf_update_onevrf 重新导入到 to_bgp。 */
 void vpn_leak_to_vrf_update_all(struct bgp *to_bgp, struct bgp *vpn_from,
 				afi_t afi)
 {
@@ -2923,6 +3216,10 @@ void vpn_leak_to_vrf_update_all(struct bgp *to_bgp, struct bgp *vpn_from,
 	}
 }
 
+/* 【函数】vpn_policy_routemap_update —— 路由映射被定义/删除/变更时的响应：
+ * 对默认/VRF 实例，若 rmap_name 命中其 tovpn 或 fromvpn 的 policy 路由映射名，
+ * 先 vpn_leak_prechange 撤销旧效果，再更新保存的 rmap 指针(可为 NULL 表示已删)，
+ * 最后 vpn_leak_postchange 应用新效果。保证路由映射改动即时生效。 */
 /*
  * This function is called for definition/deletion/change to a route-map
  */
@@ -2995,6 +3292,14 @@ static void vpn_policy_routemap_update(struct bgp *bgp, const char *rmap_name)
 	}
 }
 
+/* 【函数】vpn_handle_router_id_update —— router-id 变化时维护 VPN 的 auto RD/RT 并
+ * 重通告。参数：withdraw=true 表示撤回阶段；is_config 表示是否显式配置触发。
+ * 关键点：
+ *   - 非显式(如 zebra 引起)的 router-id 变化直接忽略，避免覆盖已配置的 RD/RT。
+ *   - withdraw 阶段：从各导入 VRF 的 import RT 列表中删除本 VRF 导出的 RT。
+ *   - 新建阶段：用新 router_id 生成 auto RD(未手工设置时采用)、重建导出 RT 列表，
+ *     并把该 RT 合并进各导入 VRF 的 import RT 列表，最后 postchange 重通告。
+ * 注意：只对 AFI_IP/AFI_IP6 且 vpn 导出激活的实例执行。 */
 /* This API is used during router-id change, reflect VPNs
  * auto RD and RT values and readvertise routes to VPN table.
  */
@@ -3111,6 +3416,9 @@ void vpn_handle_router_id_update(struct bgp *bgp, bool withdraw,
 	}
 }
 
+/* 【函数】vpn_policy_routemap_event —— 路由映射事件的对外入口：遍历所有 bgp 实例，
+ * 逐个调用 vpn_policy_routemap_update 让其检查是否有策略引用该 rmap_name。
+ * 注意 bm->bgp 可能为 NULL(清理阶段)时需提前返回。 */
 void vpn_policy_routemap_event(const char *rmap_name)
 {
 	int debug = BGP_DEBUG(vpn, VPN_LEAK_RMAP_EVENT);
@@ -3127,6 +3435,12 @@ void vpn_policy_routemap_event(const char *rmap_name)
 		vpn_policy_routemap_update(bgp, rmap_name);
 }
 
+/* 【函数】vrf_import_from_vrf —— 配置 “import vrf <name>” 时建立 VRF 间导入关系：
+ * 在 to_bgp 的 import_vrf 列表登记来源名，标记 BGP_CONFIG_VRF_TO_VRF_IMPORT；若 from_bgp
+ * 存在，则在 from_bgp 的 export_vrf 列表登记本实例，并在“首次导出”时为其生成 auto RD/RT
+ * (同时置 RD_SET、VRF_TO_VRF_EXPORT、tovpn_label=BGP_PREVENT_VRF_2_VRF_LEAK 防真标签泄漏)；
+ * 最后把导出 RT 合并进 to_bgp 的 import RT 列表并触发 prechange/postchange。
+ * 易错点：首次导出走 edir(让 from_bgp 先去导出)，否则走 idir(直接导入)。 */
 void vrf_import_from_vrf(struct bgp *to_bgp, struct bgp *from_bgp, const char *import_name,
 			 afi_t afi, safi_t safi)
 {
@@ -3265,6 +3579,11 @@ void vrf_import_from_vrf(struct bgp *to_bgp, struct bgp *from_bgp, const char *i
 		vpn_leak_postchange(idir, afi, bgp_get_default(), to_bgp);
 }
 
+/* 【函数】vrf_unimport_from_vrf —— 拆除 “import vrf <name>” 关系：
+ * 从 to_bgp 的 import_vrf 删名并撤掉已导入的路由(prechange)；若 import 列表已空，
+ * 清 BGP_CONFIG_VRF_TO_VRF_IMPORT 与 import RT 列表；否则只从 import RT 列表删掉该来源 RT。
+ * 再从 from_bgp 的 export_vrf 删名；若其导出列表已空，则清 RD/RT/EXPORT 标志与 tovpn_label。
+ * 注意多处 vname 为 NULL 的安全判断（配置与实例状态可能不一致）。 */
 void vrf_unimport_from_vrf(struct bgp *to_bgp, struct bgp *from_bgp, const char *import_name,
 			   afi_t afi, safi_t safi)
 {
@@ -3381,6 +3700,9 @@ void vrf_unimport_from_vrf(struct bgp *to_bgp, struct bgp *from_bgp, const char 
 	}
 }
 
+/* 【命令】network A.B.C.D/M rd ASN:NN... <tag|label> (0-1048575) —— 在 VPNv4 地址族
+ * 下手工配置一条带 RD 与标签的静态 VPN 网络，内部交给 bgp_static_set 处理。
+ * argv 索引：1=前缀，3=RD，5=标签值。 */
 /* For testing purpose, static route of MPLS-VPN. */
 DEFUN (vpnv4_network,
        vpnv4_network_cmd,
@@ -3403,6 +3725,8 @@ DEFUN (vpnv4_network,
 			      0, 0, 0, NULL, NULL, NULL, NULL);
 }
 
+/* 【命令】vpnv4 network ... route-map RMAP_NAME —— 同上，但额外关联一个 route-map，
+ * 用于对导入/导出该静态 VPN 路由时施加策略(argv 索引 7=RMAP)。 */
 DEFUN (vpnv4_network_route_map,
        vpnv4_network_route_map_cmd,
        "network A.B.C.D/M rd ASN:NN_OR_IP-ADDRESS:NN <tag|label> (0-1048575) route-map RMAP_NAME",
@@ -3427,6 +3751,7 @@ DEFUN (vpnv4_network_route_map,
 			      0, NULL, NULL, NULL, NULL);
 }
 
+/* 【命令】no vpnv4 network ... —— 删除上面配置的静态 VPN 路由(argv 索引 2/4/6)。 */
 /* For testing purpose, static route of MPLS-VPN. */
 DEFUN (no_vpnv4_network,
        no_vpnv4_network_cmd,
@@ -3450,6 +3775,8 @@ DEFUN (no_vpnv4_network,
 			      0, 0, 0, NULL, NULL, NULL, NULL);
 }
 
+/* 【命令】vpnv6 network X:X::X:X/M rd ... [route-map RMAP_NAME] —— VPNv6 的静态
+ * 网络配置；route-map 为可选(argc==8 时带) 。 */
 DEFUN (vpnv6_network,
        vpnv6_network_cmd,
        "network X:X::X:X/M rd ASN:NN_OR_IP-ADDRESS:NN <tag|label> (0-1048575) [route-map RMAP_NAME]",
@@ -3482,6 +3809,7 @@ DEFUN (vpnv6_network,
 				      NULL, NULL);
 }
 
+/* 【命令】no vpnv6 network ... —— 删除 VPNv6 静态网络。 */
 /* For testing purpose, static route of MPLS-VPN. */
 DEFUN (no_vpnv6_network,
        no_vpnv6_network_cmd,
@@ -3505,6 +3833,9 @@ DEFUN (no_vpnv6_network,
 			      NULL, 0, 0, 0, NULL, NULL, NULL, NULL);
 }
 
+/* 【函数】bgp_show_mpls_vpn —— “show bgp ... vpn ...” 的公共实现：取默认实例的
+ * VPN 表(rib[afi][SAFI_MPLS_VPN])，按可选 RD 过滤与 type(普通/邻居等)转交
+ * bgp_show_table_rd 输出。无 BGP 进程时给出提示/空 JSON。tags 控制是否显示标签。 */
 int bgp_show_mpls_vpn(struct vty *vty, afi_t afi, struct prefix_rd *prd,
 		      enum bgp_show_type type, void *output_arg, int tags,
 		      bool use_json)
@@ -3529,6 +3860,7 @@ int bgp_show_mpls_vpn(struct vty *vty, afi_t afi, struct prefix_rd *prd,
 				 output_arg, show_flags);
 }
 
+/* 【命令】show bgp <afi> vpn all [rd <..|all>] [json] —— 展示 VPN 表；可指定 RD。 */
 DEFUN (show_bgp_ip_vpn_all_rd,
        show_bgp_ip_vpn_all_rd_cmd,
        "show bgp "BGP_AFI_CMD_STR" vpn all [rd <ASN:NN_OR_IP-ADDRESS:NN|all>] [json]",
@@ -3569,6 +3901,7 @@ DEFUN (show_bgp_ip_vpn_all_rd,
 	return CMD_SUCCESS;
 }
 
+/* 【别名】show bgp <afi> vpn rd <..|all> [json] —— 与上面的 all_rd 同一实现。 */
 ALIAS(show_bgp_ip_vpn_all_rd,
       show_bgp_ip_vpn_rd_cmd,
        "show bgp "BGP_AFI_CMD_STR" vpn rd <ASN:NN_OR_IP-ADDRESS:NN|all> [json]",
@@ -3581,7 +3914,10 @@ ALIAS(show_bgp_ip_vpn_all_rd,
        "All VPN Route Distinguishers\n"
        JSON_STR)
 
+/* 【旧命令兼容】以下 show 命令为兼容旧 CLI(ip bgp 前缀、vpnv4/vpnv6 关键字)保留，
+ * 仅在编译期定义 KEEP_OLD_VPN_COMMANDS 时生效；逻辑与上方新命令等价。 */
 #ifdef KEEP_OLD_VPN_COMMANDS
+/* 【命令】show ip bgp <vpnv4|vpnv6> rd <..|all> —— 按 RD 展示 VPN 表(旧版语法)。 */
 DEFUN (show_ip_bgp_vpn_rd,
        show_ip_bgp_vpn_rd_cmd,
        "show ip bgp "BGP_AFI_CMD_STR" vpn rd <ASN:NN_OR_IP-ADDRESS:NN|all>",
@@ -3616,6 +3952,7 @@ DEFUN (show_ip_bgp_vpn_rd,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】show [ip] bgp <vpnv4|vpnv6> —— 展示全部 VPN 路由(旧版语法)。 */
 DEFUN (show_ip_bgp_vpn_all,
        show_ip_bgp_vpn_all_cmd,
        "show [ip] bgp <vpnv4|vpnv6>",
@@ -3633,6 +3970,7 @@ DEFUN (show_ip_bgp_vpn_all,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】show [ip] bgp <vpnv4|vpnv6> all tags —— 展示全部 VPN 路由并显示标签。 */
 DEFUN (show_ip_bgp_vpn_all_tags,
        show_ip_bgp_vpn_all_tags_cmd,
        "show [ip] bgp <vpnv4|vpnv6> all tags",
@@ -3652,6 +3990,7 @@ DEFUN (show_ip_bgp_vpn_all_tags,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】show [ip] bgp <vpnv4|vpnv6> rd <..|all> tags —— 按 RD 展示并显示标签。 */
 DEFUN (show_ip_bgp_vpn_rd_tags,
        show_ip_bgp_vpn_rd_tags_cmd,
        "show [ip] bgp <vpnv4|vpnv6> rd <ASN:NN_OR_IP-ADDRESS:NN|all> tags",
@@ -3686,6 +4025,8 @@ DEFUN (show_ip_bgp_vpn_rd_tags,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】show [ip] bgp <vpnv4|vpnv6> all neighbors A.B.C.D routes —— 展示某邻居
+ * 通告给本端的全部 VPN 路由(按邻居过滤)。 */
 DEFUN (show_ip_bgp_vpn_all_neighbor_routes,
        show_ip_bgp_vpn_all_neighbor_routes_cmd,
        "show [ip] bgp <vpnv4|vpnv6> all neighbors A.B.C.D routes [json]",
@@ -3747,6 +4088,8 @@ DEFUN (show_ip_bgp_vpn_all_neighbor_routes,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】show [ip] bgp <vpnv4|vpnv6> rd <..|all> neighbors A.B.C.D routes ——
+ * 按 RD 与邻居过滤展示 VPN 路由。 */
 DEFUN (show_ip_bgp_vpn_rd_neighbor_routes,
        show_ip_bgp_vpn_rd_neighbor_routes_cmd,
        "show [ip] bgp <vpnv4|vpnv6> rd <ASN:NN_OR_IP-ADDRESS:NN|all> neighbors A.B.C.D routes [json]",
@@ -3841,6 +4184,8 @@ DEFUN (show_ip_bgp_vpn_rd_neighbor_routes,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】show [ip] bgp <vpnv4|vpnv6> all neighbors A.B.C.D advertised-routes ——
+ * 展示本端向某邻居通告的全部 VPN 路由。 */
 DEFUN (show_ip_bgp_vpn_all_neighbor_advertised_routes,
        show_ip_bgp_vpn_all_neighbor_advertised_routes_cmd,
        "show [ip] bgp <vpnv4|vpnv6> all neighbors A.B.C.D advertised-routes [json]",
@@ -3900,6 +4245,8 @@ DEFUN (show_ip_bgp_vpn_all_neighbor_advertised_routes,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】show [ip] bgp <vpnv4|vpnv6> rd <..|all> neighbors A.B.C.D advertised-routes ——
+ * 按 RD 过滤展示向某邻居通告的 VPN 路由。 */
 DEFUN (show_ip_bgp_vpn_rd_neighbor_advertised_routes,
        show_ip_bgp_vpn_rd_neighbor_advertised_routes_cmd,
        "show [ip] bgp <vpnv4|vpnv6> rd <ASN:NN_OR_IP-ADDRESS:NN|all> neighbors A.B.C.D advertised-routes [json]",
@@ -3985,6 +4332,8 @@ DEFUN (show_ip_bgp_vpn_rd_neighbor_advertised_routes,
 }
 #endif /* KEEP_OLD_VPN_COMMANDS */
 
+/* 【函数】bgp_mplsvpn_init —— 模块初始化：把 network 命令注册到 VPNv4/VPNv6 节点，
+ * 并把各 show 命令注册到 VIEW 节点（旧命令按宏条件注册）。 */
 void bgp_mplsvpn_init(void)
 {
 	install_element(BGP_VPNV4_NODE, &vpnv4_network_cmd);
@@ -4010,6 +4359,10 @@ void bgp_mplsvpn_init(void)
 #endif /* KEEP_OLD_VPN_COMMANDS */
 }
 
+/* 【函数】get_first_vrf_for_redirect_with_rt —— 给定目标 RT(扩展团体)，找出第一个
+ * 在其 import_redirect_rtlist 中包含该 RT 的 VRF 实例，返回其 vrf_id；没有返回 VRF_UNKNOWN。
+ * 用于 EVPN/redirect 场景按 RT 定位应重定向到的 VRF。eckey 的 unit_size 可能是 IPv6
+ * 扩展团体，据此选择 afi。 */
 vrf_id_t get_first_vrf_for_redirect_with_rt(struct ecommunity *eckey)
 {
 	struct listnode *mnode, *mnnode;
@@ -4036,6 +4389,11 @@ vrf_id_t get_first_vrf_for_redirect_with_rt(struct ecommunity *eckey)
 	return VRF_UNKNOWN;
 }
 
+/* 【函数】vpn_leak_postchange_all —— 处理“因默认实例尚未创建而延后”的泄漏：
+ * 当默认实例("router bgp NNN")刚建立时被调用。分两趟遍历 VRF 实例：
+ *   第一趟对每个非自动 VRF 执行 tovpn postchange(导出到 VPN)；
+ *   第二趟执行 fromvpn postchange(从 VPN 导入)。
+ * 这样先前仅配置了 VRF 内 rd/rt 的场景在默认实例出现后能一次性生效。 */
 /*
  * The purpose of this function is to process leaks that were deferred
  * from earlier per-vrf configuration due to not-yet-existing default
@@ -4105,6 +4463,11 @@ void vpn_leak_postchange_all(void)
 	}
 }
 
+/* 【函数】bgp_vpn_leak_unimport —— bgp vrf 实例被反配置时清理泄漏关系：
+ * 对每个 afi(仅 IP/IPv6 单播)，遍历其他实例，若其 import_vrf 列表含本实例名，
+ * 则拆掉该导入关系(vrf_unimport_from_vrf)后把名字加回(配置仍在)，并处理本实例
+ * 被别的 VRF 导出时的情况；最后若默认实例未配置 retain RT all，则对本实例执行
+ * vpn_leak_no_retain 清理其残留在 VPN 表里的路由。 */
 /* When a bgp vrf instance is unconfigured, remove its routes
  * from the VPN table and this vrf could be importing routes from other
  * bgp vrf instances, unimport them.
@@ -4210,6 +4573,9 @@ void bgp_vpn_leak_unimport(struct bgp *from_bgp)
 	return;
 }
 
+/* 【函数】bgp_vpn_leak_export —— 新建 router bgp(vrf) 实例时，若已有 VRF 声明从它导入，
+ * 则把这些导入关系正式建立：遍历各实例的 import_vrf，命中本实例名者，调整 import RT
+ * 后调用 vrf_import_from_vrf 重新导入（并导出本实例路由）。 */
 /* When a router bgp is configured, there could be a bgp vrf
  * instance importing routes from this newly configured
  * bgp vrf instance. Export routes from configured
@@ -4280,6 +4646,9 @@ void bgp_vpn_leak_export(struct bgp *from_bgp)
 	}
 }
 
+/* 【函数】bgp_vpn_release_label —— 释放先前自动分配的 per-VRF 出口标签，并(可选)复位
+ * auto 模式标志。非 auto 模式、标签为 NONE(分配在途)、或处于 per-nexthop 模式时均直接返回
+ * (这些情况由各自路径负责)。vty 中改分配模式时也调用本函数。 */
 /* It releases the label from labelpool which
  * was previously assigned and unsets the flag based on reset arg
  * This also used in vty to release the label and to change the allocation mode as well
@@ -4308,6 +4677,8 @@ void bgp_vpn_release_label(struct bgp *bgp, afi_t afi, bool reset)
 		UNSET_FLAG(bgp->vpn_policy[afi].flags, BGP_VPN_POLICY_TOVPN_LABEL_AUTO);
 }
 
+/* 【函数】bgp_mplsvpn_nh_label_bind_cmp —— RB 树比较函数：先按下一跳 prefix 比较，
+ * 再按 orig_label 比较，确定 (nexthop, orig_label) 在树中的唯一位置。 */
 /* The nexthops values are compared to
  * find in the tree the appropriate cache entry
  */
@@ -4324,6 +4695,12 @@ int bgp_mplsvpn_nh_label_bind_cmp(
 	return 0;
 }
 
+/* 【函数】bgp_mplsvpn_nh_label_bind_send_nexthop_label —— 向 zebra 下发/更新/删除一条
+ * MPLS 绑定：把 new_label 指向的入标签与 (下一跳, orig_label) 的转发动作下发给内核。
+ * cmd 取 ZEBRA_MPLS_LABELS_ADD/DELETE/REPLACE。会连同下一跳已有的 nh_label 组成标签栈
+ * (出栈=下层 LSP 标签 + orig_label)；标签栈超过 MPLS_MAX_LABELS 则放弃安装并报错。
+ * 关键点：直连(NEXTHOP_TYPE_IFINDEX)用前缀本身作目标，递归下一跳用其网关地址；
+ *   黑洞下一跳直接返回。 */
 static void bgp_mplsvpn_nh_label_bind_send_nexthop_label(
 	struct bgp_mplsvpn_nh_label_bind_cache *bmnc, int cmd)
 {
@@ -4393,6 +4770,9 @@ static void bgp_mplsvpn_nh_label_bind_send_nexthop_label(
 				     ZEBRA_LSP_BGP, p, num_labels, &label[0]);
 }
 
+/* 【函数】bgp_mplsvpn_nh_label_bind_free —— 释放一个 nexthop-label 绑定缓存：
+ * 若标签仍在申请中(allocation_in_progress)，仅标记并移除缓存(回调会识别并真正删除)；
+ * 否则删除内核 MPLS 绑定、归还标签(bgp_vpn_nh_lp_release)、从树中移除、释放 nexthop 与内存。 */
 void bgp_mplsvpn_nh_label_bind_free(
 	struct bgp_mplsvpn_nh_label_bind_cache *bmnc)
 {
@@ -4416,6 +4796,8 @@ void bgp_mplsvpn_nh_label_bind_free(
 	XFREE(MTYPE_MPLSVPN_NH_LABEL_BIND_CACHE, bmnc);
 }
 
+/* 【函数】bgp_mplsvpn_nh_label_bind_new —— 分配并初始化一个绑定缓存：
+ * 以 (p, orig_label) 为键，new_label 先置 MPLS_INVALID_LABEL，初始化 paths 链表后插入树。 */
 struct bgp_mplsvpn_nh_label_bind_cache *
 bgp_mplsvpn_nh_label_bind_new(struct bgp_mplsvpn_nh_label_bind_cache_head *tree,
 			      struct prefix *p, mpls_label_t orig_label)
@@ -4434,6 +4816,8 @@ bgp_mplsvpn_nh_label_bind_new(struct bgp_mplsvpn_nh_label_bind_cache_head *tree,
 	return bmnc;
 }
 
+/* 【函数】bgp_mplsvpn_nh_label_bind_find —— 以 (p, orig_label) 在树中查找绑定缓存；
+ * 用栈上临时对象走 RB 查找。tree 为空返回 NULL。 */
 struct bgp_mplsvpn_nh_label_bind_cache *bgp_mplsvpn_nh_label_bind_find(
 	struct bgp_mplsvpn_nh_label_bind_cache_head *tree, struct prefix *p,
 	mpls_label_t orig_label)
@@ -4448,6 +4832,9 @@ struct bgp_mplsvpn_nh_label_bind_cache *bgp_mplsvpn_nh_label_bind_find(
 	return bgp_mplsvpn_nh_label_bind_cache_find(tree, &bmnc);
 }
 
+/* 【函数】bgp_mplsvpn_path_uses_valid_mpls_label —— 判断该路径是否携带“可用的 MPLS 标签”：
+ * SRv6 路径(srv6_l3service)与带 prefix_sid 标签索引的路径不算；其余按
+ * bgp_path_info_has_valid_label() 判定是否含有效 MPLS 标签。 */
 /* Called to check if the incoming l3vpn path entry
  * has mpls label information
  */
@@ -4468,6 +4855,9 @@ bool bgp_mplsvpn_path_uses_valid_mpls_label(struct bgp_path_info *pi)
 	return true;
 }
 
+/* 【函数】bgp_mplsvpn_nh_label_bind_get_label —— 取该路径绑定后应对外通告的“新标签”：
+ * 从绑定缓存取 new_label，编码为带 BOS 的 MPLS 标签并置内部有效位；未绑定或仍在
+ * 申请中则返回 MPLS_INVALID_LABEL。 */
 mpls_label_t bgp_mplsvpn_nh_label_bind_get_label(struct bgp_path_info *pi)
 {
 	mpls_label_t label;
@@ -4486,6 +4876,10 @@ mpls_label_t bgp_mplsvpn_nh_label_bind_get_label(struct bgp_path_info *pi)
 	return label;
 }
 
+/* 【函数】bgp_mplsvpn_nh_label_bind_get_local_label_cb —— zebra 回复 l3vpn 绑定用
+ * 本地新标签的异步回调(context=bmnc)。allocated=false 时置 INVALID。若申请已被取消
+ * (allocation_in_progress 为假)则直接释放缓存；否则下发内核绑定，并遍历绑定下的路径
+ * 置 BGP_NODE_LABEL_CHANGED 后 bgp_process，触发携带新标签的重通告。 */
 /* Called upon reception of a ZAPI Message from zebra, about
  * a new available label.
  */
@@ -4539,6 +4933,11 @@ static int bgp_mplsvpn_nh_label_bind_get_local_label_cb(mpls_label_t label,
 	return 0;
 }
 
+/* 【函数】bgp_mplsvpn_path_nh_label_bind_unlink —— 把路径从其 nexthop-label 绑定缓存
+ * 上解绑：LIST_REMOVE、递减 path_count、清缓存指针。
+ * 疑点：此处对 BGP_PATH_MPLSVPN_NH_LABEL_BIND 用的是 SET_FLAG，而对照相邻的
+ *   bgp_mplsvpn_path_nh_label_unlink() 用的是 UNSET_FLAG；语义上“解绑后应清除标志”，
+ *   这里可能是笔误（待确认）。未绑定/缓存指针为空则直接返回；缓存空了则释放。 */
 void bgp_mplsvpn_path_nh_label_bind_unlink(struct bgp_path_info *pi)
 {
 	struct bgp_mplsvpn_nh_label_bind_cache *bmnc;
@@ -4563,6 +4962,11 @@ void bgp_mplsvpn_path_nh_label_bind_unlink(struct bgp_path_info *pi)
 		bgp_mplsvpn_nh_label_bind_free(bmnc);
 }
 
+/* 【函数】bgp_mplsvpn_nh_label_bind_register_local_label —— 为一条 l3vpn 路径登记
+ * 本地“出标签绑定”：以 (下一跳, 收到的 orig_label) 为键找/建缓存，没有则新建并异步
+ * 申请本地标签(bgp_lp_get→...get_local_label_cb)；把 pi 绑定进缓存并同步 nexthop。
+ * 这样在 next-hop 被改写(next-hop-self/eBGP)时仍能换出新标签并保持 orig_label 转发。
+ * 注意：形参 dest 未在函数体中使用（仅 pi 提供下一跳等信息）。 */
 void bgp_mplsvpn_nh_label_bind_register_local_label(struct bgp *bgp,
 						    struct bgp_dest *dest,
 						    struct bgp_path_info *pi)
@@ -4611,6 +5015,9 @@ void bgp_mplsvpn_nh_label_bind_register_local_label(struct bgp *bgp,
 	}
 }
 
+/* 【函数】show_bgp_mplsvpn_nh_label_bind_internal —— 打印某实例的 nexthop-label 绑定
+ * 缓存表：每项显示下一跳、orig_label、已分配的 local(new) label、路径数与接口；
+ * detail 为真时再列出引用该缓存的每条路径。 */
 static void show_bgp_mplsvpn_nh_label_bind_internal(struct vty *vty,
 						    struct bgp *bgp,
 						    bool detail)
@@ -4660,6 +5067,8 @@ static void show_bgp_mplsvpn_nh_label_bind_internal(struct vty *vty,
 }
 
 
+/* 【命令】show bgp [<view|vrf> NAME] mplsvpn-nh-label-bind [detail] —— 展示 nexthop-label
+ * 绑定缓存；可指定 vrf，带 detail 显示每条路径。 */
 DEFUN(show_bgp_mplsvpn_nh_label_bind, show_bgp_mplsvpn_nh_label_bind_cmd,
       "show bgp [<view|vrf> VIEWVRFNAME] mplsvpn-nh-label-bind [detail]",
       SHOW_STR BGP_STR BGP_INSTANCE_HELP_STR
@@ -4687,6 +5096,7 @@ DEFUN(show_bgp_mplsvpn_nh_label_bind, show_bgp_mplsvpn_nh_label_bind_cmd,
 	return CMD_SUCCESS;
 }
 
+/* 【函数】bgp_mplsvpn_nexthop_init —— 注册 nexthop-label 绑定相关的 show 命令。 */
 void bgp_mplsvpn_nexthop_init(void)
 {
 	install_element(VIEW_NODE, &show_bgp_mplsvpn_nh_label_bind_cmd);

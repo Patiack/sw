@@ -5,6 +5,29 @@
  * This file is part of FRRouting
  */
 
+/* ============================================================================
+ * 【文件导读】bgp_vpn.c —— `show ... vpn` 类命令的 VPN 路由输出实现
+ * ============================================================================
+ * 【本文件解决什么问题】普通 IPv4/IPv6 表的 `show bgp ... neighbors X routes`
+ * 由 bgp_route.c 里的通用函数输出；但 VPN(MPLS-VPN) 路由是**两层结构**——
+ * “RD 表”里再挂“前缀表”，遍历方式不同，无法复用，于是有本文件唯一的函数
+ * show_adj_route_vpn() 专门输出。
+ *
+ * 【两层层级（读代码关键）】外层遍历 bgp->rib[afi][safi] 的每个 dest，它的 info
+ * 其实是一张子表（该 RD 对应的前缀表）；用 bgp_dest_get_bgp_table_info 取出后内层
+ * 再遍历前缀。RD 由外层 dest 前缀的前 8 字节给出，用 decode_rd_type + decode_rd_*
+ * 解码后打印。
+ *
+ * 【如何判断“某邻居是否收到该前缀”】内层对每个前缀遍历 adj_out 红黑树（出向通告
+ * 记录），用 SUBGRP_FOREACH_PEER 找到与目标 peer 匹配、且带 attr 的那条 adj，取其
+ * attr 打印。找不到就跳过——所以输出的是“该邻居确实被通告过”的路由。
+ *
+ * 【输出两种形态】use_json=false 走 vty_out 文本表格（表头一次、RD 头每个 RD 一次）；
+ * use_json=true 组 json 对象，最后 vty_json 输出。prd 非空时按 RD 过滤（只输出匹配的
+ * 那个 RD）。
+ * ============================================================================
+ */
+
 #include <zebra.h>
 #include "command.h"
 #include "prefix.h"
@@ -19,6 +42,17 @@
 #include "bgpd/bgp_vpn.h"
 #include "bgpd/bgp_updgrp.h"
 
+/* 【函数】show_adj_route_vpn —— 输出指定邻居在 VPN 表里的路由（文本或 JSON）。
+ * 流程：
+ *   1) 取默认 BGP 实例；无则输出提示 / 空 JSON 并返回 CMD_WARNING；
+ *   2) 外层遍历 rib[afi][safi] 的每个 dest（每个就是一个 RD 表）：
+ *      - prd 非空时用 memcmp 比较该 dest 前缀前 8 字节与 prd->val，不匹配则跳过；
+ *      - bgp_dest_get_bgp_table_info 取子表，空则跳过；
+ *      - 打印表头（仅第一次，header 标志）与 RD 头（每个 RD 第一次，rd_header）；
+ *   3) 内层遍历子表每个前缀，在 adj_out 里找目标 peer 的 adj（取其 attr）；无路径
+ *      信息或无 attr 则跳过；否则调 route_vty_out_tmp 打印该条路由；
+ *   4) use_json 时把每个 RD 的前缀集合挂到 advertisedRoutes 下，最后统一输出。
+ * 返回 CMD_SUCCESS / CMD_WARNING。 */
 int show_adj_route_vpn(struct vty *vty, struct peer *peer,
 		       struct prefix_rd *prd, afi_t afi, safi_t safi,
 		       bool use_json)
@@ -49,6 +83,7 @@ int show_adj_route_vpn(struct vty *vty, struct peer *peer,
 		json_adv = json_object_new_object();
 	}
 
+	/* 外层：遍历每个 RD 子表——dest 的 info 本身就是该 RD 对应的前缀表。 */
 	for (dest = bgp_table_top(bgp->rib[afi][safi]); dest;
 	     dest = bgp_route_next(dest)) {
 		const struct prefix *dest_p = bgp_dest_get_prefix(dest);
@@ -68,11 +103,14 @@ int show_adj_route_vpn(struct vty *vty, struct peer *peer,
 		memset(rd_str, 0, sizeof(rd_str));
 		json_routes = NULL;
 
+		/* 内层：遍历该 RD 下的每个前缀节点。 */
 		for (rm = bgp_table_top(table); rm; rm = bgp_route_next(rm)) {
 			struct bgp_adj_out *adj = NULL;
 			struct attr *attr = NULL;
 			struct peer_af *paf = NULL;
 
+			/* 在本前缀的出向通告红黑树里找目标 peer 的那条记录，取其 attr
+			 * 用于展示；SUBGRP_FOREACH_PEER 遍历该 adj 所属子组的成员 peer。 */
 			RB_FOREACH (adj, bgp_adj_out_rb, &rm->adj_out)
 				SUBGRP_FOREACH_PEER (adj->subgroup, paf) {
 					if (paf->peer != peer || !adj->attr)
@@ -118,6 +156,8 @@ int show_adj_route_vpn(struct vty *vty, struct peer *peer,
 				header = 0;
 			}
 
+			/* 每个 RD 只打印一次 RD 头：解码 RD 类型与数值后输出。
+			 * 注意 RD 前 8 字节即外层 dest 前缀的 u.val，解码时用 pnt+2 跳过类型。 */
 			if (rd_header) {
 				uint16_t type;
 				struct rd_as rd_as = {0};
@@ -142,6 +182,9 @@ int show_adj_route_vpn(struct vty *vty, struct peer *peer,
 				else if (type == RD_TYPE_VNC_ETH)
 					decode_rd_vnc_eth(pnt, &rd_vnc_eth);
 #endif
+				/* 【JSON 模式】为当前 RD 新建子对象 json_routes：
+				 * AS/AS4 号用 "as:val" 拼串，IP 用 %pI4:val 拼串，
+				 * 再以 "rd" 为键写入该子对象。 */
 				if (use_json) {
 					json_routes = json_object_new_object();
 
@@ -191,16 +234,23 @@ int show_adj_route_vpn(struct vty *vty, struct peer *peer,
 				}
 				rd_header = 0;
 			}
+			/* 【输出该条路由】把本前缀命中的 attr 交给通用函数
+			 * route_vty_out_tmp 打印（文本表格或 JSON）；
+			 * use_json 时结果会累加进 json_routes。 */
 			route_vty_out_tmp(vty, bgp, rm, bgp_dest_get_prefix(rm),
 					  attr, safi, use_json, json_routes,
 					  false);
 			output_count++;
 		}
 
+		/* 本 RD 的全部前缀已输出，把它对应的 json_routes 挂到
+		 * advertisedRoutes 下，键为该 RD 字符串；非 JSON 模式跳过。 */
 		if (use_json && json_routes)
 			json_object_object_add(json_adv, rd_str, json_routes);
 	}
 
+	/* 【收尾】JSON 模式挂上 advertisedRoutes 与前缀计数后统一输出；
+	 * 文本模式则打印总计前缀数。 */
 	if (use_json) {
 		json_object_object_add(json, "advertisedRoutes", json_adv);
 		json_object_int_add(json,

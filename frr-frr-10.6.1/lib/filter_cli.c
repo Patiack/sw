@@ -6,6 +6,32 @@
  *                    Rafael Zalamena
  */
 
+/*
+ * 文件导读 filter_cli.c —— 访问列表 / 前缀列表的 CLI 与 YANG 命令实现
+ *
+ * 定位：本文件把用户敲的配置命令翻译成对 YANG 候选配置的修改（enqueue change），
+ *   真正的数据落地与校验由 filter_nb.c 的北向回调完成；本文件不直接操作
+ *   filter.c 里的 access_list 结构，也不做匹配运算。
+ *
+ * 三方分工回顾：
+ *   filter.h      ：数据结构与接口原型；
+ *   filter.c      ：访问列表核心（存 / 查 / 匹配）；
+ *   filter_nb.c   ：YANG 回调，把配置树落到 filter.c 的 API；
+ *   filter_cli.c  ：命令行（DEFPY_YANG）与 show / 比较回调（本文件）。
+ *
+ * 本文件主要内容：
+ *   - acl_get_seq / acl_get_seq_cb ：为旧式命令自动生成序号（+5 递增）；
+ *   - filter_remove_check_empty    ：删除条目后若表空且无 remark，连整表一起删；
+ *   - access_list_* / no_access_list_* ：标准 / 扩展 ACL 的增删命令（IPv4 / IPv6 / MAC）；
+ *   - prefix_list_*                ：前缀列表命令；
+ *   - *_cmp / *_show / *_remark_show：YANG 框架要求的比较与显示回调。
+ *
+ * 关键约定：
+ *   - 命令处理函数用 DEFPY_YANG（带 $ 变量），通过 nb_cli_enqueue_change 排队修改，
+ *     最后 nb_cli_apply_changes 统一提交；中途出错返回 CMD_WARNING_CONFIG_FAILED。
+ *   - 兼容性：重复条目在旧命令里被静默接受（不报错）。
+ */
+
 #include "zebra.h"
 #include "northbound.h"
 #include "prefix.h"
@@ -19,6 +45,15 @@
 
 #include "lib/filter_cli_clippy.c"
 
+/*
+ * 命令帮助字符串宏：把各命令共用的 help 文本集中定义，避免重复书写。
+ *   ACCESS_LIST_STR / ACCESS_LIST_ZEBRA_STR : 命令关键字与列表名说明；
+ *   ACCESS_LIST_SEQ_STR         : 序号参数说明（供 DEFPY 的 help 数组使用）；
+ *   ACCESS_LIST_ACTION_STR      : deny / permit 说明；
+ *   ACCESS_LIST_REMARK_STR / _LINE_STR : remark 及其长度说明；
+ *   PREFIX_LIST_NAME_STR        : 前缀列表名说明。
+ * 注意：这些字符串直接进入命令行的 help 输出，改动会影响 show / help。
+ */
 #define ACCESS_LIST_STR "Access list entry\n"
 #define ACCESS_LIST_ZEBRA_STR "Access list name\n"
 #define ACCESS_LIST_SEQ_STR                                                    \
@@ -33,6 +68,11 @@
 #define PREFIX_LIST_NAME_STR "Prefix list entry name\n"
 
 /*
+ * acl_get_seq_cb —— yang_dnode_iterate 的回调：遍历条目时求最大序号。
+ * 参数：dnode 当前条目节点；arg 指向调用方维护的最大值（int64_t *）。
+ * 返回：YANG_ITER_CONTINUE，表示继续遍历剩余条目。
+ */
+/*
  * Helper function to generate a sequence number for legacy commands.
  */
 static int acl_get_seq_cb(const struct lyd_node *dnode, void *arg)
@@ -46,6 +86,13 @@ static int acl_get_seq_cb(const struct lyd_node *dnode, void *arg)
 	return YANG_ITER_CONTINUE;
 }
 
+/*
+ * acl_get_seq —— 为一条列表计算下一个未使用的序号。
+ * 参数：xpath 列表节点的 XPath；is_remove 为真表示当前是删除操作。
+ * 返回：max + 5；删除时即使超过 UINT32_MAX 也不报错，新增时超范围则报错返回 -1。
+ * 逻辑：遍历 <xpath>/entry 求最大 sequence，再加 5。
+ * 坑：返回值 -1 表示错误，调用方必须判断并返回 CMD_WARNING_CONFIG_FAILED。
+ */
 /**
  * Helper function that iterates over the XPath `xpath` on the candidate
  * configuration in `vty->candidate_config`.
@@ -69,6 +116,16 @@ static int64_t acl_get_seq(struct vty *vty, const char *xpath, bool is_remove)
 	return seq;
 }
 
+/*
+ * filter_remove_check_empty —— 删除一个条目 / remark 后，必要时删除整张空列表。
+ * 参数：ftype / iptype / name 定位列表；del_seq 为要删的序号（0 表示不删条目）；
+ *   del_remark 为真表示同时删除 remark。
+ * 返回：nb_cli_apply_changes 的结果（命令执行状态）。
+ * 逻辑：① 统计现存 entry 数；② 若待删条目存在，则排队删除并使计数减一；
+ *   ③ 处理 remark（删除或探测是否存在）；④ 若计数为 0 且无 remark，
+ *   则排队删除整个列表节点——这是为了兼容旧 CLI 与测试的“空表不留痕”行为。
+ * 副作用：会向候选配置排队多个 DESTROY 变更并提交。
+ */
 /**
  * Remove main data structure filter list if there are no more entries or
  * remark. This fixes compatibility with old CLI and tests.
@@ -124,7 +181,21 @@ static int filter_remove_check_empty(struct vty *vty, const char *ftype,
 }
 
 /*
+ * ===== 传统（Cisco 风格）访问列表命令 =====
+ * 下面一组 DEFPY_YANG 对应 "access-list ..." 系列命令；
+ * 它们按 标准 / 扩展、IPv4 / IPv6 / MAC 分别展开。
+ */
+/*
  * Cisco (legacy) access lists.
+ */
+/*
+ * access_list_std —— 标准 ACL 配置命令 "access-list NAME [seq N] deny|permit ..."。
+ * 语法：可跟 [host] 地址，或「地址 + 通配符」，或源任意（source-any）。
+ * 逻辑：① 按参数填 acl_dup_args 并调用 acl_is_dup 查重，重复则直接成功返回；
+ *   ② 未提供 seq 时用 acl_get_seq 自动生成；③ 依次 enqueue 建列表、建条目、
+ *   设置 action 与地址字段；④ 最后 nb_cli_apply_changes 提交。
+ * 返回：CMD_SUCCESS / CMD_WARNING_CONFIG_FAILED。
+ * 坑：acl_get_seq 返回负值（超范围）时必须立即拦截返回失败。
  */
 DEFPY_YANG(
 	access_list_std, access_list_std_cmd,
@@ -202,6 +273,13 @@ DEFPY_YANG(
 	return nb_cli_apply_changes(vty, "%s", xpath_entry);
 }
 
+/*
+ * no_access_list_std —— 删除标准 ACL 条目的命令 "no access-list ..."。
+ * 逻辑：若用户显式给了 seq，直接按序号删；否则用 acl_dup_args + acl_is_dup
+ *   反查该匹配条目对应的序号，查不到则报错返回。
+ * 返回：CMD_SUCCESS / CMD_WARNING_CONFIG_FAILED；实际删除交给
+ *   filter_remove_check_empty（可能顺带删掉空表）。
+ */
 DEFPY_YANG(
 	no_access_list_std, no_access_list_std_cmd,
 	"no access-list ACCESSLIST4_NAME$name [seq (1-4294967295)$seq] <deny|permit>$action <[host] A.B.C.D$host|A.B.C.D$host A.B.C.D$mask>",
@@ -249,6 +327,14 @@ DEFPY_YANG(
 					 false);
 }
 
+/*
+ * access_list_ext —— 扩展 ACL 配置命令 "access-list NAME ... permit ip SRC DST"。
+ * 语法：源与目的各可写「地址 + 掩码 / host 地址 / any」。
+ * 逻辑：与标准命令类似，但用 idx 依次把源、目的字段填入 acl_dup_args 做查重，
+ *   随后 enqueue 建条目并逐项设置源 / 目的字段，最后统一提交。
+ * 返回：CMD_SUCCESS / CMD_WARNING_CONFIG_FAILED。
+ * 坑：源 / 目的涉及多个字段，拼 XPath 与维护 idx 时要格外小心。
+ */
 DEFPY_YANG(
 	access_list_ext, access_list_ext_cmd,
 	"access-list ACCESSLIST4_NAME$name [seq (1-4294967295)$seq] <deny|permit>$action ip <A.B.C.D$src A.B.C.D$src_mask|host A.B.C.D$src|any> <A.B.C.D$dst A.B.C.D$dst_mask|host A.B.C.D$dst|any>",
@@ -367,6 +453,12 @@ DEFPY_YANG(
 	return nb_cli_apply_changes(vty, "%s", xpath_entry);
 }
 
+/*
+ * no_access_list_ext —— 删除扩展 ACL 条目的命令 "no access-list ... ip ..."。
+ * 逻辑：给了 seq 就直接按序号删；否则用源 + 目的的字段组合查重反查序号，
+ *   查不到则报错返回。
+ * 返回：CMD_SUCCESS / CMD_WARNING_CONFIG_FAILED。
+ */
 DEFPY_YANG(
 	no_access_list_ext, no_access_list_ext_cmd,
 	"no access-list ACCESSLIST4_NAME$name [seq (1-4294967295)$seq] <deny|permit>$action ip <A.B.C.D$src A.B.C.D$src_mask|host A.B.C.D$src|any> <A.B.C.D$dst A.B.C.D$dst_mask|host A.B.C.D$dst|any>",
@@ -443,6 +535,12 @@ DEFPY_YANG(
 					 false);
 }
 
+/*
+ * access_list_v6_std —— IPv6 标准 ACL 命令 "ipv6 access-list NAME ... "。
+ * 说明：IPv6 标准 ACL 只关心目的（dst），可写 host / 地址 + 掩码 / 源任意。
+ * 逻辑：与 IPv4 标准版本一致——先查重，未给 seq 时用 acl_get_seq 生成。
+ * 坑：本函数未检查 acl_get_seq 的负返回值（历史实现），与 IPv4 版本不同。
+ */
 DEFPY_YANG(
 	access_list_v6_std, access_list_v6_std_cmd,
 	"ipv6 access-list ACCESSLIST6_NAME$name [seq (1-4294967295)$seq] <deny|permit>$action <X:X::X:X$dst X:X::X:X$dst_mask|[host] X:X::X:X$dst>",
@@ -519,6 +617,10 @@ DEFPY_YANG(
 	return nb_cli_apply_changes(vty, "%s", xpath_entry);
 }
 
+/*
+ * no_access_list_v6_std —— 删除 IPv6 标准 ACL 条目 "no ipv6 access-list ..."。
+ * 逻辑同 IPv4 版本：给了 seq 直接删，否则查重反查序号；查不到返回失败。
+ */
 DEFPY_YANG(
 	no_access_list_v6_std, no_access_list_v6_std_cmd,
 	"no ipv6 access-list ACCESSLIST6_NAME$name [seq (1-4294967295)$seq] <deny|permit>$action <X:X::X:X$dst X:X::X:X$dst_mask|[host] X:X::X:X$dst>",
@@ -570,6 +672,11 @@ DEFPY_YANG(
 	return filter_remove_check_empty(vty, "access", "ipv6", name, sseq, false);
 }
 
+/*
+ * access_list_v6_ext —— IPv6 扩展 ACL 命令 "ipv6 access-list NAME ... ipv6 SRC DST"。
+ * 语法：源、目的各可为「地址 + 掩码 / host / any」。
+ * 逻辑：先查重，再逐项 enqueue 建条目并设置源 / 目的字段，最后统一提交。
+ */
 DEFPY_YANG(
 	access_list_v6_ext, access_list_v6_ext_cmd,
 	"ipv6 access-list ACCESSLIST6_NAME$name [seq (1-4294967295)$seq] <deny|permit>$action ipv6 <X:X::X:X$src X:X::X:X$src_mask|host X:X::X:X$src|any> <X:X::X:X$dst X:X::X:X$dst_mask|host X:X::X:X$dst|any>",
@@ -681,6 +788,11 @@ DEFPY_YANG(
 	return nb_cli_apply_changes(vty, "%s", xpath_entry);
 }
 
+/*
+ * no_access_list_v6_ext —— 删除 IPv6 扩展 ACL 条目
+ * "no ipv6 access-list ... ipv6 SRC DST"。
+ * 逻辑：给了 seq 直接删，否则用源 + 目的字段查重反查序号；查不到返回失败。
+ */
 DEFPY_YANG(
 	no_access_list_v6_ext, no_access_list_v6_ext_cmd,
 	"no ipv6 access-list ACCESSLIST6_NAME$name [seq (1-4294967295)$seq] <deny|permit>$action ipv6 <X:X::X:X$src X:X::X:X$src_mask|host X:X::X:X$src|any> <X:X::X:X$dst X:X::X:X$dst_mask|host X:X::X:X$dst|any>",
@@ -757,7 +869,20 @@ DEFPY_YANG(
 }
 
 /*
+ * ===== Zebra（前缀列表式）访问列表命令 =====
+ * 下面命令用 "A.B.C.D/M [exact-match]" 表达匹配，落到 YANG 里即 zebra 风格条目。
+ */
+/*
  * Zebra access lists.
+ */
+/*
+ * access_list —— zebra 风格 IPv4 访问列表命令
+ * "access-list NAME ... deny|permit A.B.C.D/M [exact-match]|any"。
+ * 逻辑：① 用 ipv4-prefix（含 exact 则加 ipv4-exact-match）或 any 填 acl_dup_args 查重；
+ *   ② 未给 seq 时用 acl_get_seq 生成（此处含负值检查）；③ enqueue 建列表与条目，
+ *   设置 action 及 ipv4-prefix / ipv4-exact-match（或 any）；④ 提交。
+ * 返回：CMD_SUCCESS / CMD_WARNING_CONFIG_FAILED。
+ * 注意：这类条目在 filter.c 走 zebra 分支匹配（前缀包含，exact 时要求等长）。
  */
 DEFPY_YANG(
 	access_list, access_list_cmd,
@@ -832,6 +957,12 @@ DEFPY_YANG(
 	return nb_cli_apply_changes(vty, "%s", xpath_entry);
 }
 
+/*
+ * no_access_list —— 删除 zebra 风格 IPv4 访问列表条目
+ * "no access-list NAME ... deny|permit A.B.C.D/M|any"。
+ * 逻辑同其它 no 命令：给了 seq 直接删，否则查重反查序号，
+ *   最后交给 filter_remove_check_empty（空表则一并删除）。
+ */
 DEFPY_YANG(
 	no_access_list, no_access_list_cmd,
 	"no access-list ACCESSLIST4_NAME$name [seq (1-4294967295)$seq] <deny|permit>$action <A.B.C.D/M$prefix [exact-match$exact]|any>",
@@ -878,6 +1009,10 @@ DEFPY_YANG(
 					 false);
 }
 
+/*
+ * no_access_list_all —— "no access-list NAME"：删除整张列表。
+ * 逻辑：直接对 access-list 节点排队 NB_OP_DESTROY 并提交，无需逐条删除。
+ */
 DEFPY_YANG(
 	no_access_list_all, no_access_list_all_cmd,
 	"no access-list ACCESSLIST4_NAME$name",
@@ -894,6 +1029,13 @@ DEFPY_YANG(
 	return nb_cli_apply_changes(vty, NULL);
 }
 
+/*
+ * access_list_remark —— "access-list NAME remark LINE..."：设置列表备注。
+ * 逻辑：先 CREATE 列表节点（保证其存在），把 LINE... 拼成一个 remark 字符串，
+ *   enqueue 到 ./remark，提交后立即 XFREE 该临时字符串。
+ * 返回：nb_cli_apply_changes 的结果。
+ * 坑：remark 用 MTYPE_TMP 分配，必须在本函数内释放，不能遗漏。
+ */
 DEFPY_YANG(
 	access_list_remark, access_list_remark_cmd,
 	"access-list ACCESSLIST4_NAME$name remark LINE...",
@@ -918,6 +1060,11 @@ DEFPY_YANG(
 	return rv;
 }
 
+/*
+ * no_access_list_remark —— "no access-list NAME remark"：删除备注。
+ * 逻辑：调用 filter_remove_check_empty，del_seq=0 表示不删条目、
+ *   del_remark=true 表示删 remark（若删后表空则整表一并删除）。
+ */
 DEFPY_YANG(
 	no_access_list_remark, no_access_list_remark_cmd,
 	"no access-list ACCESSLIST4_NAME$name remark",
@@ -929,6 +1076,10 @@ DEFPY_YANG(
 	return filter_remove_check_empty(vty, "access", "ipv4", name, 0, true);
 }
 
+/*
+ * ALIAS no_access_list_remark_line —— 为 no_access_list_remark 增加一个带
+ *   "remark LINE..." 文本的别名写法，两种输入效果相同（都删除备注）。
+ */
 ALIAS(
 	no_access_list_remark, no_access_list_remark_line_cmd,
 	"no access-list ACCESSLIST4_NAME$name remark LINE...",
@@ -938,6 +1089,12 @@ ALIAS(
 	ACCESS_LIST_REMARK_STR
 	ACCESS_LIST_REMARK_LINE_STR)
 
+/*
+ * ipv6_access_list —— zebra 风格 IPv6 访问列表命令
+ * "ipv6 access-list NAME ... deny|permit X:X::X:X/M [exact-match]|any"。
+ * 逻辑：与 IPv4 zebra 版本一致，字段换成 ipv6-prefix / ipv6-exact-match。
+ * 返回：CMD_SUCCESS / CMD_WARNING_CONFIG_FAILED。
+ */
 DEFPY_YANG(
 	ipv6_access_list, ipv6_access_list_cmd,
 	"ipv6 access-list ACCESSLIST6_NAME$name [seq (1-4294967295)$seq] <deny|permit>$action <X:X::X:X/M$prefix [exact-match$exact]|any>",
@@ -1012,6 +1169,11 @@ DEFPY_YANG(
 	return nb_cli_apply_changes(vty, "%s", xpath_entry);
 }
 
+/*
+ * no_ipv6_access_list —— 删除 zebra 风格 IPv6 列表条目
+ * "no ipv6 access-list NAME ... deny|permit X:X::X:X/M|any"。
+ * 逻辑：给了 seq 直接删，否则查重反查序号，再交给 filter_remove_check_empty。
+ */
 DEFPY_YANG(
 	no_ipv6_access_list, no_ipv6_access_list_cmd,
 	"no ipv6 access-list ACCESSLIST6_NAME$name [seq (1-4294967295)$seq] <deny|permit>$action <X:X::X:X/M$prefix [exact-match$exact]|any>",
@@ -1059,6 +1221,10 @@ DEFPY_YANG(
 					 false);
 }
 
+/*
+ * no_ipv6_access_list_all —— "no ipv6 access-list NAME"：删除整张 IPv6 列表。
+ * 逻辑：直接对列表节点排队 NB_OP_DESTROY 并提交。
+ */
 DEFPY_YANG(
 	no_ipv6_access_list_all, no_ipv6_access_list_all_cmd,
 	"no ipv6 access-list ACCESSLIST6_NAME$name",
@@ -1076,6 +1242,11 @@ DEFPY_YANG(
 	return nb_cli_apply_changes(vty, NULL);
 }
 
+/*
+ * ipv6_access_list_remark —— "ipv6 access-list NAME remark LINE..."：设置备注。
+ * 逻辑同 IPv4 版本，只是 XPath 类型为 ipv6、LINE 的起始下标为 4。
+ * 坑：remark 用 MTYPE_TMP 分配，需在本函数内释放。
+ */
 DEFPY_YANG(
 	ipv6_access_list_remark, ipv6_access_list_remark_cmd,
 	"ipv6 access-list ACCESSLIST6_NAME$name remark LINE...",
@@ -1101,6 +1272,10 @@ DEFPY_YANG(
 	return rv;
 }
 
+/*
+ * no_ipv6_access_list_remark —— "no ipv6 access-list NAME remark"：删除备注。
+ * 逻辑同 IPv4：调用 filter_remove_check_empty 且 del_remark=true。
+ */
 DEFPY_YANG(
 	no_ipv6_access_list_remark, no_ipv6_access_list_remark_cmd,
 	"no ipv6 access-list ACCESSLIST6_NAME$name remark",
@@ -1113,6 +1288,9 @@ DEFPY_YANG(
 	return filter_remove_check_empty(vty, "access", "ipv6", name, 0, true);
 }
 
+/*
+ * ALIAS no_ipv6_access_list_remark_line —— 为 IPv6 删除备注命令增加带 LINE... 的别名。
+ */
 ALIAS(
 	no_ipv6_access_list_remark, no_ipv6_access_list_remark_line_cmd,
 	"no ipv6 access-list ACCESSLIST6_NAME$name remark LINE...",
@@ -1123,6 +1301,13 @@ ALIAS(
 	ACCESS_LIST_REMARK_STR
 	ACCESS_LIST_REMARK_LINE_STR)
 
+/*
+ * mac_access_list —— MAC 访问列表命令
+ * "mac access-list NAME ... deny|permit X:X:X:X:X:X|any"。
+ * 逻辑：以 ./mac 或 ./any 字段填充 acl_dup_args 查重；未给 seq 时用 acl_get_seq
+ *   生成（含负值检查）；然后 enqueue 建列表与条目，设置 action 与 mac / any 并提交。
+ * 返回：CMD_SUCCESS / CMD_WARNING_CONFIG_FAILED。
+ */
 DEFPY_YANG(
 	mac_access_list, mac_access_list_cmd,
 	"mac access-list ACCESSLIST_MAC_NAME$name [seq (1-4294967295)$seq] <deny|permit>$action <X:X:X:X:X:X$mac|any>",
@@ -1189,6 +1374,11 @@ DEFPY_YANG(
 	return nb_cli_apply_changes(vty, "%s", xpath_entry);
 }
 
+/*
+ * no_mac_access_list —— 删除 MAC 访问列表条目
+ * "no mac access-list NAME ... deny|permit MAC|any"。
+ * 逻辑同其它 no 命令：给了 seq 直接删，否则查重反查序号。
+ */
 DEFPY_YANG(
 	no_mac_access_list, no_mac_access_list_cmd,
 	"no mac access-list ACCESSLIST_MAC_NAME$name [seq (1-4294967295)$seq] <deny|permit>$action <X:X:X:X:X:X$mac|any>",
@@ -1231,6 +1421,9 @@ DEFPY_YANG(
 					 false);
 }
 
+/*
+ * no_mac_access_list_all —— "no mac access-list NAME"：删除整张 MAC 列表。
+ */
 DEFPY_YANG(
 	no_mac_access_list_all, no_mac_access_list_all_cmd,
 	"no mac access-list ACCESSLIST_MAC_NAME$name",
@@ -1248,6 +1441,10 @@ DEFPY_YANG(
 	return nb_cli_apply_changes(vty, NULL);
 }
 
+/*
+ * mac_access_list_remark —— "mac access-list NAME remark LINE..."：设置 MAC 列表备注。
+ * 逻辑同 IPv4 / IPv6 版本，只是类型为 mac。remark 需在本函数内释放。
+ */
 DEFPY_YANG(
 	mac_access_list_remark, mac_access_list_remark_cmd,
 	"mac access-list ACCESSLIST_MAC_NAME$name remark LINE...",
@@ -1273,6 +1470,10 @@ DEFPY_YANG(
 	return rv;
 }
 
+/*
+ * no_mac_access_list_remark —— "no mac access-list NAME remark"：删除 MAC 列表备注。
+ * 逻辑同 IPv4 / IPv6：filter_remove_check_empty 且 del_remark=true。
+ */
 DEFPY_YANG(
 	no_mac_access_list_remark, no_mac_access_list_remark_cmd,
 	"no mac access-list ACCESSLIST_MAC_NAME$name remark",
@@ -1285,6 +1486,9 @@ DEFPY_YANG(
 	return filter_remove_check_empty(vty, "access", "mac", name, 0, true);
 }
 
+/*
+ * ALIAS no_mac_access_list_remark_line —— 为 MAC 删除备注命令增加带 LINE... 的别名。
+ */
 ALIAS(
 	no_mac_access_list_remark, no_mac_access_list_remark_line_cmd,
 	"no mac access-list ACCESSLIST_MAC_NAME$name remark LINE...",
@@ -1295,6 +1499,12 @@ ALIAS(
 	ACCESS_LIST_REMARK_STR
 	ACCESS_LIST_REMARK_LINE_STR)
 
+/*
+ * access_list_cmp —— YANG 条目的排序比较回调（显示时用于按序排列）。
+ * 参数：dnode1 / dnode2 两个条目节点。
+ * 返回：seq1 - seq2 的差值（<0 表示前者应排在前）。
+ * 说明：直接用无符号序号相减，相等得 0，足以表达排序关系。
+ */
 int access_list_cmp(const struct lyd_node *dnode1,
 		    const struct lyd_node *dnode2)
 {
@@ -1304,6 +1514,15 @@ int access_list_cmp(const struct lyd_node *dnode1,
 	return seq1 - seq2;
 }
 
+/*
+ * access_list_show —— 把一条访问列表条目渲染成配置文本（YANG 显示回调）。
+ * 参数：dnode 当前 entry 节点；show_defaults 本函数未使用。
+ * 逻辑：先读 type（IPv4 / IPv6 / MAC）决定地址表现形式，再打印
+ *   "access-list NAME seq N action"；随后按风格分流——
+ *   cisco 标准 / 扩展（区分 host / network / any，扩展再输出目的部分），
+ *   或 zebra 风格（前缀 + 可选 exact-match，any 则输出 any）。
+ * 注意：MAC 用 type==2 判断（历史写法），且不打印掩码。
+ */
 void access_list_show(struct vty *vty, const struct lyd_node *dnode,
 		      bool show_defaults)
 {
@@ -1455,6 +1674,11 @@ void access_list_show(struct vty *vty, const struct lyd_node *dnode,
 	vty_out(vty, "\n");
 }
 
+/*
+ * access_list_remark_show —— 渲染列表的 remark（YANG 显示回调）。
+ * 逻辑：按 type 先输出可选前缀（ipv6 / mac），再输出
+ *   "access-list NAME remark <文本>"。
+ */
 void access_list_remark_show(struct vty *vty, const struct lyd_node *dnode,
 			     bool show_defaults)
 {
@@ -1477,9 +1701,22 @@ void access_list_remark_show(struct vty *vty, const struct lyd_node *dnode,
 }
 
 /*
+ * ===== 前缀列表（prefix-list）命令 =====
+ * 下面一组命令对应 "ip / ipv6 prefix-list ..."，同样落到 frr-filter 的
+ * prefix-list 子树。
+ */
+/*
  * Prefix lists.
  */
 
+/*
+ * plist_remove —— 通用前缀列表条目删除辅助。
+ * 参数：iptype 地址族；name 列表名；seq 序号（0 表示按内容反查）；
+ *   action 动作；prefix 前缀（NULL 表示 any）；ge / le 长度约束。
+ * 返回：CMD_SUCCESS / CMD_WARNING_CONFIG_FAILED。
+ * 逻辑：给了 seq 直接删；否则构造 plist_dup_args 并调用 plist_is_dup 反查序号，
+ *   再交给 filter_remove_check_empty。
+ */
 static int plist_remove(struct vty *vty, const char *iptype, const char *name,
 			uint32_t seq, const char *action,
 			union prefixconstptr prefix, int ge, int le)
@@ -1514,6 +1751,15 @@ static int plist_remove(struct vty *vty, const char *iptype, const char *name,
 					 false);
 }
 
+/*
+ * ip_prefix_list —— IPv4 前缀列表配置命令
+ * "ip prefix-list NAME [seq N] deny|permit any|A.B.C.D/M [ge X|le Y]"。
+ * 逻辑：① 填 plist_dup_args；② 未给 seq 时先查重（重复则复用其序号），
+ *   否则用 acl_get_seq 生成（含负值检查）；③ enqueue 建列表与条目，
+ *   设置 action、ipv4-prefix 及 ge / le（未提供则 DESTROY 旧值）或 any；④ 提交。
+ * 返回：CMD_SUCCESS / CMD_WARNING_CONFIG_FAILED。
+ * 坑：修改前缀条目时会显式 DESTROY 未再给出的 ge / le，防止旧约束残留。
+ */
 DEFPY_YANG(
 	ip_prefix_list, ip_prefix_list_cmd,
 	"ip prefix-list PREFIXLIST4_NAME$name [seq (1-4294967295)$seq] <deny|permit>$action <any|A.B.C.D/M$prefix [{ge (0-32)$ge|le (0-32)$le}]>",
@@ -1612,6 +1858,10 @@ DEFPY_YANG(
 	return nb_cli_apply_changes(vty, "%s", xpath_entry);
 }
 
+/*
+ * no_ip_prefix_list —— 删除 IPv4 前缀列表条目（可按内容匹配）。
+ * 逻辑：委托 plist_remove 统一处理（prefix_str 决定是否带前缀匹配）。
+ */
 DEFPY_YANG(
 	no_ip_prefix_list, no_ip_prefix_list_cmd,
 	"no ip prefix-list PREFIXLIST4_NAME$name [seq (1-4294967295)$seq] <deny|permit>$action <any|A.B.C.D/M$prefix [{ge (0-32)|le (0-32)}]>",
@@ -1632,6 +1882,10 @@ DEFPY_YANG(
 			    prefix_str ? prefix : NULL, ge, le);
 }
 
+/*
+ * no_ip_prefix_list_seq —— 按序号删除前缀列表条目
+ * "no ip prefix-list NAME seq N"，直接走 plist_remove 的 seq 分支。
+ */
 DEFPY_YANG(
 	no_ip_prefix_list_seq, no_ip_prefix_list_seq_cmd,
 	"no ip prefix-list PREFIXLIST4_NAME$name seq (1-4294967295)$seq",
@@ -1644,6 +1898,9 @@ DEFPY_YANG(
 	return plist_remove(vty, "ipv4", name, seq, NULL, NULL, 0, 0);
 }
 
+/*
+ * no_ip_prefix_list_all —— "no ip prefix-list NAME"：删除整张 IPv4 前缀列表。
+ */
 DEFPY_YANG(
 	no_ip_prefix_list_all, no_ip_prefix_list_all_cmd,
 	"no ip prefix-list PREFIXLIST4_NAME$name",
@@ -1661,6 +1918,11 @@ DEFPY_YANG(
 	return nb_cli_apply_changes(vty, NULL);
 }
 
+/*
+ * ip_prefix_list_remark —— "ip prefix-list NAME description LINE..."：设置描述。
+ * 逻辑同 ACL remark：CREATE 列表节点、拼接 LINE 为 remark、提交后释放临时串。
+ * 坑：命令关键字是 description，但落到 YANG 的字段仍是 ./remark。
+ */
 DEFPY_YANG(
 	ip_prefix_list_remark, ip_prefix_list_remark_cmd,
 	"ip prefix-list PREFIXLIST4_NAME$name description LINE...",
@@ -1686,6 +1948,10 @@ DEFPY_YANG(
 	return rv;
 }
 
+/*
+ * no_ip_prefix_list_remark —— "no ip prefix-list NAME description"：删除描述。
+ * 逻辑：filter_remove_check_empty 且 del_remark=true（若删后表空则一并删除）。
+ */
 DEFPY_YANG(
 	no_ip_prefix_list_remark, no_ip_prefix_list_remark_cmd,
 	"no ip prefix-list PREFIXLIST4_NAME$name description",
@@ -1698,6 +1964,9 @@ DEFPY_YANG(
 	return filter_remove_check_empty(vty, "prefix", "ipv4", name, 0, true);
 }
 
+/*
+ * ALIAS no_ip_prefix_list_remark_line —— 为上一条删除描述命令增加带 LINE... 的别名。
+ */
 ALIAS(
 	no_ip_prefix_list_remark, no_ip_prefix_list_remark_line_cmd,
 	"no ip prefix-list PREFIXLIST4_NAME$name description LINE...",
@@ -1708,6 +1977,13 @@ ALIAS(
 	ACCESS_LIST_REMARK_STR
 	ACCESS_LIST_REMARK_LINE_STR)
 
+/*
+ * ipv6_prefix_list —— IPv6 前缀列表配置命令
+ * "ipv6 prefix-list NAME [seq N] deny|permit any|X:X::X:X/M [ge X|le Y]"。
+ * 逻辑：与 IPv4 前缀列表一致，字段换成 ipv6-prefix 与 ipv6-prefix-length-*
+ *   （同样含负值检查，以及未再给出 ge / le 时的 DESTROY）。
+ * 返回：CMD_SUCCESS / CMD_WARNING_CONFIG_FAILED。
+ */
 DEFPY_YANG(
 	ipv6_prefix_list, ipv6_prefix_list_cmd,
 	"ipv6 prefix-list PREFIXLIST6_NAME$name [seq (1-4294967295)] <deny|permit>$action <any|X:X::X:X/M$prefix [{ge (0-128)$ge|le (0-128)$le}]>",
@@ -1806,6 +2082,10 @@ DEFPY_YANG(
 	return nb_cli_apply_changes(vty, "%s", xpath_entry);
 }
 
+/*
+ * no_ipv6_prefix_list —— 删除 IPv6 前缀列表条目（可带前缀匹配）。
+ * 逻辑：委托 plist_remove(vty, "ipv6", ...) 统一处理。
+ */
 DEFPY_YANG(
 	no_ipv6_prefix_list, no_ipv6_prefix_list_cmd,
 	"no ipv6 prefix-list PREFIXLIST6_NAME$name [seq (1-4294967295)$seq] <deny|permit>$action <any|X:X::X:X/M$prefix [{ge (0-128)$ge|le (0-128)$le}]>",
@@ -1826,6 +2106,10 @@ DEFPY_YANG(
 			    prefix_str ? prefix : NULL, ge, le);
 }
 
+/*
+ * no_ipv6_prefix_list_seq —— 按序号删除 IPv6 前缀列表条目
+ * "no ipv6 prefix-list NAME seq N"。
+ */
 DEFPY_YANG(
 	no_ipv6_prefix_list_seq, no_ipv6_prefix_list_seq_cmd,
 	"no ipv6 prefix-list PREFIXLIST6_NAME$name seq (1-4294967295)$seq",
@@ -1838,6 +2122,9 @@ DEFPY_YANG(
 	return plist_remove(vty, "ipv6", name, seq, NULL, NULL, 0, 0);
 }
 
+/*
+ * no_ipv6_prefix_list_all —— "no ipv6 prefix-list NAME"：删除整张 IPv6 前缀列表。
+ */
 DEFPY_YANG(
 	no_ipv6_prefix_list_all, no_ipv6_prefix_list_all_cmd,
 	"no ipv6 prefix-list PREFIXLIST6_NAME$name",
@@ -1855,6 +2142,10 @@ DEFPY_YANG(
 	return nb_cli_apply_changes(vty, NULL);
 }
 
+/*
+ * ipv6_prefix_list_remark —— "ipv6 prefix-list NAME description LINE..."：设置描述。
+ * 逻辑同 IPv4 版本，类型为 ipv6，LINE 起始下标为 4，临时串需释放。
+ */
 DEFPY_YANG(
 	ipv6_prefix_list_remark, ipv6_prefix_list_remark_cmd,
 	"ipv6 prefix-list PREFIXLIST6_NAME$name description LINE...",
@@ -1880,6 +2171,10 @@ DEFPY_YANG(
 	return rv;
 }
 
+/*
+ * no_ipv6_prefix_list_remark —— "no ipv6 prefix-list NAME description"：删除描述。
+ * 逻辑：filter_remove_check_empty 且 del_remark=true。
+ */
 DEFPY_YANG(
 	no_ipv6_prefix_list_remark, no_ipv6_prefix_list_remark_cmd,
 	"no ipv6 prefix-list PREFIXLIST6_NAME$name description",
@@ -1892,6 +2187,9 @@ DEFPY_YANG(
 	return filter_remove_check_empty(vty, "prefix", "ipv6", name, 0, true);
 }
 
+/*
+ * ALIAS no_ipv6_prefix_list_remark_line —— 为 IPv6 删除描述命令增加带 LINE... 的别名。
+ */
 ALIAS(
 	no_ipv6_prefix_list_remark, no_ipv6_prefix_list_remark_line_cmd,
 	"no ipv6 prefix-list PREFIXLIST6_NAME$name description LINE...",
@@ -1902,6 +2200,10 @@ ALIAS(
 	ACCESS_LIST_REMARK_STR
 	ACCESS_LIST_REMARK_LINE_STR)
 
+/*
+ * prefix_list_cmp —— 前缀列表条目的排序比较回调，按 sequence 升序。
+ * 返回：seq1 - seq2。
+ */
 int prefix_list_cmp(const struct lyd_node *dnode1,
 		    const struct lyd_node *dnode2)
 {
@@ -1911,6 +2213,11 @@ int prefix_list_cmp(const struct lyd_node *dnode1,
 	return seq1 - seq2;
 }
 
+/*
+ * prefix_list_show —— 渲染一条前缀列表条目（YANG 显示回调）。
+ * 逻辑：读 type（IPv4 / IPv6）决定前缀来源与 ge / le 字段名；先打印
+ *   "prefix-list NAME seq N action"；any 直接收尾，否则输出前缀及可选 ge / le。
+ */
 void prefix_list_show(struct vty *vty, const struct lyd_node *dnode,
 		      bool show_defaults)
 {
@@ -1970,6 +2277,11 @@ void prefix_list_show(struct vty *vty, const struct lyd_node *dnode,
 	vty_out(vty, "\n");
 }
 
+/*
+ * prefix_list_remark_show —— 渲染前缀列表的 description（YANG 显示回调）。
+ * 逻辑：按 type 输出 "ip " / "ipv6 "，再输出
+ *   "prefix-list NAME description <文本>"。
+ */
 void prefix_list_remark_show(struct vty *vty, const struct lyd_node *dnode,
 			     bool show_defaults)
 {
@@ -1989,6 +2301,12 @@ void prefix_list_remark_show(struct vty *vty, const struct lyd_node *dnode,
 		yang_dnode_get_string(dnode, NULL));
 }
 
+/*
+ * filter_cli_init —— 注册本模块全部配置命令（均挂在 CONFIG_NODE 下）。
+ * 分组安装：传统 Cisco 风格 ACL -> zebra 风格 ACL（IPv4 / IPv6 / MAC）
+ *   -> 前缀列表（IPv4 / IPv6），每类都含 remark / 描述与整表删除命令。
+ * 说明：由 access_list_init_new 在非后端模式下调用（后端不装 config 命令）。
+ */
 void filter_cli_init(void)
 {
 	/* access-list cisco-style (legacy). */

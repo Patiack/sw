@@ -4,6 +4,49 @@
  * Copyright (C) 2019 David Lamparter for NetDEF, Inc.
  */
 
+/* 【文件导读】bgp_bmp.c —— BMP（BGP Monitoring Protocol）实现
+ *
+ * 这个文件做什么：
+ *   实现 RFC 7854（BMP v3）及 RFC 9069（Loc-RIB 监控）等扩展。BMP 是单向旁路
+ *   遥测：把 BGP 的邻居状态变化、收到的路由（策略前 / 策略后 / loc-rib）、以及
+ *   原始报文，镜像给外部监控服务器。它是只读观察者，不改变 BGP 自身的选路与
+ *   转发行为，也不参与任何 BGP 协议交互。
+ *
+ * 整体架构（生产者—队列—发送线程）：
+ *   1) 生产者：BGP 主线程在若干 hook 点（见文件末尾 bgp_bmp_module_init）被回调，
+ *      把要上报的内容封装成 stream 或队列项；
+ *   2) 队列：route monitoring 走 bmp_queue_entry（按键去重，见 bmp_process /
+ *      bmp_process_one）；route mirroring 走 bmp_mirrorq（原样入队，见
+ *      bmp_mirror_packet）；
+ *   3) 发送线程：每条 BMP 会话有一个 pullwr，其填充回调是 bmp_wrfill，它在需要时
+ *      被唤醒，从队列取出一条消息写 socket。这样 BGP 主线程永不阻塞在慢速监控端
+ *      的 socket 上。
+ *
+ * 两类"路由上报"的本质区别：
+ *   - route monitoring（bmp_monitor / bmp_wrqueue）：把路由加工成新的 BGP UPDATE
+ *     再发出，可发生在策略前（pre-policy，来自 Adj-RIB-In）、策略后（post-policy，
+ *     来自 Loc-RIB 中的有效路径）、或 loc-rib。同一前缀的过时更新可被新更新替换
+ *     （去重），因此带宽受控。
+ *   - route mirroring（bmp_mirror_packet / bmp_wrmirror）：把收到的原始 BGP PDU
+ *     逐字节透传，不解析、不套策略、不去重，能在监控端完整复现线缆上的报文。
+ *     代价是可能占满缓冲，因此设有 mirror_qsizelimit 与"丢消息"提示。
+ *
+ * "给谁发、发多少、发什么"由配置决定：
+ *   - 给谁发：bmp_targets 下的 bmp_listener（被动监听）与 bmp_active（主动外连）；
+ *   - 发什么：bmp_targets->afimon[afi][safi] 的三个位 pre-policy / post-policy /
+ *     loc-rib，外加 bmp_targets->mirror 开关；
+ *   - 发多少：是否导入其它 BGP 实例（bmp_imported_bgp）、mirror 缓冲上限等。
+ *
+ * 推荐阅读顺序：
+ *   1) 文件头部的比较 / 哈希 / 队列模板实例化（DECLARE_*）建立数据结构；
+ *   2) bmp_common_hdr / bmp_per_peer_hdr / bmp_send_initiation：消息封装；
+ *   3) bmp_peerstate / bmp_monitor / bmp_mirror_packet：三类主要消息的生成；
+ *   4) bmp_wrfill 及其调用的 bmp_wrmirror / bmp_wrqueue / bmp_wrqueue_locrib /
+ *      bmp_wrsync：发送侧状态机；
+ *   5) bmp_open / bmp_accept / bmp_active_*：会话建立；
+ *   6) 文件末尾的 DEFPY 配置命令与 bgp_bmp_module_init 的 hook 注册。
+ */
+
 #include <zebra.h>
 
 #include "log.h"
@@ -58,6 +101,9 @@ static struct bmp_imported_bgp *bmp_imported_bgp_find(struct bmp_targets *bt, ch
 static void bmp_stats_per_instance(struct bgp *bgp, struct bmp_targets *bt);
 static void bmp_bgp_peer_vrf(struct bmp_bgp_peer *bbpeer, struct bgp *bgp);
 
+/* 内存统计组与各类内存类型（MTYPE_*）：BMP 相关的每次 XMALLOC / XCALLOC 都带上这些
+ * 类型，便于 memory MTYPE 统计与泄漏排查。
+ */
 DEFINE_MGROUP(BMP, "BMP (BGP Monitoring Protocol)");
 
 DEFINE_MTYPE_STATIC(BMP, BMP_CONN,	"BMP connection state");
@@ -75,6 +121,9 @@ DEFINE_MTYPE_STATIC(BMP, BMP_IMPORTED_BGP, "BMP imported BGP instance");
 
 DEFINE_QOBJ_TYPE(bmp_targets);
 
+/* bmp_bgph：以 struct bgp 指针为键的哈希表，把每个 BGP 实例映射到它的 BMP 状态
+ * （struct bmp_bgp）。下面两个函数即哈希表所需的比较与散列函数。
+ */
 static int bmp_bgp_cmp(const struct bmp_bgp *a, const struct bmp_bgp *b)
 {
 	if (a->bgp < b->bgp)
@@ -93,6 +142,9 @@ DECLARE_HASH(bmp_bgph, struct bmp_bgp, bbi, bmp_bgp_cmp, bmp_bgp_hash);
 
 struct bmp_bgph_head bmp_bgph;
 
+/* bmp_peerh：以 peer 的 qobj nid 为键的哈希表，映射到每个 peer 保存的 OPEN 报文等
+ * BMP 附属数据（struct bmp_bgp_peer）。
+ */
 static int bmp_bgp_peer_cmp(const struct bmp_bgp_peer *a,
 		const struct bmp_bgp_peer *b)
 {
@@ -117,6 +169,7 @@ DECLARE_LIST(bmp_mirrorq, struct bmp_mirrorq, bmi);
 
 /* listener management */
 
+/* 监听端点（bmp_listener）按 (地址, 端口) 排序去重，同一 target 下相同端点只保留一份。 */
 static int bmp_listener_cmp(const struct bmp_listener *a,
 		const struct bmp_listener *b)
 {
@@ -135,12 +188,14 @@ static int bmp_listener_cmp(const struct bmp_listener *a,
 DECLARE_SORTLIST_UNIQ(bmp_listeners, struct bmp_listener, bli,
 		      bmp_listener_cmp);
 
+/* 释放一个监听端点：先从所属 target 的 listeners 表摘除，再释放内存。 */
 static void bmp_listener_put(struct bmp_listener *bl)
 {
 	bmp_listeners_del(&bl->targets->listeners, bl);
 	XFREE(MTYPE_BMP_LISTENER, bl);
 }
 
+/* bmp_targets 按 name 排序去重，name 即配置中的 "bmp targets <NAME>"。 */
 static int bmp_targets_cmp(const struct bmp_targets *a,
 			   const struct bmp_targets *b)
 {
@@ -149,6 +204,7 @@ static int bmp_targets_cmp(const struct bmp_targets *a,
 
 DECLARE_SORTLIST_UNIQ(bmp_targets, struct bmp_targets, bti, bmp_targets_cmp);
 
+/* 被导入的 BGP 实例按名字排序去重；name == NULL 视为同一个（代表默认实例）。 */
 static int bmp_imported_bgps_cmp(const struct bmp_imported_bgp *a, const struct bmp_imported_bgp *b)
 {
 	if (a->name == NULL && b->name == NULL)
@@ -164,6 +220,11 @@ DECLARE_LIST(bmp_session, struct bmp, bsi);
 
 DECLARE_DLIST(bmp_qlist, struct bmp_queue_entry, bli);
 
+/* route monitoring 队列项的排序 / 相等判定，决定"同一键"的语义。
+ * 排序优先级：先处理 AFI/SAFI 特殊项（L2VPN/EVPN 与 MPLS VPN）按其 RD 比较，再按
+ * 前缀 p，最后按 peerid。仅比较到 refcount 之前的所有键字段，因此
+ * (afi,safi,prefix,peerid[,rd]) 相同的两项被判等，从而实现按键去重。
+ */
 static int bmp_rbtree_cmp(const struct bmp_queue_entry *a,
 			  const struct bmp_queue_entry *b)
 {
@@ -199,6 +260,7 @@ static int bmp_rbtree_cmp(const struct bmp_queue_entry *a,
 
 DECLARE_RBTREE_UNIQ(bmp_rbtree, struct bmp_queue_entry, bhi, bmp_rbtree_cmp);
 
+/* 主动外连配置按 (hostname, port) 排序去重。 */
 static int bmp_active_cmp(const struct bmp_active *a,
 		const struct bmp_active *b)
 {
@@ -216,6 +278,9 @@ static int bmp_active_cmp(const struct bmp_active *a,
 
 DECLARE_SORTLIST_UNIQ(bmp_actives, struct bmp_active, bai, bmp_active_cmp);
 
+/* 新建一条 BMP 会话运行时对象，并加入 target 的 sessions 链表。初始按 target 的
+ * afimon 为每个 (afi,safi) 决定是 NEEDSYNC（需要发送整表同步）还是 INACTIVE。
+ */
 static struct bmp *bmp_new(struct bmp_targets *bt, int bmp_sock)
 {
 	struct bmp *new = XCALLOC(MTYPE_BMP_CONN, sizeof(struct bmp));
@@ -237,6 +302,7 @@ static struct bmp *bmp_new(struct bmp_targets *bt, int bmp_sock)
 	return new;
 }
 
+/* 释放 BMP 会话运行时对象（仅内存；关闭 socket 由 bmp_close 负责）。 */
 static void bmp_free(struct bmp *bmp)
 {
 	bmp_session_del(&bmp->targets->sessions, bmp);
@@ -247,6 +313,13 @@ static void bmp_free(struct bmp *bmp)
 #define BMP_PEER_TYPE_RD_INSTANCE 1
 #define BMP_PEER_TYPE_LOCAL_INSTANCE 2
 #define BMP_PEER_TYPE_LOC_RIB_INSTANCE 3
+
+/* per-peer header 的 "Peer Type" 字段取值（本文件私有定义）：
+ *   GLOBAL_INSTANCE    —— 全局默认实例（vrf_id == VRF_DEFAULT）；
+ *   RD_INSTANCE        —— 带 RD 的普通 VRF 实例；
+ *   LOCAL_INSTANCE     —— 本地实例（VRF 未知时按此处理）；
+ *   LOC_RIB_INSTANCE   —— Loc-RIB 监控（RFC 9069）。
+ */
 
 /* determine the peer type for per-peer headers from a vrf_id
  * for non loc-rib peer type only
@@ -264,6 +337,9 @@ static inline int bmp_get_peer_type_vrf(vrf_id_t vrf_id)
 	}
 }
 
+/* 由 struct peer 判定 peer type：peer_self（即 loc-rib 视角）返回 LOC_RIB_INSTANCE，
+ * 否则按 peer 所在实例的 vrf_id 归类。
+ */
 /* determine the peer type for per-peer headers from a struct peer
  * provide a bgp->peer_self for loc-rib
  */
@@ -275,6 +351,11 @@ static inline int bmp_get_peer_type(struct peer *peer)
 	return bmp_get_peer_type_vrf(peer->bgp->vrf_id);
 }
 
+/* 计算 per-peer header 的 "Peer Distinguisher" 字段（8 字节）。
+ * 规则：本地实例或 VRF 未知时无区分符（返回 1，调用方据此跳过该消息）；默认实例填
+ * 0；若配了到 VPN 的 RD（vpn_policy[afi].tovpn_rd）则直接复制该 RD；否则把 vrf_id
+ * 转成 "::vrf_id" 的 64 位形式。返回 0 表示成功，非 0 表示无法给出区分符。
+ */
 static inline int bmp_get_peer_distinguisher(struct bgp *bgp, afi_t afi, uint8_t peer_type,
 					     uint64_t *result_ref)
 {
@@ -308,6 +389,9 @@ static inline int bmp_get_peer_distinguisher(struct bgp *bgp, afi_t afi, uint8_t
 	return 0;
 }
 
+/* 写 BMP 公共头（common header）：版本号(1B) + 消息长度(4B) + 消息类型(1B)。
+ * 长度此处先占位为 0，待正文写完后由调用方用 stream_putl_at(BMP_LENGTH_POS, ...) 回填。
+ */
 static void bmp_common_hdr(struct stream *s, uint8_t ver, uint8_t type)
 {
 	stream_putc(s, ver);
@@ -315,6 +399,11 @@ static void bmp_common_hdr(struct stream *s, uint8_t ver, uint8_t type)
 	stream_putc(s, type);
 }
 
+/* 写 per-peer header：除 initiation 外所有 BMP 消息共用的邻居描述头。依次写
+ * Peer Type、Peer Flags、Peer Distinguisher、Peer Address、Peer AS、Peer BGP ID、
+ * Timestamp。对 Loc-RIB（RFC 9069）特殊处理：地址置 0、ASN 用本实例 AS、BGP ID 用
+ * 本实例 router-id。
+ */
 static void bmp_per_peer_hdr(struct stream *s, struct bgp *bgp,
 			     struct peer *peer, uint8_t flags,
 			     uint8_t peer_type_flag,
@@ -386,6 +475,7 @@ static void bmp_per_peer_hdr(struct stream *s, struct bgp *bgp,
 	}
 }
 
+/* 写一个通用 Information TLV：type(2B) + length(2B) + value。 */
 static void bmp_put_info_tlv(struct stream *s, uint16_t type,
 		const char *string)
 {
@@ -397,6 +487,9 @@ static void bmp_put_info_tlv(struct stream *s, uint16_t type,
 
 /* put the vrf table name of the bgp instance bmp is bound to in a tlv on the
  * stream
+ */
+/* 写 "VRF/Table Name" Information TLV（type=3）：loc-rib 通知中用来标明该实例对应的
+ * VRF 名称；默认实例固定为 "global"。
  */
 static void bmp_put_vrftablename_info_tlv(struct stream *s, struct peer *peer)
 {
@@ -414,6 +507,11 @@ static void bmp_put_vrftablename_info_tlv(struct stream *s, struct peer *peer)
 		bmp_put_info_tlv(s, BMP_INFO_TYPE_VRFTABLENAME, vrftablename);
 }
 
+/* 发送 initiation 消息（BMP_TYPE_INITIATION）。内含两条 Information TLV：
+ *   SYSDESCR（1）：FRR 名称与版本；
+ *   SYSNAME （2）：本机 hostname。
+ * 这是每条 BMP 会话建立后发送的第一条消息。
+ */
 static int bmp_send_initiation(struct bmp *bmp)
 {
 	int len;
@@ -435,6 +533,9 @@ static int bmp_send_initiation(struct bmp *bmp)
 	return 0;
 }
 
+/* 在 stream 中追加一个完整的 BGP NOTIFICATION 报文（含 16 字节全 0xFF marker、
+ * 长度、类型、错误码 / 子码与数据），用于 peer down 通知里携带远端发来的通告。
+ */
 static void bmp_notify_put(struct stream *s, struct bgp_notify *nfy)
 {
 	size_t len_pos;
@@ -460,6 +561,12 @@ static void bmp_notify_put(struct stream *s, struct bgp_notify *nfy)
 /* send peer up/down for peer based on down boolean value
  * returns the message to send or NULL if the peer_distinguisher is not
  * available
+ */
+/* 构造 peer up / peer down 通知（BMP_TYPE_PEER_UP_NOTIFICATION / _DOWN_NOTIFICATION）。
+ *   down == false 且邻居已 Established（或 loc-rib）：发 peer up，附带本端 / 对端
+ *     OPEN 报文（缺失则用 dummy OPEN）以及 local / remote 地址与端口。
+ *   否则发 peer down，并按 peer->last_reset 映射 down 原因码（见 BMP_PEERDOWN_*）。
+ * 返回待发送的 stream；若拿不到 peer distinguisher 则返回 NULL 表示跳过。
  */
 static struct stream *bmp_peerstate(struct peer *peer, bool down)
 {
@@ -602,6 +709,7 @@ static struct stream *bmp_peerstate(struct peer *peer, bool down)
 	return s;
 }
 
+/* 对某 BGP 实例（含其 loc-rib peer_self）下的所有 peer，逐一生成并发送 peer up 通知。 */
 static int bmp_send_peerup_per_instance(struct bmp *bmp, struct bgp *bgp)
 {
 	struct peer *peer;
@@ -619,6 +727,7 @@ static int bmp_send_peerup_per_instance(struct bmp *bmp, struct bgp *bgp)
 	return 0;
 }
 
+/* 新会话建立后，为本 target 自身的 BGP 实例及其全部导入实例发送所有 peer up。 */
 static int bmp_send_peerup(struct bmp *bmp)
 {
 	struct bmp_imported_bgp *bib;
@@ -634,6 +743,9 @@ static int bmp_send_peerup(struct bmp *bmp)
 	return 0;
 }
 
+/* 针对某实例的 peer_self（loc-rib 视角）发送 VRF 级 peer up/down：先刷新 vrf_state，
+ * 再据其结果决定发 peer up 还是 peer down。
+ */
 static void bmp_send_peerup_vrf_per_instance(struct bmp *bmp, enum bmp_vrf_state *vrf_state,
 					     struct bgp *bgp)
 {
@@ -651,6 +763,7 @@ static void bmp_send_peerup_vrf_per_instance(struct bmp *bmp, enum bmp_vrf_state
 	}
 }
 
+/* 为新会话发送 target 自身实例及各导入实例的 VRF（loc-rib）状态消息。 */
 static int bmp_send_peerup_vrf(struct bmp *bmp)
 {
 	struct bgp *bgp;
@@ -671,6 +784,7 @@ static int bmp_send_peerup_vrf(struct bmp *bmp)
 	return 0;
 }
 
+/* 把同一份 stream 交给某 target 下的所有 BMP 会话（各会话用自己的 pullwr 各写一份）。 */
 static void bmp_send_bt(struct bmp_targets *bt, struct stream *s)
 {
 	struct bmp *bmp;
@@ -679,6 +793,7 @@ static void bmp_send_bt(struct bmp_targets *bt, struct stream *s)
 		pullwr_write_stream(bmp->pullwr, s);
 }
 
+/* bmp_send_bt 的空安全封装：s 为空直接返回，否则发送后释放 stream。 */
 static void bmp_send_bt_safe(struct bmp_targets *bt, struct stream *s)
 {
 	if (!s)
@@ -689,6 +804,7 @@ static void bmp_send_bt_safe(struct bmp_targets *bt, struct stream *s)
 	stream_free(s);
 }
 
+/* 为某实例的 peer_self 构造并广播一条 peer down 通知。 */
 static void bmp_send_peerdown_vrf_per_instance(struct bmp_targets *bt, struct bgp *bgp)
 {
 	struct stream *s;
@@ -700,6 +816,7 @@ static void bmp_send_peerdown_vrf_per_instance(struct bmp_targets *bt, struct bg
 	stream_free(s);
 }
 
+/* 把一个 stream 广播给某 BGP 实例下所有 target 的所有会话，随后释放它。 */
 /* send a stream to all bmp sessions configured in a bgp instance */
 /* XXX: kludge - filling the pullwr's buffer */
 static void bmp_send_all(struct bmp_bgp *bmpbgp, struct stream *s)
@@ -715,6 +832,7 @@ static void bmp_send_all(struct bmp_bgp *bmpbgp, struct stream *s)
 	stream_free(s);
 }
 
+/* bmp_send_all 的空安全封装：bmpbgp / s 为空时只释放 s。 */
 static void bmp_send_all_safe(struct bmp_bgp *bmpbgp, struct stream *s)
 {
 	if (!s)
@@ -732,12 +850,18 @@ static void bmp_send_all_safe(struct bmp_bgp *bmpbgp, struct stream *s)
  * Route Mirroring
  */
 
+/* route mirroring 的 TLV 类型：BGP_MESSAGE 存放一段原始 BGP PDU，INFO 存放提示信息
+ * （错误 PDU 或丢消息，code 见下）。镜像队列不分键、不去重，按到达顺序逐条保存。
+ */
 #define BMP_MIRROR_TLV_TYPE_BGP_MESSAGE 0
 #define BMP_MIRROR_TLV_TYPE_INFO        1
 
 #define BMP_MIRROR_INFO_CODE_ERRORPDU   0
 #define BMP_MIRROR_INFO_CODE_LOSTMSGS   1
 
+/* 从会话的镜像读游标取出一条镜像队列项并推进游标；每取出一条即对 refcount 减一，
+ * 减到 0 时说明所有会话都已发过，从队列移除并归还内存统计。
+ */
 static struct bmp_mirrorq *bmp_pull_mirror(struct bmp *bmp)
 {
 	struct bmp_mirrorq *bmq;
@@ -756,6 +880,10 @@ static struct bmp_mirrorq *bmp_pull_mirror(struct bmp *bmp)
 	return bmq;
 }
 
+/* 当某实例的镜像队列超过 mirror_qsizelimit 时，从队首开始丢弃：对仍指向队首的会话，
+ * 前移其游标并丢弃这些条目，同时置 mirror_lost，以便随后向监控端发一条"丢消息"提示。
+ * 这是"宁可丢消息也不无限占内存"的取舍。
+ */
 static void bmp_mirror_cull(struct bmp_bgp *bmpbgp)
 {
 	while (bmpbgp->mirror_qsize > bmpbgp->mirror_qsizelimit) {
@@ -787,6 +915,12 @@ static void bmp_mirror_cull(struct bmp_bgp *bmpbgp)
 	}
 }
 
+/* 【route mirroring 入口】BGP 收到（或发出）每个报文时由 bgp_packet_dump hook 调用。
+ *   - 若是 OPEN，保存一份到 peer 的 BMP 附属数据（供 peer up 回填）；
+ *   - 把整段原始 PDU 复制进 bmp_mirrorq，然后遍历该 peer 所属实例以及所有导入了它的
+ *     target，对每个开启了 mirror 的会话入队并唤醒发送线程；
+ *   - 这里完全不做策略、不做去重，是"逐字节镜像"。
+ */
 static int bmp_mirror_packet(struct peer *peer, uint8_t type, bgp_size_t size,
 		struct stream *packet)
 {
@@ -859,6 +993,9 @@ static int bmp_mirror_packet(struct peer *peer, uint8_t type, bgp_size_t size,
 	return 0;
 }
 
+/* 当镜像缓冲此前曾溢出时，向监控端补发一条 ROUTE_MIRRORING / INFO / LOSTMSGS 提示，
+ * 告知对端中间发生了丢消息，同时累加 cnt_mirror_overruns。
+ */
 static void bmp_wrmirror_lost(struct bmp *bmp, struct pullwr *pullwr)
 {
 	struct stream *s;
@@ -892,6 +1029,10 @@ static void bmp_wrmirror_lost(struct bmp *bmp, struct pullwr *pullwr)
 	stream_free(s);
 }
 
+/* 【route mirroring 发送】pullwr 填充回调之一：若上一轮被标记过 mirror_lost，先补发
+ * 丢消息提示；否则取出一条镜像队列项，按 (common header + per-peer header + TLV 头)
+ * 封装后连同原始 PDU 一并写出。返回 true 表示本次写出了内容。
+ */
 static bool bmp_wrmirror(struct bmp *bmp, struct pullwr *pullwr)
 {
 	struct bmp_mirrorq *bmq;
@@ -948,6 +1089,9 @@ out:
 	return written;
 }
 
+/* bgp_packet_send hook：本端将要发出的报文经过这里。目前仅用于缓存自己发出的 OPEN
+ * 报文副本（open_tx），供本端 peer up 通知回填使用。
+ */
 static int bmp_outgoing_packet(struct peer *peer, uint8_t type, bgp_size_t size,
 		struct stream *packet)
 {
@@ -965,6 +1109,11 @@ static int bmp_outgoing_packet(struct peer *peer, uint8_t type, bgp_size_t size,
 	return 0;
 }
 
+/* peer_status_changed hook：邻居状态变化时调用。
+ *   - 邻居被删除：清理其 BMP 附属数据；
+ *   - 邻居刚进入 Established：处理 doppelganger（连接碰撞）场景下 OPEN 的迁移，并
+ *     广播该 peer 的 peer up 通知。
+ */
 static int bmp_peer_status_changed(struct peer *peer)
 {
 	struct bmp_bgp_peer *bbpeer, *bbdopp;
@@ -1009,6 +1158,9 @@ static int bmp_peer_status_changed(struct peer *peer)
 	return 0;
 }
 
+/* peer_backward_transition hook：邻居状态回退（离开 Established 等）时调用。清空缓存
+ * 的 OPEN 报文，并广播 peer down 通知。
+ */
 static int bmp_peer_backward(struct peer *peer)
 {
 	struct bmp_bgp_peer *bbpeer;
@@ -1027,6 +1179,10 @@ static int bmp_peer_backward(struct peer *peer)
 	return 0;
 }
 
+/* 为同步结束构造并发送 End-of-RIB（EoR）通知。做法是手工拼一个"空"BGP UPDATE：
+ * IPv4 unicast 用空 withdrawn / 空属性；其它 afi/safi 用 MP_UNREACH_NLRI 空属性。
+ * 对 bgp->peer 下所有已协商该 afi/safi 的邻居，加上 per-peer header 后发出。
+ */
 static void bmp_eor(struct bmp *bmp, afi_t afi, safi_t safi, uint8_t flags, uint8_t peer_type_flag,
 		    struct bgp *bgp)
 {
@@ -1094,6 +1250,10 @@ static void bmp_eor(struct bmp *bmp, afi_t afi, safi_t safi, uint8_t flags, uint
 	stream_free(s);
 }
 
+/* 把一条路由（前缀 + 属性）编码成一个标准 BGP UPDATE 报文 stream，供 route monitoring
+ * 使用。IPv4 unicast 走经典 NLRI 编码；其它场景走 MP_REACH_NLRI。本函数复用现有的
+ * bgp_packet_attribute / bgp_packet_mpattr_* 编码器。
+ */
 static struct stream *bmp_update(const struct prefix *p, struct prefix_rd *prd,
 				 struct peer *peer, struct attr *attr,
 				 afi_t afi, safi_t safi, mpls_label_t *label,
@@ -1144,6 +1304,9 @@ static struct stream *bmp_update(const struct prefix *p, struct prefix_rd *prd,
 	return s;
 }
 
+/* 把一条路由的撤销编码成 BGP UPDATE 报文 stream：IPv4 unicast 用 withdrawn routes 段，
+ * 其它场景用 MP_UNREACH_NLRI 属性。
+ */
 static struct stream *bmp_withdraw(const struct prefix *p,
 				   struct prefix_rd *prd, afi_t afi,
 				   safi_t safi)
@@ -1185,6 +1348,10 @@ static struct stream *bmp_withdraw(const struct prefix *p,
 	return s;
 }
 
+/* 【route monitoring 核心】生成并发送一条 ROUTE_MONITORING 消息：头部（common header +
+ * per-peer header）+ 正文（attr 非空则用 bmp_update 编码为 announce，否则用 bmp_withdraw
+ * 编码为 withdraw）。flags 中的 BMP_PEER_FLAG_L 表示这是策略后 / loc-rib 视角。
+ */
 static void bmp_monitor(struct bmp *bmp, struct peer *peer, uint8_t flags,
 			uint8_t peer_type_flag, const struct prefix *p,
 			struct prefix_rd *prd, struct attr *attr, afi_t afi,
@@ -1225,6 +1392,9 @@ static void bmp_monitor(struct bmp *bmp, struct peer *peer, uint8_t flags,
 	stream_free(msg);
 }
 
+/* 在 target 自身实例与所有导入实例之间，按注册顺序找出下一个"已请求同步该 afi/safi"
+ * 的 BGP 实例（整表同步逐个实例推进）。bgp 传入 NULL 表示从最先者开始。
+ */
 static struct bgp *bmp_get_next_bgp(struct bmp_targets *bt, struct bgp *bgp, afi_t afi, safi_t safi)
 {
 	struct bmp_imported_bgp *bib;
@@ -1245,6 +1415,9 @@ static struct bgp *bmp_get_next_bgp(struct bmp_targets *bt, struct bgp *bgp, afi
 	return NULL;
 }
 
+/* 标记某 (afi,safi) 需要重新做整表同步：把该会话的 afistate 置 NEEDSYNC，并给相关实例
+ * 的 bgp_request_sync 打上请求。若该 afi/safi 已不再监控则直接置 INACTIVE。
+ */
 static void bmp_update_syncro(struct bmp *bmp, afi_t afi, safi_t safi, struct bgp *bgp)
 {
 	struct bmp_imported_bgp *bib;
@@ -1272,6 +1445,9 @@ static void bmp_update_syncro(struct bmp *bmp, afi_t afi, safi_t safi, struct bg
 	}
 }
 
+/* 某 (afi,safi) 同步完成或无需同步时调用：设置最终状态（LIVE / INACTIVE），并清除相关
+ * 实例的 bgp_request_sync 请求标志。
+ */
 static void bmp_update_syncro_set(struct bmp *bmp, afi_t afi, safi_t safi, struct bgp *bgp,
 				  enum bmp_afi_state state)
 {
@@ -1290,6 +1466,9 @@ static void bmp_update_syncro_set(struct bmp *bmp, afi_t afi, safi_t safi, struc
 	}
 }
 
+/* 某 afi/safi 整表同步完成：按监控配置分别发送 pre-policy / post-policy / loc-rib 的
+ * EoR，然后切换到下一个待同步实例；若没有下一个则把该 afi/safi 置为 LIVE。
+ */
 static void bmp_eor_afi_safi(struct bmp *bmp, afi_t afi, safi_t safi, uint8_t peer_type_flag)
 {
 	struct bgp *sync_bgp;
@@ -1315,6 +1494,11 @@ static void bmp_eor_afi_safi(struct bmp *bmp, afi_t afi, safi_t safi, uint8_t pe
 	bmp->sync_bgp = sync_bgp;
 }
 
+/* 【整表同步发送】把某 BGP 实例某 afi/safi 的路由表按序分批上报（每次 pullwr 回调发一
+ * 部分），支持 IPv4/IPv6 普通表以及 EVPN / MPLS VPN 的两层表结构。会按配置同时发出
+ * pre-policy（Adj-RIB-In）、post-policy（有效路径）与 loc-rib 三种视角。整表发完后调用
+ * bmp_eor_afi_safi 发 EoR。返回 true 表示本次写出了内容。
+ */
 static bool bmp_wrsync(struct bmp *bmp, struct pullwr *pullwr)
 {
 	uint8_t bpi_num_labels, adjin_num_labels;
@@ -1524,6 +1708,9 @@ afibreak:
 }
 
 static struct bmp_queue_entry *
+/* 从一个 monitoring 队列取出游标所指条目并推进游标；refcount 减到 0 时从红黑树与链表中
+ * 移除。普通队列与 loc-rib 队列共用本实现，只是传入不同的队列 / 树 / 游标指针。
+ */
 bmp_pull_from_queue(struct bmp_qlist_head *list, struct bmp_rbtree_head *hash,
 		    struct bmp_queue_entry **queuepos_ptr)
 {
@@ -1543,12 +1730,14 @@ bmp_pull_from_queue(struct bmp_qlist_head *list, struct bmp_rbtree_head *hash,
 	return bqe;
 }
 
+/* 从 target 的普通（pre / post-policy）monitoring 队列取出一条。 */
 static inline struct bmp_queue_entry *bmp_pull(struct bmp *bmp)
 {
 	return bmp_pull_from_queue(&bmp->targets->updlist,
 				   &bmp->targets->updhash, &bmp->queuepos);
 }
 
+/* 从 target 的 loc-rib monitoring 队列取出一条。 */
 static inline struct bmp_queue_entry *bmp_pull_locrib(struct bmp *bmp)
 {
 	return bmp_pull_from_queue(&bmp->targets->locupdlist,
@@ -1558,6 +1747,10 @@ static inline struct bmp_queue_entry *bmp_pull_locrib(struct bmp *bmp)
 
 /* TODO BMP_MON_LOCRIB find a way to merge properly this function with
  * bmp_wrqueue or abstract it if possible
+ */
+/* 【loc-rib 队列发送】pullwr 填充回调之一，处理 loc-rib（RFC 9069）监控项：SYNC 阶段
+ * 跳过尚未同步到的前缀（交给整表同步发），LIVE 阶段则查 Loc-RIB 中该前缀被选中的路径
+ * 并上报。
  */
 static bool bmp_wrqueue_locrib(struct bmp *bmp, struct pullwr *pullwr)
 {
@@ -1648,6 +1841,10 @@ out:
 	return written;
 }
 
+/* 【pre / post-policy 队列发送】pullwr 填充回调之一：按 afistate 决定能否发送（SYNC
+ * 阶段跳过尚未同步到的前缀），然后分别按 post-policy（查有效路径的 attr）与 pre-policy
+ * （查邻接表 adj_in 的 attr）生成 ROUTE_MONITORING 消息。
+ */
 static bool bmp_wrqueue(struct bmp *bmp, struct pullwr *pullwr)
 {
 	struct bmp_queue_entry *bqe;
@@ -1744,6 +1941,10 @@ out:
 	return written;
 }
 
+/* 【发送线程回调】pullwr 的填充函数：每次有可写空间时被调用，按优先级依次尝试产出下
+ * 一条待发内容：镜像 > 普通 monitoring 队列 > loc-rib 队列 > 整表同步。会话刚建立时
+ * (BMP_PeerUp) 先补发 peer up / VRF 状态消息再进入 BMP_Run。产出一条即返回。
+ */
 static void bmp_wrfill(struct bmp *bmp, struct pullwr *pullwr)
 {
 	afi_t afi;
@@ -1771,6 +1972,7 @@ static void bmp_wrfill(struct bmp *bmp, struct pullwr *pullwr)
 	}
 }
 
+/* pullwr 的错误 / 断开回调：记录日志后关闭并释放该会话。 */
 static void bmp_wrerr(struct bmp *bmp, struct pullwr *pullwr, bool eof)
 {
 	if (eof)
@@ -1784,6 +1986,10 @@ static void bmp_wrerr(struct bmp *bmp, struct pullwr *pullwr, bool eof)
 }
 
 static struct bmp_queue_entry *
+/* 把 "某实例的某 (afi,safi) 前缀，来自 peer 的更新" 作为一个队列项放入 monitoring 队列：
+ * 若同键项已在队列中则先摘除再重新追加到队尾（实现"旧更新被新更新取代"的合并语义），否则
+ * 新建一项。refcount 设为当前会话数，表示还需发给多少个会话。返回该队列项。
+ */
 bmp_process_one(struct bmp_targets *bt, struct bmp_rbtree_head *updhash,
 		struct bmp_qlist_head *updlist, struct bgp *bgp, afi_t afi,
 		safi_t safi, struct bgp_dest *bn, struct peer *peer)
@@ -1830,6 +2036,10 @@ bmp_process_one(struct bmp_targets *bt, struct bmp_rbtree_head *updhash,
 	 */
 }
 
+/* 【monitoring 生产者】bgp_process hook：BGP 完成一次前缀处理（安装 / 撤销路由）后调用。
+ * 遍历所有 BGP 实例与 target，对开启了（非 loc-rib）monitoring 的 target 调
+ * bmp_process_one 入队，并唤醒各会话的发送线程。
+ */
 static int bmp_process(struct bgp *bgp, afi_t afi, safi_t safi,
 		       struct bgp_dest *bn, struct peer *peer, bool withdraw)
 {
@@ -1881,6 +2091,9 @@ static int bmp_process(struct bgp *bgp, afi_t afi, safi_t safi,
 	return 0;
 }
 
+/* bgp_nht_path_update hook：路径有效性变化时调用。自身宣告 / 重发布的路由（peer_self）
+ * 与 BMP 无关，直接跳过；否则据 valid 决定按更新还是撤销入队。
+ */
 static int bmp_nht_path_valid(struct bgp *bgp, struct bgp_path_info *path, bool valid)
 {
 	struct bgp_dest *dest = path->net;
@@ -1901,6 +2114,7 @@ static int bmp_nht_path_valid(struct bgp *bgp, struct bgp_path_info *path, bool 
 	return bmp_process(bgp, table->afi, table->safi, dest, path->peer, !valid);
 }
 
+/* 写一条 32 位 statistics TLV：type(2B) + length(4B) + value(4B)，并自增计数。 */
 static void bmp_stat_put_u32(struct stream *s, size_t *cnt, uint16_t type,
 		uint32_t value)
 {
@@ -1910,6 +2124,7 @@ static void bmp_stat_put_u32(struct stream *s, size_t *cnt, uint16_t type,
 	(*cnt)++;
 }
 
+/* 写一条 64 位 statistics TLV：type(2B) + length(8B) + value(8B)，并自增计数。 */
 static void bmp_stat_put_u64(struct stream *s, size_t *cnt, uint16_t type,
 			     uint64_t value)
 {
@@ -1919,6 +2134,9 @@ static void bmp_stat_put_u64(struct stream *s, size_t *cnt, uint16_t type,
 	(*cnt)++;
 }
 
+/* 构造并广播某 peer 的 STATISTICS_REPORT：填充被拒前缀、环路、撤销、Adj-RIB-In 与
+ * Loc-RIB 规模等计数。bt->stats_send_experimental 为真时额外带 FRR 私有统计项。
+ */
 static void bmp_stats_peer(struct peer *peer, struct bmp_targets *bt)
 {
 	size_t count = 0, count_pos, len;
@@ -1961,6 +2179,9 @@ static void bmp_stats_peer(struct peer *peer, struct bmp_targets *bt)
 	bmp_send_all(bt->bmpbgp, s);
 }
 
+/* 定时器回调：按 bt->stat_msec 周期性地为 peer_self、本实例各 peer 及各导入实例发送
+ * statistics report，并重新挂定时器。
+ */
 static void bmp_stats(struct event *event)
 {
 	struct bmp_targets *bt = EVENT_ARG(event);
@@ -1979,6 +2200,7 @@ static void bmp_stats(struct event *event)
 	}
 }
 
+/* 对某实例下所有已 Established 的 peer 逐一发送 statistics report。 */
 static void bmp_stats_per_instance(struct bgp *bgp, struct bmp_targets *bt)
 {
 	struct peer *peer;
@@ -1994,6 +2216,9 @@ static void bmp_stats_per_instance(struct bgp *bgp, struct bmp_targets *bt)
 	}
 }
 
+/* 监听 BMP socket 的可读事件，目的只是检测会话是否被对端关闭（正常不接收应用数据）；
+ * 读到 EOF 或错误即关闭会话，否则继续挂读事件。
+ */
 /* read from the BMP socket to detect session termination */
 static void bmp_read(struct event *t)
 {
@@ -2019,6 +2244,12 @@ static void bmp_read(struct event *t)
 	event_add_read(bm->master, bmp_read, bmp, bmp->socket, &bmp->t_read);
 }
 
+/* 一条 BMP 连接建立后的公共初始化（被动 accept 与主动 connect 都会走到）：
+ *   - 取对端地址，按 family 应用 ip / ipv6 access-list 做准入；
+ *   - 设置 keepalive / nodelay、非阻塞、cloexec；
+ *   - 创建会话对象，latch pullwr（发送回调 bmp_wrfill、错误回调 bmp_wrerr），挂读事件，
+ *     并发送 initiation。
+ */
 static struct bmp *bmp_open(struct bmp_targets *bt, int bmp_sock)
 {
 	union sockunion su, *sumem;
@@ -2098,6 +2329,7 @@ static struct bmp *bmp_open(struct bmp_targets *bt, int bmp_sock)
 	return bmp;
 }
 
+/* 监听 socket 的可读事件：accept 新连接并交给 bmp_open 初始化。 */
 /* Accept BMP connection. */
 static void bmp_accept(struct event *event)
 {
@@ -2119,6 +2351,9 @@ static void bmp_accept(struct event *event)
 	bmp_open(bl->targets, bmp_sock);
 }
 
+/* 关闭一条 BMP 会话：取消读事件、通知 active（若为主动连接）、把本会话在三条共享队列
+ * 中尚未消费的引用全部释放，最后撤销 pullwr 并 close socket（不释放会话对象本身）。
+ */
 static void bmp_close(struct bmp *bmp)
 {
 	struct bmp_queue_entry *bqe;
@@ -2144,12 +2379,14 @@ static void bmp_close(struct bmp *bmp)
 	close(bmp->socket);
 }
 
+/* 查找某 BGP 实例的 BMP 状态对象（不存在返回 NULL）。 */
 static struct bmp_bgp *bmp_bgp_find(struct bgp *bgp)
 {
 	struct bmp_bgp dummy = { .bgp = bgp };
 	return bmp_bgph_find(&bmp_bgph, &dummy);
 }
 
+/* 取得（必要时创建）某 BGP 实例的 BMP 状态对象，并初始化其 targets / mirrorq 容器。 */
 static struct bmp_bgp *bmp_bgp_get(struct bgp *bgp)
 {
 	struct bmp_bgp *bmpbgp;
@@ -2169,6 +2406,7 @@ static struct bmp_bgp *bmp_bgp_get(struct bgp *bgp)
 	return bmpbgp;
 }
 
+/* 释放某 BGP 实例的 BMP 状态：连带释放其下所有 listener 与 target，销毁 mirrorq。 */
 static void bmp_bgp_put(struct bmp_bgp *bmpbgp)
 {
 	struct bmp_targets *bt;
@@ -2187,6 +2425,7 @@ static void bmp_bgp_put(struct bmp_bgp *bmpbgp)
 	XFREE(MTYPE_BMP, bmpbgp);
 }
 
+/* bgp_inst_delete hook：BGP 实例删除时回收其 BMP 状态。 */
 static int bmp_bgp_del(struct bgp *bgp)
 {
 	struct bmp_bgp *bmpbgp = bmp_bgp_find(bgp);
@@ -2196,6 +2435,9 @@ static int bmp_bgp_del(struct bgp *bgp)
 	return 0;
 }
 
+/* 为 loc-rib（RFC 9069）构造 peer_self 的 OPEN 报文：分别为 open_rx 与 open_tx 各生成
+ * 一份（RFC 9069 5.2 规定收到的 OPEN 即本端所发 OPEN 的复刻）。
+ */
 static void bmp_bgp_peer_vrf(struct bmp_bgp_peer *bbpeer, struct bgp *bgp)
 {
 	struct peer *peer = bgp->peer_self;
@@ -2244,6 +2486,11 @@ static void bmp_bgp_peer_vrf(struct bmp_bgp_peer *bbpeer, struct bgp *bgp)
  *
  * returns true if state has changed
  */
+/* 更新某 BGP 实例（或其导入实例）的 VRF 状态。
+ *   force 为 unknown 时用 zebra 的 VRF 是否使能来推断，否则用 force；
+ *   状态由 down 变 up 时为 peer_self 生成 OPEN，由 up 变 down 时清理之。
+ * 返回 true 表示状态发生了变化。
+ */
 bool bmp_bgp_update_vrf_status(enum bmp_vrf_state *vrf_state, struct bgp *bgp,
 			       enum bmp_vrf_state force)
 {
@@ -2283,12 +2530,14 @@ bool bmp_bgp_update_vrf_status(enum bmp_vrf_state *vrf_state, struct bgp *bgp,
 	return changed;
 }
 
+/* 按 peer nid 查找其 BMP 附属数据。 */
 static struct bmp_bgp_peer *bmp_bgp_peer_find(uint64_t peerid)
 {
 	struct bmp_bgp_peer dummy = { .peerid = peerid };
 	return bmp_peerh_find(&bmp_peerh, &dummy);
 }
 
+/* 取得（必要时创建）某 peer 的 BMP 附属数据。 */
 static struct bmp_bgp_peer *bmp_bgp_peer_get(struct peer *peer)
 {
 	struct bmp_bgp_peer *bbpeer;
@@ -2304,6 +2553,7 @@ static struct bmp_bgp_peer *bmp_bgp_peer_get(struct peer *peer)
 	return bbpeer;
 }
 
+/* 在某 BGP 实例下按名字查找 target；实例没有 BMP 状态时返回 NULL。 */
 static struct bmp_targets *bmp_targets_find1(struct bgp *bgp, const char *name)
 {
 	struct bmp_bgp *bmpbgp = bmp_bgp_find(bgp);
@@ -2315,6 +2565,9 @@ static struct bmp_targets *bmp_targets_find1(struct bgp *bgp, const char *name)
 	return bmp_targets_find(&bmpbgp->targets, &dummy);
 }
 
+/* 取得（必要时创建）某 BGP 实例下指定名字的 target，并初始化其全部容器
+ * （sessions / 两条 monitoring 队列 / listeners / actives / imported_bgps）。
+ */
 static struct bmp_targets *bmp_targets_get(struct bgp *bgp, const char *name)
 {
 	struct bmp_targets *bt;
@@ -2346,6 +2599,7 @@ static struct bmp_targets *bmp_targets_get(struct bgp *bgp, const char *name)
 	return bt;
 }
 
+/* 释放一个"被导入 BGP 实例"记录（含其名字）。 */
 static void bmp_imported_bgp_free(struct bmp_imported_bgp *bib)
 {
 	if (bib->name)
@@ -2353,6 +2607,9 @@ static void bmp_imported_bgp_free(struct bmp_imported_bgp *bib)
 	XFREE(MTYPE_BMP_IMPORTED_BGP, bib);
 }
 
+/* 释放一个 target：取消统计定时器、关闭全部 active 连接与会话、释放导入实例 / 各类容器
+ * 与名称，最后从 bmp_bgp 中摘除。
+ */
 static void bmp_targets_put(struct bmp_targets *bt)
 {
 	struct bmp *bmp;
@@ -2391,6 +2648,7 @@ static void bmp_targets_put(struct bmp_targets *bt)
 	XFREE(MTYPE_BMP_TARGETS, bt);
 }
 
+/* 按 (地址, 端口) 查找监听端点。 */
 static struct bmp_listener *bmp_listener_find(struct bmp_targets *bt,
 					      const union sockunion *su,
 					      int port)
@@ -2401,6 +2659,7 @@ static struct bmp_listener *bmp_listener_find(struct bmp_targets *bt,
 	return bmp_listeners_find(&bt->listeners, &dummy);
 }
 
+/* 取得（必要时创建）监听端点对象，socket 先置 -1，实际监听由 bmp_listener_start 建立。 */
 static struct bmp_listener *bmp_listener_get(struct bmp_targets *bt,
 					     const union sockunion *su,
 					     int port)
@@ -2420,6 +2679,7 @@ static struct bmp_listener *bmp_listener_get(struct bmp_targets *bt,
 	return bl;
 }
 
+/* 在某 target 下按名字查找"被导入的 BGP 实例"记录。 */
 static struct bmp_imported_bgp *bmp_imported_bgp_find(struct bmp_targets *bt, char *name)
 {
 	struct bmp_imported_bgp dummy;
@@ -2428,6 +2688,9 @@ static struct bmp_imported_bgp *bmp_imported_bgp_find(struct bmp_targets *bt, ch
 	return bmp_imported_bgps_find(&bt->imported_bgps, &dummy);
 }
 
+/* 为某 peer 生成一条 peer up / down 通知，发送给：该 peer 所在实例下所有 target 的会话，
+ * 以及所有"导入了该 peer 实例"的其它实例下 target 的会话。
+ */
 static void bmp_send_all_bgp(struct peer *peer, bool down)
 {
 	struct bmp_bgp *bmpbgp = bmp_bgp_find(peer->bgp);
@@ -2457,12 +2720,14 @@ static void bmp_send_all_bgp(struct peer *peer, bool down)
 	stream_free(s);
 }
 
+/* 从 target 摘除并释放一条"被导入 BGP 实例"记录。 */
 static void bmp_imported_bgp_put(struct bmp_targets *bt, struct bmp_imported_bgp *bib)
 {
 	bmp_imported_bgps_del(&bt->imported_bgps, bib);
 	bmp_imported_bgp_free(bib);
 }
 
+/* 取得（必要时创建）某 target 下指定名字的"被导入 BGP 实例"记录。 */
 static struct bmp_imported_bgp *bmp_imported_bgp_get(struct bmp_targets *bt, char *name)
 {
 	struct bmp_imported_bgp *bib = bmp_imported_bgp_find(bt, name);
@@ -2485,6 +2750,9 @@ static struct bmp_imported_bgp *bmp_imported_bgp_get(struct bmp_targets *bt, cha
 	return bib;
 }
 
+/* 创建监听 socket、设置 SO_REUSEADDR / REUSEPORT / IPV6_V6ONLY、bind、listen，并挂
+ * accept 读事件。
+ */
 static void bmp_listener_start(struct bmp_listener *bl)
 {
 	int sock, ret;
@@ -2513,6 +2781,7 @@ out_sock:
 	close(sock);
 }
 
+/* 停止监听：取消 accept 事件并关闭 socket。 */
 static void bmp_listener_stop(struct bmp_listener *bl)
 {
 	event_cancel(&bl->t_accept);
@@ -2522,6 +2791,7 @@ static void bmp_listener_stop(struct bmp_listener *bl)
 	bl->sock = -1;
 }
 
+/* 按 (hostname, port) 查找主动外连配置。 */
 static struct bmp_active *bmp_active_find(struct bmp_targets *bt,
 					  const char *hostname, int port)
 {
@@ -2531,6 +2801,7 @@ static struct bmp_active *bmp_active_find(struct bmp_targets *bt,
 	return bmp_actives_find(&bt->actives, &dummy);
 }
 
+/* 取得（必要时创建）主动外连配置，重试间隔取默认值。 */
 static struct bmp_active *bmp_active_get(struct bmp_targets *bt,
 					 const char *hostname, int port)
 {
@@ -2552,6 +2823,7 @@ static struct bmp_active *bmp_active_get(struct bmp_targets *bt,
 	return ba;
 }
 
+/* 释放一个 active 连接配置：取消其定时 / 读 / 写事件，关闭关联会话与 socket 并释放内存。 */
 static void bmp_active_put(struct bmp_active *ba)
 {
 	event_cancel(&ba->t_timer);
@@ -2575,6 +2847,9 @@ static void bmp_active_put(struct bmp_active *ba)
 
 static void bmp_active_setup(struct bmp_active *ba);
 
+/* 逐个尝试已解析出的目标地址发起连接：可用 source-interface 绑定源地址；connect 结果分
+ * 成功 / 进行中 / 失败分别处理，全部地址都失败则退避后重试。
+ */
 static void bmp_active_connect(struct bmp_active *ba)
 {
 	enum connect_result res;
@@ -2659,6 +2934,9 @@ static void bmp_active_connect(struct bmp_active *ba)
 	bmp_active_setup(ba);
 }
 
+/* resolver 解析回调：把解析到的地址存入 ba->addrs[]（受数组上限约束），随后开始连接；
+ * 解析失败则退避后重试。
+ */
 static void bmp_active_resolved(struct resolver_query *resq, const char *errstr,
 				int numaddrs, union sockunion *addr)
 {
@@ -2687,6 +2965,10 @@ static void bmp_active_resolved(struct resolver_query *resq, const char *errstr,
 	bmp_active_connect(ba);
 }
 
+/* active 连接的统一事件处理：定时器 / 读 / 写事件都进入这里，按 socket 状态区分——尚未
+ * 建 socket 则发起域名解析；否则用 SO_ERROR 判定非阻塞 connect 是否成功，成功则建立 BMP
+ * 会话，失败则换下一个地址重试。
+ */
 static void bmp_active_thread(struct event *t)
 {
 	struct bmp_active *ba = EVENT_ARG(t);
@@ -2744,12 +3026,16 @@ out_next:
 	bmp_active_connect(ba);
 }
 
+/* 会话断开时的回连：清空会话引用并重新安排连接。 */
 static void bmp_active_disconnected(struct bmp_active *ba)
 {
 	ba->bmp = NULL;
 	bmp_active_setup(ba);
 }
 
+/* 安排下一次连接尝试：若已有会话或正在解析则返回；到点后用定时器（未建 socket）或读写
+ * 事件（连接进行中）触发 bmp_active_thread。
+ */
 static void bmp_active_setup(struct bmp_active *ba)
 {
 	event_cancel(&ba->t_timer);
@@ -2775,6 +3061,7 @@ static void bmp_active_setup(struct bmp_active *ba)
 	}
 }
 
+/* BMP 配置节点（config-bgp-bmp），父节点为 BGP_NODE。 */
 static struct cmd_node bmp_node = {
 	.name = "bmp",
 	.node = BMP_NODE,
@@ -2782,6 +3069,7 @@ static struct cmd_node bmp_node = {
 	.prompt = "%s(config-bgp-bmp)# "
 };
 
+/* 命令补全：列举所有 BGP 实例下已定义的 BMP target 名字，供 "bmp targets" 使用。 */
 static void bmp_targets_autocomplete(vector comps, struct cmd_token *token)
 {
 	struct bgp *bgp;
@@ -2800,14 +3088,17 @@ static void bmp_targets_autocomplete(vector comps, struct cmd_token *token)
 	}
 }
 
+/* 把 BMPTARGETS 记号绑定到上面的补全函数。 */
 static const struct cmd_variable_handler bmp_targets_var_handlers[] = {
 	{.tokenname = "BMPTARGETS", .completions = bmp_targets_autocomplete},
 	{.completions = NULL}};
 
+/* 命令帮助字符串中反复出现的 "BGP Monitoring Protocol"。 */
 #define BMP_STR "BGP Monitoring Protocol\n"
 
 #include "bgpd/bgp_bmp_clippy.c"
 
+/* 命令 "bmp targets <NAME>"：进入 / 创建 BMP target 配置子节点。 */
 DEFPY_NOSH(bmp_targets_main,
       bmp_targets_cmd,
       "bmp targets BMPTARGETS",
@@ -2824,6 +3115,7 @@ DEFPY_NOSH(bmp_targets_main,
 	return CMD_SUCCESS;
 }
 
+/* 命令 "no bmp targets <NAME>"：删除一个 BMP target。 */
 DEFPY(no_bmp_targets_main,
       no_bmp_targets_cmd,
       "no bmp targets BMPTARGETS",
@@ -2844,6 +3136,10 @@ DEFPY(no_bmp_targets_main,
 	return CMD_SUCCESS;
 }
 
+/* 命令 "[no] bmp import-vrf-view <VRFNAME>"：把另一个 BGP 实例（VRF / view）纳入本
+ * target 的监控范围。no 时对被删实例发 peer down 并移除；是时立即为已连会话补发该实例的
+ * peer up / VRF 状态并触发整表同步。
+ */
 DEFPY(bmp_import_vrf,
       bmp_import_vrf_cmd,
       "[no] bmp import-vrf-view VRFNAME$vrfname",
@@ -2901,6 +3197,7 @@ DEFPY(bmp_import_vrf,
 	return CMD_SUCCESS;
 }
 
+/* 命令 "bmp listener <地址> port <端口>"：新增被动监听端点并启动监听。 */
 DEFPY(bmp_listener_main,
       bmp_listener_cmd,
       "bmp listener <X:X::X:X|A.B.C.D> port (1-65535)",
@@ -2921,6 +3218,7 @@ DEFPY(bmp_listener_main,
 	return CMD_SUCCESS;
 }
 
+/* 命令 "no bmp listener <地址> port <端口>"：停止并删除监听端点。 */
 DEFPY(no_bmp_listener_main,
       no_bmp_listener_cmd,
       "no bmp listener <X:X::X:X|A.B.C.D> port (1-65535)",
@@ -2945,6 +3243,9 @@ DEFPY(no_bmp_listener_main,
 	return CMD_SUCCESS;
 }
 
+/* 命令 "[no] bmp connect <HOSTNAME> port <端口> ..."：配置一条主动外连（可带
+ * source-interface / min-retry / max-retry）；no 时删除并断开。
+ */
 DEFPY(bmp_connect,
       bmp_connect_cmd,
       "[no] bmp connect HOSTNAME port (1-65535) {min-retry (100-86400000)|max-retry (100-86400000)} [source-interface <WORD$srcif>]",
@@ -2998,6 +3299,9 @@ DEFPY(bmp_connect,
 	return CMD_SUCCESS;
 }
 
+/* 命令 "[no] <ip|ipv6> access-list <名>"：为 IPv4 / IPv6 入站 BMP 连接设置准入
+ * access-list。
+ */
 DEFPY(bmp_acl,
       bmp_acl_cmd,
       "[no] <ip|ipv6>$af access-list ACCESSLIST_NAME$access_list",
@@ -3024,6 +3328,7 @@ DEFPY(bmp_acl,
 	return CMD_SUCCESS;
 }
 
+/* 命令 "[no] bmp stats [interval <毫秒>]"：开关周期性 statistics report 并设置周期。 */
 DEFPY(bmp_stats_cfg,
       bmp_stats_cmd,
       "[no] bmp stats [interval (100-86400000)]",
@@ -3049,6 +3354,7 @@ DEFPY(bmp_stats_cfg,
 	return CMD_SUCCESS;
 }
 
+/* 命令 "[no] bmp stats send-experimental"：是否附带 FRR 实验性统计项。 */
 DEFPY(bmp_stats_send_experimental,
       bmp_stats_send_experimental_cmd,
       "[no] bmp stats send-experimental",
@@ -3064,9 +3370,13 @@ DEFPY(bmp_stats_send_experimental,
 	return CMD_SUCCESS;
 }
 
+/* 由策略关键字快速判定监控类别：loc-rib 取首字母 'l'，pre-policy 取第二个字母 'r'。 */
 #define BMP_POLICY_IS_LOCRIB(str) ((str)[0] == 'l') /* __l__oc-rib */
 #define BMP_POLICY_IS_PRE(str) ((str)[1] == 'r')    /* p__r__e-policy */
 
+/* 命令 "[no] bmp monitor <afi> <safi> <pre-policy|post-policy|loc-rib>"：设置 / 清除某
+ * 个 (afi,safi) 上的监控类别位。配置变化后对所有会话触发重新同步。
+ */
 DEFPY(bmp_monitor_cfg, bmp_monitor_cmd,
       "[no] bmp monitor <ipv4|ipv6|l2vpn> <unicast|multicast|evpn|vpn> <pre-policy|post-policy|loc-rib>$policy",
       NO_STR BMP_STR
@@ -3109,6 +3419,7 @@ DEFPY(bmp_monitor_cfg, bmp_monitor_cmd,
 	return CMD_SUCCESS;
 }
 
+/* 命令 "[no] bmp mirror"：开关 route mirroring。关闭时顺便丢弃各会话尚未发出的镜像积压。 */
 DEFPY(bmp_mirror_cfg,
       bmp_mirror_cmd,
       "[no] bmp mirror",
@@ -3136,6 +3447,7 @@ DEFPY(bmp_mirror_cfg,
 	return CMD_SUCCESS;
 }
 
+/* 命令 "bmp mirror buffer-limit <字节>"：设置某 BGP 实例的镜像队列内存上限。 */
 DEFPY(bmp_mirror_limit_cfg,
       bmp_mirror_limit_cmd,
       "bmp mirror buffer-limit (0-4294967294)",
@@ -3153,6 +3465,7 @@ DEFPY(bmp_mirror_limit_cfg,
 	return CMD_SUCCESS;
 }
 
+/* 命令 "no bmp mirror buffer-limit"：取消镜像内存上限（置为 ~0，即不限制）。 */
 DEFPY(no_bmp_mirror_limit_cfg,
       no_bmp_mirror_limit_cmd,
       "no bmp mirror buffer-limit [(0-4294967294)]",
@@ -3172,6 +3485,9 @@ DEFPY(no_bmp_mirror_limit_cfg,
 }
 
 
+/* 命令 "show bmp"：打印各 BGP 实例的 BMP 状态，包括镜像队列占用 / 上限、每个 target 的
+ * 监控类别、监听端点、外连状态，以及各会话的各类计数与队列深度。
+ */
 DEFPY(show_bmp,
       show_bmp_cmd,
       "show bmp",
@@ -3320,6 +3636,9 @@ DEFPY(show_bmp,
 	return CMD_SUCCESS;
 }
 
+/* bgp_inst_config_write hook：把某 BGP 实例的 BMP 配置回写到 running-config，使其可持久化
+ * 并在重启后恢复。
+ */
 static int bmp_config_write(struct bgp *bgp, struct vty *vty)
 {
 	struct bmp_bgp *bmpbgp = bmp_bgp_find(bgp);
@@ -3393,6 +3712,7 @@ static int bmp_config_write(struct bgp *bgp, struct vty *vty)
 	return 0;
 }
 
+/* frr_late_init hook：注册 BMP 命令树与补全，并初始化 resolver（供主动外连解析域名）。 */
 static int bgp_bmp_init(struct event_loop *tm)
 {
 	install_node(&bmp_node);
@@ -3422,6 +3742,9 @@ static int bgp_bmp_init(struct event_loop *tm)
 	return 0;
 }
 
+/* bgp_route_update hook【loc-rib 生产者】：路由发生更新 / 撤销时，遍历实例与 target，对开启
+ * 了 loc-rib 监控的 target 调 bmp_route_update_bgpbmp 入队。
+ */
 static int bmp_route_update(struct bgp *bgp, afi_t afi, safi_t safi,
 			    struct bgp_dest *bn,
 			    struct bgp_path_info *old_route,
@@ -3461,6 +3784,9 @@ static int bmp_route_update_bgpbmp(struct bmp_targets *bt, afi_t afi, safi_t saf
 				   struct bgp_dest *bn, struct bgp_path_info *old_route,
 				   struct bgp_path_info *new_route)
 {
+	/* 【loc-rib 生产者】把 Loc-RIB 中该前缀的选中路径作为 loc-rib 队列项入队并唤醒各会话；
+	 * 同时维护路径的 bgp_rib_uptime，作为 loc-rib 上报中的时间戳。
+	 */
 	bool is_withdraw = old_route && !new_route;
 	struct bgp_path_info *updated_route = is_withdraw ? old_route : new_route;
 	struct peer *peer = updated_route->peer;
@@ -3498,6 +3824,7 @@ static int bmp_route_update_bgpbmp(struct bmp_targets *bt, afi_t afi, safi_t saf
 	return 0;
 }
 
+/* frr_early_fini hook：终止 resolver。 */
 static int bgp_bmp_early_fini(void)
 {
 	resolver_terminate();
@@ -3505,6 +3832,9 @@ static int bgp_bmp_early_fini(void)
 	return 0;
 }
 
+/* 某实例属性（router-id / RD）变化时，为该实例刷新 VRF 状态；若 VRF 状态为 down 则不发送
+ * peer 事件（仅有 router-id 不足以让状态变为 up）。返回是否已发送事件。
+ */
 static int bmp_bgp_attribute_updated_instance(struct bmp_targets *bt, enum bmp_vrf_state *vrf_state,
 					      struct bgp *bgp, bool withdraw, struct stream *s)
 {
@@ -3520,6 +3850,9 @@ static int bmp_bgp_attribute_updated_instance(struct bmp_targets *bt, enum bmp_v
 	return 1;
 }
 
+/* bgp_routerid_update / bgp_route_distinguisher_update 的共同实现：实例 router-id 或 RD
+ * 变化相当于一次"实例级重启"，需要重新广播 peer_self 的 up/down 并触发整表重新同步。
+ */
 /* called when the routerid of an instance changes */
 static int bmp_bgp_attribute_updated(struct bgp *bgp, bool withdraw)
 {
@@ -3582,16 +3915,21 @@ static int bmp_bgp_attribute_updated(struct bgp *bgp, bool withdraw)
 	return 1;
 }
 
+/* bgp_routerid_update hook：router-id 变化等价于一次实例重启，转发到公共实现。 */
 static int bmp_routerid_update(struct bgp *bgp, bool withdraw)
 {
 	return bmp_bgp_attribute_updated(bgp, withdraw);
 }
 
+/* bgp_route_distinguisher_update hook：RD 变化等价于一次实例重启，转发到公共实现。 */
 static int bmp_route_distinguisher_update(struct bgp *bgp, afi_t afi, bool preconfig)
 {
 	return bmp_bgp_attribute_updated(bgp, preconfig);
 }
 
+/* VRF 状态变化（实例 / VRF 设备 up、down，或由接口状态变化推断）的内部处理：更新 bmp_bgp
+ * 及各导入实例的 vrf_state，并按需广播 peer_self 的 up/down 与触发整表同步。
+ */
 static void _bmp_vrf_state_changed_internal(struct bgp *bgp, enum bmp_vrf_state vrf_state)
 {
 	struct bmp_bgp *bmpbgp = bmp_bgp_find(bgp);
@@ -3647,6 +3985,7 @@ static void _bmp_vrf_state_changed_internal(struct bgp *bgp, enum bmp_vrf_state 
 	}
 }
 
+/* bgp_instance_state hook：BGP 实例 up / down（意味着 zebra 中对应 VRF 创建 / 删除）时调用。 */
 /* called when a bgp instance goes up/down, implying that the underlying VRF
  * has been created or deleted in zebra
  */
@@ -3656,6 +3995,9 @@ static int bmp_vrf_state_changed(struct bgp *bgp)
 	return 0;
 }
 
+/* bgp_vrf_status_changed hook：VRF 内的接口 up / down 时调用（bgp_snmp 也用它感知 VRF
+ * 状态）。若变化对象不是 VRF 设备，则回退为按 zebra 的 VRF 状态推断。
+ */
 /* called when an interface goes up/down in a vrf, this may signal that the
  * VRF changed state and is how bgp_snmp detects vrf state changes
  */
@@ -3675,6 +4017,9 @@ static int bmp_vrf_itf_state_changed(struct bgp *bgp, struct interface *itf)
 	return 0;
 }
 
+/* 模块初始化：注册 BMP 依赖的全部 BGP hook，把 BMP 只读地挂接到 BGP 的关键路径上。这些
+ * hook 就是"生产者"被触发的入口（mirror、monitor、peer up/down、VRF 状态等）。
+ */
 static int bgp_bmp_module_init(void)
 {
 	hook_register(bgp_packet_dump, bmp_mirror_packet);

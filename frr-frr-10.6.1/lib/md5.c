@@ -12,16 +12,53 @@
  * All rights reserved.
  */
 
+/*
+ * 文件导读: md5.c
+ * ----------------------------------------------------------------------------
+ * 本文件实现 MD5 摘要算法(RFC 1321)与 HMAC-MD5(RFC 2104), 采用 6WIND / WIDE
+ *   的实现, 大小端兼容.
+ * 作用: 提供 init / loop / pad / result 四步 MD5 计算, 以及 hmac_md5 认证.
+ *
+ * 核心实现结构:
+ *   - 一批位运算与轮函数宏(F, G, H, I, ROUND1 至 ROUND4, SHIFT, Sa 至 Sp)描述
+ *     MD5 的四轮变换.
+ *   - T[65]: 由 sin 生成的 64 个轮常数(下标从 1 开始, 0 号占位).
+ *   - md5_paddat: 填充用的首字节 0x80 加若干 0.
+ *   - md5_calc: 对 64 字节分块做一次压缩, 是算法的核心.
+ *
+ * 与其他模块关系: 实现 md5.h 的接口; 被 bgpd 等需要摘要或 HMAC 认证的模块调用.
+ *
+ * 阅读顺序: 先看轮函数宏与 T 表, 再读 md5_calc 的压缩过程, 然后按 init / loop /
+ *   pad / result 顺序理解对外接口, 最后看 hmac_md5.
+ *
+ * 易踩的坑: T 表下标从 1 开始; 大小端处理散见在 md5_pad / md5_result / md5_calc;
+ *   HMAC 结束时用 explicit_bzero 擦除上下文, 避免密钥残留.
+ */
+
 #include <zebra.h>
 #include "md5.h"
 
+/*
+ * 32 位循环左移.
+ * X: 待移位值; s: 左移位数(1 至 31).
+ */
 #define SHIFT(X, s) (((X) << (s)) | ((X) >> (32 - (s))))
 
+/*
+ * MD5 四轮使用的非线性函数 F, G, H, I.
+ * F 为选择函数((X 与 Y) 或 (非 X 与 Z)); G 为更复杂的选择; H 为异或;
+ * I 为混合运算. 逐步用于第 1 至第 4 轮.
+ */
 #define F(X, Y, Z) (((X) & (Y)) | ((~X) & (Z)))
 #define G(X, Y, Z) (((X) & (Z)) | ((Y) & (~Z)))
 #define H(X, Y, Z) ((X) ^ (Y) ^ (Z))
 #define I(X, Y, Z) ((Y) ^ ((X) | (~Z)))
 
+/*
+ * MD5 单步轮运算宏 ROUND1 至 ROUND4, 依次使用 F / G / H / I.
+ * 参数: a, b, c, d 为四个状态字; k 为消息字下标; s 为循环左移量; i 为 T 表下标.
+ * 每步执行: a += f(b,c,d) + X[k] + T[i]; a 循环左移 s 位; a += b.
+ */
 #define ROUND1(a, b, c, d, k, s, i)                                            \
 	{                                                                      \
 		(a) = (a) + F((b), (c), (d)) + X[(k)] + T[(i)];                \
@@ -50,6 +87,10 @@
 		(a) = (b) + (a);                                               \
 	}
 
+/*
+ * 各轮使用的循环左移量常量: Sa 至 Sd 用于第 1 轮, Se 至 Sh 用于第 2 轮,
+ * Si 至 Sl 用于第 3 轮, Sm 至 Sp 用于第 4 轮.
+ */
 #define Sa	 7
 #define Sb	12
 #define Sc	17
@@ -70,11 +111,18 @@
 #define So	15
 #define Sp	21
 
+/*
+ * MD5 四个状态字的标准初始值(魔数).
+ */
 #define MD5_A0	0x67452301
 #define MD5_B0	0xefcdab89
 #define MD5_C0	0x98badcfe
 #define MD5_D0	0x10325476
 
+/*
+ * 轮常数表 T[1..64]: 由 4294967296 乘 sin(i) 的整数部分生成; T[0] 占位不用,
+ * 故数组长度为 65.
+ */
 /* Integer part of 4294967296 times abs(sin(i)), where i is in radians. */
 static const uint32_t T[65] = {
 	0,	  0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf,
@@ -94,14 +142,25 @@ static const uint32_t T[65] = {
 	0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
 };
 
+/*
+ * 填充数据: 首字节 0x80, 其余全为 0. md5_pad 时按需从中拷贝若干字节.
+ */
 static const uint8_t md5_paddat[MD5_BUFLEN] = {
 	0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 	0,    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 	0,    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 };
 
+/*
+ * 压缩函数前置声明: 对 64 字节分块执行一次 MD5 压缩, 更新上下文状态.
+ */
 static void md5_calc(const uint8_t *, md5_ctxt *);
 
+/*
+ * 初始化 MD5 上下文.
+ * ctxt: 上下文.
+ * 置比特计数 md5_n 与缓冲偏移 md5_i 为 0, 装入四个状态字初始值, 清空 md5_buf.
+ */
 void md5_init(md5_ctxt *ctxt)
 {
 	ctxt->md5_n = 0;
@@ -113,6 +172,12 @@ void md5_init(md5_ctxt *ctxt)
 	memset(ctxt->md5_buf, 0, sizeof(ctxt->md5_buf));
 }
 
+/*
+ * 向 MD5 上下文喂入一段数据(可多次调用).
+ * ctxt: 上下文; vinput: 数据指针; len: 字节数.
+ * 副作用: 累加比特计数, 每凑满 64 字节压缩一次, 不足一块的留在 md5_buf 中.
+ * 说明: 先补齐旧缓冲的缺口, 再对整块数据循环压缩, 最后把剩余不足一块的拷入缓冲.
+ */
 void md5_loop(md5_ctxt *ctxt, const void *vinput, uint len)
 {
 	uint gap, i;
@@ -137,6 +202,12 @@ void md5_loop(md5_ctxt *ctxt, const void *vinput, uint len)
 	}
 }
 
+/*
+ * 填充: 补齐到 56 模 64 字节, 并在最后 8 字节写入 64 位比特长度.
+ * ctxt: 上下文.
+ * 副作用: 可能触发一次额外压缩, 改动 md5_buf 与状态; 不改变比特计数 md5_n.
+ * 注意: 大端平台需手动把长度字段按字节反转后填入.
+ */
 void md5_pad(md5_ctxt *ctxt)
 {
 	uint gap;
@@ -170,6 +241,11 @@ void md5_pad(md5_ctxt *ctxt)
 	md5_calc(ctxt->md5_buf, ctxt);
 }
 
+/*
+ * 取出最终的 128 位摘要.
+ * digest: 输出缓冲, 至少 16 字节; ctxt: 已完成填充的上下文.
+ * 注意: 大端平台需按 32 位字做字节反转后再拷贝, 小端可直接拷贝.
+ */
 void md5_result(uint8_t *digest, md5_ctxt *ctxt)
 {
 	/* 4 byte words */
@@ -195,6 +271,12 @@ void md5_result(uint8_t *digest, md5_ctxt *ctxt)
 	}
 }
 
+/*
+ * MD5 压缩函数: 用 64 字节分块 b64 对上下文的四个状态字做 64 步变换.
+ * 参数: b64 为一个 64 字节分块的起始地址; ctxt 为上下文.
+ * 实现: 把分块解释为 16 个 32 位字 X(大端需逐字节拼装), 依次执行 4 轮共 64 步
+ *   ROUND 运算, 最后把本轮结果累加回上下文状态字.
+ */
 static void md5_calc(const uint8_t *b64, md5_ctxt *ctxt)
 {
 	uint32_t A = ctxt->md5_sta;
@@ -351,6 +433,13 @@ static void md5_calc(const uint8_t *b64, md5_ctxt *ctxt)
 	ctxt->md5_std += D;
 }
 
+/*
+ * 计算 HMAC-MD5(见 RFC 2104).
+ * text / text_len: 消息及其长度; key / key_len: 密钥及其长度; digest: 输出 16 字节.
+ * 实现: MD5(K 异或 opad, MD5(K 异或 ipad, text)), 其中 ipad 填 0x36, opad 填
+ *   0x5c; 若 key 超过 64 字节则先摘要成 16 字节. 结束时用 explicit_bzero 擦除
+ *   上下文, 防止密钥残留.
+ */
 /* From RFC 2104 */
 void hmac_md5(unsigned char *text, int text_len, unsigned char *key,
 	      int key_len, uint8_t *digest)

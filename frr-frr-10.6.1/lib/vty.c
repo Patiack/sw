@@ -4,6 +4,34 @@
  * Copyright (C) 1997, 98 Kunihiro Ishiguro
  */
 
+/* ============================================================================
+ * vty.c —— VTY（虚拟终端）子系统的核心实现
+ *
+ * VTY 是 FRR 面向用户交互的统一抽象层，本文件实现它的“引擎”部分：
+ *   - 连接的建立与注销：监听 socket、accept 新连接、把每个连接包装成 struct vty，
+ *     并维护 vty_sessions / vtysh_sessions / vty_servs 三条全局链表。
+ *   - 事件驱动：所有 socket 读写、超时都用 libfrr 的 event 机制挂回调
+ *     （见 enum vty_event 与 vty_event()）。
+ *   - 输入解析：读入字节流，处理 telnet 的 IAC 控制序列与 NAWS 窗口协商，
+ *     按行切分后交给 command.c 的命令解析器执行。
+ *   - 输出：vty_out() 是统一的 printf 风格输出入口，内部用输出缓冲 + 可选的
+ *     include 正则过滤 + 增量刷新（避免一次性缓存巨量输出）。
+ *   - 命令历史：上下键翻历史（hist / hp / hindex）。
+ *   - 配置读写：vty_read_config / vty_read_file 读取配置文件；
+ *     vty_config_enter / vty_config_exit 管理配置模式的进入退出。
+ *   - 分页：输出超过一屏时用 --More-- 分页（vty_more / vty_moreline）。
+ *
+ * 与其它模块的关系：
+ *   - command.c 提供命令树与解析；本文件负责“输入输出 + 会话生命周期”。
+ *   - northbound_cli.c 提供配置提交相关辅助。
+ *   - vtysh 客户端 / 服务端复用同一套 struct vty，只是 type 不同（VTY_SHELL 等）。
+ *
+ * 阅读建议：先看 struct vty（定义在 vty.h）的字段分组，再顺着
+ * vty_new -> vty_accept -> vty_read 的调用链理解一个交互会话的生命周期，
+ * 最后看 vty_out / vty_more 理解输出与分页。
+ * ============================================================================
+ */
+
 #include <zebra.h>
 
 #include <fcntl.h>
@@ -13,6 +41,8 @@
 #include <sys/types.h>
 #include <stdio.h>
 
+/* 若系统自带 libcrypt 则直接用其 crypt()；否则在仅有 OpenSSL 可用时，
+ * 用 OpenSSL 的 DES_crypt 作为 crypt() 的替代实现（vty_auth 校验密码用）。 */
 #ifndef HAVE_LIBCRYPT
 #ifdef HAVE_LIBCRYPTO
 #include <openssl/des.h>
@@ -51,6 +81,12 @@
 
 #include "lib/vty_clippy.c"
 
+/* 本文件使用的内存类型（MTYPE）登记：把不同用途的分配区分开，便于 qmem 统计。
+ *   VTY         struct vty 本体。
+ *   VTY_SERV    监听服务端结构 struct vty_serv。
+ *   VTY_OUT_BUF 输出格式化用的临时缓冲。
+ *   VTY_HIST    命令历史字符串。
+ *   VTY_REGEX   输出过滤正则结构。 */
 DEFINE_MTYPE_STATIC(LIB, VTY, "VTY");
 DEFINE_MTYPE_STATIC(LIB, VTY_SERV, "VTY server");
 DEFINE_MTYPE_STATIC(LIB, VTY_OUT_BUF, "VTY output buffer");
@@ -59,6 +95,11 @@ DEFINE_MTYPE_STATIC(LIB, VTY_REGEX, "VTY filter regex");
 
 DECLARE_DLIST(vtys, struct vty, itm);
 
+/* VTY 事件类型：每个枚举值对应一类可挂到 event loop 上的回调，由 vty_event() 分发。
+ *   VTY_SERV         监听 socket 上来了新连接。
+ *   VTY_READ / VTY_WRITE  已建立连接的读 / 写就绪。
+ *   VTY_TIMEOUT_RESET     重置空闲超时。
+ *   VTYSH_SERV / VTYSH_READ / VTYSH_WRITE  仅编译 vtysh 服务端（VTYSH 宏）时启用。 */
 /* Vty events */
 enum vty_event {
 	VTY_SERV,
@@ -85,6 +126,11 @@ int (*nb_cli_rpc_mgmt_cb)(struct vty *vty, const char *xpath, const struct lyd_n
 
 PREDECL_DLIST(vtyservs);
 
+/* 一个监听中的 VTY 服务端（对应一个监听 socket）。
+ *   itm      挂入全局 vtyservs 链表。
+ *   sock     监听 socket 的 fd。
+ *   vtysh    是否为 vtysh 服务端（决定 accept 之后如何包装会话）。
+ *   t_accept 该监听 socket 上等待新连接的 event。 */
 struct vty_serv {
 	struct vtyservs_item itm;
 
@@ -100,6 +146,18 @@ static void vty_event_serv(enum vty_event event, struct vty_serv *);
 static void vty_event(enum vty_event, struct vty *);
 static int vtysh_flush(struct vty *vty);
 
+/* 全局状态：
+ *   host            来自 command.c 的宿主机信息（如 hostname）。
+ *   vty_servs       当前所有监听服务端链表。
+ *   vty_sessions    所有普通（telnet / 本地 / 配置读取）vty 会话链表。
+ *   vtysh_sessions  所有 vtysh 服务端 vty 会话链表。
+ *   vty_timeout_val 空闲超时秒数（默认 VTY_TIMEOUT_DEFAULT）。
+ *   vty_accesslist_name / vty_ipv6_accesslist_name  访问控制列表名（IPv4 / IPv6）。
+ *   vty_cwd          当前工作目录缓存。
+ *   no_password_check  是否跳过登录密码校验。
+ *   integrate_default  默认整合配置文件路径。
+ *   vty_log_commands(_perm)  是否记录命令日志及其“永久”标志。
+ *   VTY_MAX_INCREMENTAL_FLUSH  增量刷新阈值（超过即主动 flush）。 */
 /* Extern host structure from command.c */
 extern struct host host;
 
@@ -134,6 +192,11 @@ static bool vty_log_commands_perm;
 /* Vty incremental flush threshold size */
 static const int VTY_MAX_INCREMENTAL_FLUSH = 1024 * 128;
 
+/* mgmtd 前端：向等待中的 vty 用户回送一个响应码。
+ * 参数：ret 为命令返回码。
+ * 行为：非“读配置文件”的 vty 会把 4 字节头（低字节为 ret）写入输出缓冲并尝试
+ *   flush；若 vty 已请求关闭则关闭它，否则重新挂上读事件继续交互。
+ * 说明：仅对非 VTY_FILE 类型发送响应头；VTY_FILE 下出现该情形视为异常并告警。 */
 void vty_resume_response(struct vty *vty, int ret)
 {
 	uint8_t header[4] = {0, 0, 0, 0};
@@ -157,6 +220,10 @@ void vty_resume_response(struct vty *vty, int ret)
 		zlog_err("mgmtd: unexpected resume while reading config file");
 }
 
+/* 把一段“上下文起始标记”格式化写入 frame 缓冲（延迟输出）。
+ * 参数：format / ... 为 printf 风格内容。
+ * 说明：内容先攒在 vty->frame 里，等真正有 vty_out() 输出时才一并冲出；
+ *   若之后一直没有真实输出，这段标记就不会显示（见 vty_endframe）。 */
 void vty_frame(struct vty *vty, const char *format, ...)
 {
 	va_list args;
@@ -168,6 +235,9 @@ void vty_frame(struct vty *vty, const char *format, ...)
 	va_end(args);
 }
 
+/* 结束一段 frame：清空 frame 缓冲。
+ * 若缓冲原本为空（说明该上下文没有任何真实输出），则打印 endtext 作为结束标记。
+ * 参数：endtext 为缓冲为空时要打印的文本（可为 NULL）。 */
 void vty_endframe(struct vty *vty, const char *endtext)
 {
 	if (vty->frame_pos == 0 && endtext)
@@ -175,6 +245,10 @@ void vty_endframe(struct vty *vty, const char *endtext)
 	vty->frame_pos = 0;
 }
 
+/* 设置 / 清除输出过滤正则（只显示匹配 include 的行）。
+ * 参数：regexp 为扩展正则；传 NULL 表示清除过滤。
+ * 返回：正则编译成功为 true，失败为 false（并已向 vty 报错）。
+ * 副作用：编译成功置 vty->filter=true；清除时释放旧正则。 */
 bool vty_set_include(struct vty *vty, const char *regexp)
 {
 	int errcode;
@@ -204,6 +278,12 @@ bool vty_set_include(struct vty *vty, const char *regexp)
 	return ret;
 }
 
+/* VTY 标准输出函数：printf 风格把内容写到 vty。
+ * 参数：format / ... 为格式串与可变参数。
+ * 返回：成功返回写入字节数（负值表示出错或 vty 已关闭）。
+ * 关键行为：若之前有未冲出的 frame 标记会先冲出；输出可能被 vty->filter 正则
+ *   按行过滤；内容最终进入 obuf，在合适时机刷新。
+ * 坑：格式串里若含 %m 需要保留 errno，故函数开头先保存 errno 再恢复。 */
 /* VTY standard output function. */
 int vty_out(struct vty *vty, const char *format, ...)
 {
@@ -334,6 +414,11 @@ done:
 		return len;
 }
 
+/* JSON 输出的公共实现：把 json 对象序列化后经 vty_out 输出并释放。
+ * 参数：json 为待输出对象（为 NULL 直接返回 CMD_SUCCESS）；options 传给
+ *   json_object_to_json_string_ext，控制美化 / 转义风格。
+ * 返回：CMD_SUCCESS；若 vty 已关闭则释放对象并返回 CMD_ERR_NOTHING_TODO。
+ * 说明：无论成功与否都会释放 json，调用方交出对象所有权。 */
 static int vty_json_helper(struct vty *vty, struct json_object *json,
 			   uint32_t options)
 {
@@ -355,6 +440,7 @@ static int vty_json_helper(struct vty *vty, struct json_object *json,
 	return CMD_SUCCESS;
 }
 
+/* 输出 JSON（带美化换行、斜杠不转义）。返回 CMD_* 码，便于 return vty_json(...)。 */
 int vty_json(struct vty *vty, struct json_object *json)
 {
 	return vty_json_helper(vty, json,
@@ -362,18 +448,25 @@ int vty_json(struct vty *vty, struct json_object *json)
 				       JSON_C_TO_STRING_NOSLASHESCAPE);
 }
 
+/* 输出 JSON（不美化、尽量紧凑，斜杠不转义）。返回 CMD_* 码。 */
 int vty_json_no_pretty(struct vty *vty, struct json_object *json)
 {
 	return vty_json_helper(vty, json, JSON_C_TO_STRING_NOSLASHESCAPE);
 }
 
 
+/* 手工拼装 JSON：输出一个键。
+ * 参数：key 为键名；first_key 为“是否首个键”标志，首键输出 { 前缀，其余输出逗号。
+ * 副作用：把 *first_key 置 false。 */
 void vty_json_key(struct vty *vty, const char *key, bool *first_key)
 {
 	vty_out(vty, "%s\"%s\":", *first_key ? "{" : ",", key);
 	*first_key = false;
 }
 
+/* 手工拼装 JSON：收尾当前对象。
+ * 参数：first_key 为 true 表示此前一个键都没写过（对象未开启），此时补一个 {。
+ * 最后统一输出 } 并换行。 */
 void vty_json_close(struct vty *vty, bool first_key)
 {
 	if (first_key)
@@ -382,6 +475,7 @@ void vty_json_close(struct vty *vty, bool first_key)
 	vty_out(vty, "}\n");
 }
 
+/* 输出一个空 JSON 对象：若传入 json 为 NULL 则新建 {}，否则直接输出传入对象。 */
 void vty_json_empty(struct vty *vty, struct json_object *json)
 {
 	json_object *jsonobj = json;
@@ -392,6 +486,9 @@ void vty_json_empty(struct vty *vty, struct json_object *json)
 	vty_json(vty, jsonobj);
 }
 
+/* 把当前时间戳打印到 vty。
+ * 参数：cr 非 0 时结尾加换行，否则加空格（用于行内前缀）。
+ * 说明：frr_timestamp 失败时记日志并直接返回，不输出任何内容。 */
 /* Output current time to the vty. */
 void vty_time_print(struct vty *vty, int cr)
 {
@@ -409,6 +506,9 @@ void vty_time_print(struct vty *vty, int cr)
 	return;
 }
 
+/* 向 vty 打印欢迎信息（MOTD）。
+ * 若配置了 motdfile 则打开该文件逐行输出（输出前去掉行尾空白）；文件打不开则提示；
+ * 否则若存在 host.motd 字符串则直接输出。 */
 /* Say hello to vty interface. */
 void vty_hello(struct vty *vty)
 {
@@ -445,6 +545,9 @@ void vty_hello(struct vty *vty)
  * wraps the entire function rather than just the vty_out line.
  */
 
+/* 输出命令行提示符（仅对终端型 vty）。
+ * 提示符来自 cmd_prompt(当前节点)，其中会做 %s 替换（通常是主机名）。
+ * 见上方 pragma：因为提示串是运行期格式串且含 %s，这里临时关闭格式告警。 */
 /* Put out prompt and wait input from user. */
 static void vty_prompt(struct vty *vty)
 {
@@ -454,6 +557,7 @@ static void vty_prompt(struct vty *vty)
 }
 #pragma GCC diagnostic pop
 
+/* 向对端发送 telnet WILL ECHO 选项，协商由本端负责回显。 */
 /* Send WILL TELOPT_ECHO to remote server. */
 static void vty_will_echo(struct vty *vty)
 {
@@ -461,6 +565,7 @@ static void vty_will_echo(struct vty *vty)
 	vty_out(vty, "%s", cmd);
 }
 
+/* 发送 telnet WILL SGA（抑制 Go-Ahead）选项，避免每行输入的冗余协商。 */
 /* Make suppress Go-Ahead telnet option. */
 static void vty_will_suppress_go_ahead(struct vty *vty)
 {
@@ -468,6 +573,7 @@ static void vty_will_suppress_go_ahead(struct vty *vty)
 	vty_out(vty, "%s", cmd);
 }
 
+/* 发送 telnet DONT LINEMODE 选项，禁用远端行模式，改为逐字符交互。 */
 /* Make don't use linemode over telnet. */
 static void vty_dont_linemode(struct vty *vty)
 {
@@ -475,6 +581,7 @@ static void vty_dont_linemode(struct vty *vty)
 	vty_out(vty, "%s", cmd);
 }
 
+/* 发送 telnet DO NAWS 选项，请求对端上报窗口大小（宽高）。 */
 /* Use window size. */
 static void vty_do_window_size(struct vty *vty)
 {
@@ -482,6 +589,11 @@ static void vty_do_window_size(struct vty *vty)
 	vty_out(vty, "%s", cmd);
 }
 
+/* vty 密码认证：按当前节点（AUTH_NODE / AUTH_ENABLE_NODE）取对应密码做校验。
+ * 参数：buf 为用户输入的密码。
+ * 行为：按 host.encrypt 决定是否用 crypt() 比对；成功则清失败计数并前进到 next_node；
+ * 失败累计三次则提示并置 VTY_CLOSE（登录 / enable 两种提示不同）。
+ * 说明：密码未设置时一律视为失败。 */
 /* Authentication of vty */
 static void vty_auth(struct vty *vty, char *buf)
 {
@@ -538,6 +650,13 @@ static void vty_auth(struct vty *vty, char *buf)
 	}
 }
 
+/* 在 vty 上执行一条命令行。
+ * 参数：buf 为待执行的命令行文本。
+ * 返回：cmd_execute() 的返回码（CMD_SUCCESS / CMD_WARNING / CMD_ERR_* 等）。
+ * 行为：若开启命令日志则先把该行记入日志（跳过 echo PING 之类）；
+ *   用 rusage 统计命令 CPU / 墙钟耗时，超阈值时告警（CPU HOG / STARVATION）；
+ *   执行后在失败时按错误类型打印统一提示。
+ * 坑：cputime_enabled 可能被命令本身改动，故先快照 cputime_enabled_here 再比较。 */
 /* Command execution over the vty interface. */
 static int vty_command(struct vty *vty, char *buf)
 {
@@ -631,9 +750,14 @@ static int vty_command(struct vty *vty, char *buf)
 	return ret;
 }
 
+/* 行编辑用的两个特殊字节：退格字符（0x08）与空格字符。 */
 static const char telnet_backward_char = 0x08;
 static const char telnet_space_char = ' ';
 
+/* 把原始字节写入 vty 输出缓冲。
+ * 参数：buf / nbytes 为数据与长度。
+ * 说明：在认证节点（AUTH_NODE / AUTH_ENABLE_NODE）下不输出，避免回显敏感输入。
+ * 注意：这里只是入缓冲，真正写到 socket 由 vty_flush 完成。 */
 /* Basic function to write buffer to vty. */
 static void vty_write(struct vty *vty, const char *buf, size_t nbytes)
 {
@@ -644,6 +768,10 @@ static void vty_write(struct vty *vty, const char *buf, size_t nbytes)
 	buffer_put(vty->obuf, buf, nbytes);
 }
 
+/* 在光标处插入一个字符（insert 模式，右侧内容右移）。
+ * 参数：c 为待插入字符。
+ * 说明：命令行长度上限 VTY_BUFSIZ；会重绘光标右侧内容并把光标退回到原位。
+ * 副作用：改 vty->buf / cp / length 并写输出。 */
 /* Basic function to insert character into vty. */
 static void vty_self_insert(struct vty *vty, char c)
 {
@@ -667,6 +795,8 @@ static void vty_self_insert(struct vty *vty, char c)
 	vty->buf[vty->length] = '\0';
 }
 
+/* 覆盖模式插入字符：光标在行尾等价于普通插入，否则就地覆盖当前字符。
+ * 参数：c 为待写入字符。 */
 /* Self insert character 'c' in overwrite mode. */
 static void vty_self_insert_overwrite(struct vty *vty, char c)
 {
@@ -679,6 +809,10 @@ static void vty_self_insert_overwrite(struct vty *vty, char c)
 	vty_write(vty, &c, 1);
 }
 
+/* 在光标处插入一个字符串（用于 Tab 补全等），超出 VTY_BUFSIZ 时截断。
+ * 参数：str 为待插入字符串。
+ * 说明：不改动历史内容，直接覆盖式写入并同步 cp / length。
+ * 见下方 doxygen 注释。 */
 /**
  * Insert a string into vty->buf at the current cursor position.
  *
@@ -698,6 +832,7 @@ static void vty_insert_word_overwrite(struct vty *vty, char *str)
 	vty_write(vty, str, nwrite);
 }
 
+/* 光标右移一个字符（不越过行尾）。 */
 /* Forward character. */
 static void vty_forward_char(struct vty *vty)
 {
@@ -707,6 +842,7 @@ static void vty_forward_char(struct vty *vty)
 	}
 }
 
+/* 光标左移一个字符（不越过行首）。 */
 /* Backward character. */
 static void vty_backward_char(struct vty *vty)
 {
@@ -716,6 +852,7 @@ static void vty_backward_char(struct vty *vty)
 	}
 }
 
+/* 光标移到行首（通过连续左移实现）。 */
 /* Move to the beginning of the line. */
 static void vty_beginning_of_line(struct vty *vty)
 {
@@ -723,6 +860,7 @@ static void vty_beginning_of_line(struct vty *vty)
 		vty_backward_char(vty);
 }
 
+/* 光标移到行尾（通过连续右移实现）。 */
 /* Move to the end of the line. */
 static void vty_end_of_line(struct vty *vty)
 {
@@ -733,6 +871,9 @@ static void vty_end_of_line(struct vty *vty)
 static void vty_kill_line_from_beginning(struct vty *);
 static void vty_redraw_line(struct vty *);
 
+/* 把历史缓冲区中当前 hp 指向的那条命令回显到输入行上。
+ * 先清掉从行首到光标的内容，再拷入历史命令并重绘。
+ * 见下方英文注释：本函数被 vty_next_line / vty_previous_line 调用。 */
 /* Print command line history.  This function is called from
    vty_next_line and vty_previous_line. */
 static void vty_history_print(struct vty *vty)
@@ -751,6 +892,9 @@ static void vty_history_print(struct vty *vty)
 	vty_redraw_line(vty);
 }
 
+/* 显示“下一条”命令历史（向下翻）。
+ * hp 为当前条目的环形索引，hindex 为插入端点；hp 已到 hindex 表示已是最新，直接返回。
+ * 环形缓冲：加一后越过末尾则回到 0；该槽为空则表示无更“新”的历史，停止。 */
 /* Show next command line history. */
 static void vty_next_line(struct vty *vty)
 {
@@ -775,6 +919,8 @@ static void vty_next_line(struct vty *vty)
 	vty_history_print(vty);
 }
 
+/* 显示“上一条”命令历史（向上翻）。
+ * 环形缓冲：减一后越过开头则回到末尾；该槽为空则表示无更“旧”的历史，停止。 */
 /* Show previous command line history. */
 static void vty_previous_line(struct vty *vty)
 {
@@ -794,6 +940,7 @@ static void vty_previous_line(struct vty *vty)
 	vty_history_print(vty);
 }
 
+/* 重绘整条输入行：把 buf 内容原样写出，并把光标移到行尾（cp=length）。 */
 /* This function redraw all of the command line character. */
 static void vty_redraw_line(struct vty *vty)
 {
@@ -801,6 +948,7 @@ static void vty_redraw_line(struct vty *vty)
 	vty->cp = vty->length;
 }
 
+/* 光标向右前进一个“词”：先跳过当前词的非空格字符，再跳过其后的空格。 */
 /* Forward word. */
 static void vty_forward_word(struct vty *vty)
 {
@@ -811,6 +959,7 @@ static void vty_forward_word(struct vty *vty)
 		vty_forward_char(vty);
 }
 
+/* 光标向左回退一个“纯词”（不跳过前导空格）：仅回退到词首。 */
 /* Backward word without skipping training space. */
 static void vty_backward_pure_word(struct vty *vty)
 {
@@ -818,6 +967,7 @@ static void vty_backward_pure_word(struct vty *vty)
 		vty_backward_char(vty);
 }
 
+/* 光标向左回退一个“词”：先跳过左侧空格，再回退到词首。 */
 /* Backward word. */
 static void vty_backward_word(struct vty *vty)
 {
@@ -828,6 +978,8 @@ static void vty_backward_word(struct vty *vty)
 		vty_backward_char(vty);
 }
 
+/* 行首输入 ^D 时“下降一级”：换行后调用 cmd_exit 退出当前节点，再重画提示符。
+ * 说明：cmd_exit 负责节点栈的弹出。 */
 /* When '^D' is typed at the beginning of the line we move to the down
    level. */
 static void vty_down_level(struct vty *vty)
@@ -838,6 +990,8 @@ static void vty_down_level(struct vty *vty)
 	vty->cp = 0;
 }
 
+/* 收到 ^Z 时回到 enable 模式：若处于配置模式则退出配置并切到 ENABLE_NODE，
+ * 然后重画提示符。 */
 /* When '^Z' is received from vty, move down to the enable mode. */
 static void vty_end_config(struct vty *vty)
 {
@@ -852,6 +1006,9 @@ static void vty_end_config(struct vty *vty)
 	vty->cp = 0;
 }
 
+/* 删除光标处的字符（delete 键）。
+ * 行首（length==0）时触发 vty_down_level 下降一级；光标已在行尾则无操作。
+ * 删除后重绘光标右侧内容并用退格把光标回退到原位。 */
 /* Delete a character at the current point. */
 static void vty_delete_char(struct vty *vty)
 {
@@ -882,6 +1039,7 @@ static void vty_delete_char(struct vty *vty)
 		vty_write(vty, &telnet_backward_char, 1);
 }
 
+/* 删除光标前一个字符（backspace）：光标先左移，再调用删除。 */
 /* Delete a character before the point. */
 static void vty_delete_backward_char(struct vty *vty)
 {
@@ -892,6 +1050,7 @@ static void vty_delete_backward_char(struct vty *vty)
 	vty_delete_char(vty);
 }
 
+/* 删除从光标到行尾的所有字符：先用空格覆盖显示，再回退光标并截断 buf。 */
 /* Kill rest of line from current point. */
 static void vty_kill_line(struct vty *vty)
 {
@@ -912,6 +1071,7 @@ static void vty_kill_line(struct vty *vty)
 	vty->length = vty->cp;
 }
 
+/* 删除从行首到光标的所有字符：先移到行首，再执行 vty_kill_line。 */
 /* Kill line from the beginning. */
 static void vty_kill_line_from_beginning(struct vty *vty)
 {
@@ -919,6 +1079,7 @@ static void vty_kill_line_from_beginning(struct vty *vty)
 	vty_kill_line(vty);
 }
 
+/* 向右删除一个词：先删当前词后的空格，再删该词直到下一个空格。 */
 /* Delete a word before the point. */
 static void vty_forward_kill_word(struct vty *vty)
 {
@@ -928,6 +1089,7 @@ static void vty_forward_kill_word(struct vty *vty)
 		vty_delete_char(vty);
 }
 
+/* 向左删除一个词：先删光标左侧空格，再从词尾删到词首。 */
 /* Delete a word before the point. */
 static void vty_backward_kill_word(struct vty *vty)
 {
@@ -937,6 +1099,8 @@ static void vty_backward_kill_word(struct vty *vty)
 		vty_delete_backward_char(vty);
 }
 
+/* 交换光标前或光标处的两个字符（^T）。
+ * 行太短或光标在行首时不做。光标在行尾则交换最后两个字符，否则交换光标与其前一字符。 */
 /* Transpose chars before or at the point. */
 static void vty_transpose_chars(struct vty *vty)
 {
@@ -966,6 +1130,12 @@ static void vty_transpose_chars(struct vty *vty)
 	}
 }
 
+/* 处理 Tab 补全：把当前行交给 cmd_complete_command，再按返回类型分别处理。
+ *   FULL_MATCH / MATCH：回写补全结果（FULL_MATCH 还会补一个空格）。
+ *   LIST_MATCH：列出所有候选（每行 6 个）。
+ *   AMBIGUOUS / NO_MATCH：仅打印提示并重画。
+ * 参数：vty。返回：void。会释放 matched 中的补全字符串。
+ * 坑：FULL_MATCH 却拿到 NULL 时视为 CLI BUG（历史上曾在此 SEGV）。 */
 /* Do completion at vty interface. */
 static void vty_complete_command(struct vty *vty)
 {
@@ -1045,6 +1215,9 @@ static void vty_complete_command(struct vty *vty)
 	XFREE(MTYPE_TMP, matched);
 }
 
+/* 打印一条命令的帮助描述，必要时按宽度折行。
+ * 参数：cmd_width 命令名列宽；desc_width 描述列宽（<=0 表示不折行）；token 为命令词元。
+ * 说明：按空格寻找折行点逐段输出；每段之后命令名列清空只留对齐空格。 */
 static void vty_describe_fold(struct vty *vty, int cmd_width,
 			      unsigned int desc_width, struct cmd_token *token)
 {
@@ -1081,6 +1254,10 @@ static void vty_describe_fold(struct vty *vty, int cmd_width,
 	XFREE(MTYPE_TMP, buf);
 }
 
+/* 处理 '?'：列出当前输入可匹配的命令及其帮助。
+ * 把当前行解析成词向量交给 cmd_describe_command 得到描述列表；
+ * 先统计最宽命令名以对齐，再逐项调用 vty_describe_fold 输出。
+ * 歧义 / 无匹配时打印对应提示。 */
 /* Describe matched command function. */
 static void vty_describe_command(struct vty *vty)
 {
@@ -1190,11 +1367,15 @@ out:
 	vty_redraw_line(vty);
 }
 
+/* 清空命令输入缓冲：把 vty->buf 的前 vty->max 字节清零。 */
 static void vty_clear_buf(struct vty *vty)
 {
 	memset(vty->buf, 0, vty->max);
 }
 
+/* ^C：中止当前输入，并且不把该行计入历史。
+ * 清空行缓冲与输入缓冲、换行；若在配置模式则退出配置回到 enable 模式；
+ * 重画提示符并把历史指针指向最新条目。 */
 /* ^C stop current input and do not add command line to the history. */
 static void vty_stop_input(struct vty *vty)
 {
@@ -1213,6 +1394,10 @@ static void vty_stop_input(struct vty *vty)
 	vty->hp = vty->hindex;
 }
 
+/* 把当前命令行加入历史缓冲（环形）。
+ * 空行不加；与上一条完全相同的命令跳过（只把 hp 指到最新）。
+ * 索引：hindex 为插入位置，写完后 hindex 前移并在 VTY_MAXHIST 处回绕；
+ * hp 同步指向“最新下一条”。 */
 /* Add current command line to the history buffer. */
 static void vty_hist_add(struct vty *vty)
 {
@@ -1244,6 +1429,12 @@ static void vty_hist_add(struct vty *vty)
 
 /* #define TELNET_OPTION_DEBUG */
 
+/* 解析一个 telnet 选项序列（IAC ...），返回是否已消费掉该控制字节。
+ * 参数：buf / nbytes 为收到的字节及其长度。
+ * 返回：1 表示本字节属于 telnet 控制序列、已被处理（调用方不应当作普通输入）；0 表示无需额外处理。
+ * 关键逻辑：SB 开始子协商并置 iac_sb_in_progress；SE 结束子协商，若是 NAWS 则按
+ *   RFC 1073 从 sb_buf 解析宽高（并校验长度，违反协议时报错）。
+ * 调试：定义 TELNET_OPTION_DEBUG 可打印每个控制字节。 */
 /* Get telnet window size. */
 static int vty_telnet_option(struct vty *vty, unsigned char *buf, int nbytes)
 {
@@ -1340,6 +1531,11 @@ static int vty_telnet_option(struct vty *vty, unsigned char *buf, int nbytes)
 	return 1;
 }
 
+/* 执行当前输入行。
+ * 认证节点（AUTH_NODE / AUTH_ENABLE_NODE）走 vty_auth 做密码校验；
+ * 其它节点调用 vty_command，终端型还会把命令加入历史。
+ * 返回：命令结果码（认证节点下初始为 CMD_SUCCESS）。
+ * 执行后清空行缓冲与输入缓冲。 */
 /* Execute current command line. */
 static int vty_execute(struct vty *vty)
 {
@@ -1375,6 +1571,16 @@ static int vty_execute(struct vty *vty)
 #define VTY_ESCAPE     2
 #define VTY_CR         3
 
+/* 行编辑状态与辅助宏：
+ *   CONTROL(X)     把控制字母 X 转成对应控制字符（X 减 @），如 CONTROL('C') 为 0x03。
+ *   VTY_NORMAL     普通输入状态。
+ *   VTY_PRE_ESCAPE 收到 ESC 后的“预转义”状态（等下一字节判断是不是 [）。
+ *   VTY_ESCAPE     进入转义序列状态（如方向键的 ESC [ A）。
+ *   VTY_CR         刚收到回车、等待可能紧随的换行。
+ * 这些状态存放在 vty->escape 字段，由 vty_read 驱动。 */
+/* 处理 ESC [ 之后的转义字符（方向键等）。
+ *   A 上 / B 下 / C 右 / D 左。
+ * 处理完把状态复位为 VTY_NORMAL。 */
 /* Escape character command map. */
 static void vty_escape_map(unsigned char c, struct vty *vty)
 {
@@ -1399,6 +1605,8 @@ static void vty_escape_map(unsigned char c, struct vty *vty)
 	vty->escape = VTY_NORMAL;
 }
 
+/* 丢弃缓冲中的待输出内容，并重画提示符与当前行。
+ * 用于分页时按 q / ^C 退出、或读取出错后清理。 */
 /* Quit print out to the buffer. */
 static void vty_buffer_reset(struct vty *vty)
 {
@@ -1408,6 +1616,12 @@ static void vty_buffer_reset(struct vty *vty)
 	vty_redraw_line(vty);
 }
 
+/* vty socket 的读事件回调：读一块字节并逐字符处理。
+ * 处理链：telnet IAC 转义 -> NAWS 子协商收集 -> telnet 选项解析 ->
+ *   分页(VTY_MORE)时只认 q/Q/^C -> 转义序列(方向键) -> 控制字符
+ *   (^A/^B/^C/^D/^E/^K/^N/^P/^T/^U/^W/^Z 等) -> 回车/换行时执行命令。
+ * 结束：若已请求关闭则 vty_close，否则重新挂读写事件继续交互。
+ * 坑：CR 后紧跟的 LF 必须丢弃，否则会多打一行空提示符（见 VTY_CR 分支）。 */
 /* Read data via vty socket. */
 static void vty_read(struct event *event)
 {
@@ -1611,6 +1825,9 @@ static void vty_read(struct event *event)
 	}
 }
 
+/* vty 写事件回调：把输出缓冲刷新到 wfd。
+ * 若处于分页状态（VTY_MORE / VTY_MORELINE）先做擦除处理；
+ * width / height / lines 未知（为 0）时按“无分页”直接 flush，否则走带分页控制的刷新。 */
 /* Flush buffer to the vty. */
 static void vty_flush(struct event *event)
 {
@@ -1661,6 +1878,10 @@ static void vty_flush(struct event *event)
 	}
 }
 
+/* 分配并初始化一个新的 struct vty（不绑定 socket）。
+ * 默认 fd/wfd = -1、of = stdout、输入/输出缓冲新建、命令缓冲 VTY_BUFSIZ、
+ * pass_fd = -1；若注册了 vty_new_mgmt_cb 则回调它。
+ * 返回：新分配的 vty（MTYPE_VTY）。 */
 /* Allocate new vty struct. */
 struct vty *vty_new(void)
 {
@@ -1681,6 +1902,10 @@ struct vty *vty_new(void)
 }
 
 
+/* 在 vty_new 基础上做“网络会话”初始化：绑定 socket、类型设为终端、
+ * 初始节点 AUTH_NODE、清空命令缓冲与历史、重置 xpath 与状态，
+ * 并把 vty 挂入全局 vty_sessions 链表。
+ * 参数：vty_sock 为已 accept 的连接 fd。返回：初始化好的 vty。 */
 /* allocate and initialise vty */
 static struct vty *vty_new_init(int vty_sock)
 {
@@ -1713,6 +1938,10 @@ static struct vty *vty_new_init(int vty_sock)
 	return vty;
 }
 
+/* 创建一个面向网络连接的 vty：在 vty_new_init 之上设置超时、对端地址，
+ * 并按 no_password_check / host 配置决定初始节点（ENABLE / VIEW）。
+ * 若未设置密码且需要校验，则打印提示、关闭并返回 NULL（拒绝连接）。
+ * 否则打印欢迎信息、协商终端选项，挂上读写事件并返回 vty。 */
 /* Create new vty structure. */
 static struct vty *vty_create(int vty_sock, union sockunion *su)
 {
@@ -1768,12 +1997,19 @@ static struct vty *vty_create(int vty_sock, union sockunion *su)
 	return vty;
 }
 
+/* 本地 stdio（stdin/stdout）vty 的私有状态：
+ *   stdio_orig_termios  进入前保存的终端属性，退出时恢复。
+ *   stdio_vty           当前 stdio vty（全局单例，禁止同时开两个）。
+ *   stdio_termios       终端属性是否已被我们改写。
+ *   stdio_vty_atclose   关闭时的用户回调。 */
 /* create vty for stdio */
 static struct termios stdio_orig_termios;
 static struct vty *stdio_vty = NULL;
 static bool stdio_termios = false;
 static void (*stdio_vty_atclose)(int isexit);
 
+/* 复位 stdio vty：恢复原始终端属性、清空单例、调用关闭回调。
+ * 参数：isexit 透传给 atclose 回调（区分是否进程退出）。 */
 static void vty_stdio_reset(int isexit)
 {
 	if (stdio_vty) {
@@ -1789,11 +2025,13 @@ static void vty_stdio_reset(int isexit)
 	}
 }
 
+/* 进程退出时的清理钩子：调用 vty_stdio_reset(1)。 */
 static void vty_stdio_atexit(void)
 {
 	vty_stdio_reset(1);
 }
 
+/* 挂起 stdio vty（用于 ^Z / SIGTSTP）：取消读写与超时事件并恢复原始终端属性。 */
 void vty_stdio_suspend(void)
 {
 	if (!stdio_vty)
@@ -1808,6 +2046,8 @@ void vty_stdio_suspend(void)
 	stdio_termios = false;
 }
 
+/* 恢复 stdio vty：把终端切到原始（raw）模式（关行缓冲、回显等），重画提示符，
+ * 并重新挂上读写事件。若无 stdio vty 则直接返回。 */
 void vty_stdio_resume(void)
 {
 	if (!stdio_vty)
@@ -1833,6 +2073,7 @@ void vty_stdio_resume(void)
 	vty_event(VTY_READ, stdio_vty);
 }
 
+/* 关闭 stdio vty（若存在）。 */
 void vty_stdio_close(void)
 {
 	if (!stdio_vty)
@@ -1840,6 +2081,10 @@ void vty_stdio_close(void)
 	vty_close(stdio_vty);
 }
 
+/* 在本进程 stdio 上创建一个 vty（本地交互）。
+ * 参数：atclose 为关闭回调。返回：新 vty；若已存在 stdio vty 则返回 NULL。
+ * 说明：wfd 设为 1，节点固定为 ENABLE_NODE、超时置 0、地址记为 console，
+ * 以保证脚本化调用行为稳定（配置不会影响它）。 */
 struct vty *vty_stdio(void (*atclose)(int isexit))
 {
 	struct vty *vty;
@@ -1864,6 +2109,10 @@ struct vty *vty_stdio(void (*atclose)(int isexit))
 	return vty;
 }
 
+/* 监听 socket 的连接到达回调：accept 一个新连接并做准入检查。
+ * 流程：把对端地址转成 prefix；按 IPv4 / IPv6 分别套用访问控制列表（DENY 则拒绝）；
+ * 设置 TCP_NODELAY 等选项，最后创建 vty 会话。
+ * 参数：event 的 arg 为 struct vty_serv（accept_sock 的来源）。 */
 /* Accept connection from the network. */
 static void vty_accept(struct event *event)
 {
@@ -1931,6 +2180,10 @@ static void vty_accept(struct event *event)
 	vty_create(vty_sock, &su);
 }
 
+/* 用 getaddrinfo 解析 hostname:port，并为每个可用的 IPv4 / IPv6 地址创建一个监听
+ * socket（REUSEADDR / REUSEPORT / CLOEXEC），bind + listen 后登记为 vty_serv 并挂 accept 事件。
+ * 参数：hostname 为监听地址（NULL 表示任意）；port 为端口。
+ * 说明：getaddrinfo 失败会直接 exit(1)；单个地址 bind / listen 失败则跳过该地址。 */
 static void vty_serv_sock_addrinfo(const char *hostname, unsigned short port)
 {
 	int ret;
@@ -1999,6 +2252,10 @@ static void vty_serv_sock_addrinfo(const char *hostname, unsigned short port)
 /* For sockaddr_un. */
 #include <sys/un.h>
 
+/* 创建 vtysh 用的 UNIX 域套接字并监听（sockaddr_un）。
+ * 步骤：先 unlink 旧路径；临时 umask(0007) 建 socket 并 bind；随后恢复 umask；
+ * 若配置了 gid_vty 则 chown 该套接字文件；最后登记为 vtysh 服务端并挂 VTYSH_SERV 事件。
+ * 参数：path 为套接字路径。失败时记日志并返回（不致命）。 */
 /* VTY shell UNIX domain socket. */
 static void vty_serv_un(const char *path)
 {
@@ -2078,6 +2335,10 @@ static void vty_serv_un(const char *path)
 
 /* #define VTYSH_DEBUG 1 */
 
+/* vtysh 客户端的连接到达回调：accept 一个本地连接并创建 VTY_SHELL_SERV 会话。
+ * 步骤：非阻塞化、放大发送缓冲（VTY_SEND_BUF_MAX）、按发送缓冲算增量刷新阈值、
+ * 设置 fd/wfd/type/node，挂入 vtysh_sessions 并注册 VTYSH_READ 事件。
+ * 参数：event 的 arg 为 struct vty_serv。 */
 static void vtysh_accept(struct event *event)
 {
 	struct vty_serv *vtyserv = EVENT_ARG(event);
@@ -2148,6 +2409,10 @@ static void vtysh_accept(struct event *event)
 	vty_event(VTYSH_READ, vty);
 }
 
+/* 通过 UNIX 域套接字用 SCM_RIGHTS 把 vty->pass_fd 传递给 vtysh 客户端。
+ * 返回：BUFFER_PENDING（需重试）/ BUFFER_ERROR（失败）/ 发送成功的状态。
+ * 说明：发送成功后关闭 pass_fd 并复位 status，重新挂上 VTYSH_READ；
+ * 若只发出去一部分状态字节，则把剩余部分放入 obuf 并返回 PENDING。 */
 static int vtysh_do_pass_fd(struct vty *vty)
 {
 	struct iovec iov[1] = {
@@ -2198,6 +2463,10 @@ static int vtysh_do_pass_fd(struct vty *vty)
 	return BUFFER_EMPTY;
 }
 
+/* 把输出缓冲刷给 vtysh 客户端，并在需要时补发 fd。
+ * 返回：0 成功；-1 出错（写失败，已置 VTY_CLOSE、清缓冲）。
+ * 说明：当缓冲已空且状态为 VTY_PASSFD 时，调用 vtysh_do_pass_fd 把 fd 发出去；
+ * PENDING 时挂写事件等待，EMPTY 时复位增量计数。 */
 static int vtysh_flush(struct vty *vty)
 {
 	int ret;
@@ -2230,6 +2499,8 @@ static int vtysh_flush(struct vty *vty)
 	return 0;
 }
 
+/* 记录一个要传递给 vtysh 客户端的 fd（如 terminal monitor 的日志 fd）。
+ * 若已有待传 fd 则先关闭旧的；随后保存新 fd。 */
 void vty_pass_fd(struct vty *vty, int fd)
 {
 	if (vty->pass_fd != -1)
@@ -2238,6 +2509,12 @@ void vty_pass_fd(struct vty *vty, int fd)
 	vty->pass_fd = fd;
 }
 
+/* vtysh 服务端读回调：从 vtysh 客户端 socket 读命令字节流并执行。
+ * 逐字节累积到 vty->buf，遇到 '\0' 即认为一条命令结束，调用 vty_execute 执行，
+ * 再把 4 字节返回码写回客户端（若本命令要传递 fd，则先发 fd 并暂停读取）。
+ * 参数：event 的 arg 为 struct vty。返回：void。
+ * 坑：一次 read 里通常只承载一条命令——为传 fd / CMD_SUSPEND / 等待 mgmtd 响应，
+ *   本函数会在中途 return，尚未处理的字节会被丢弃（见上方英文长注释）。 */
 static void vtysh_read(struct event *event)
 {
 	int ret;
@@ -2375,6 +2652,7 @@ static void vtysh_read(struct event *event)
 		vty_event(VTYSH_READ, vty);
 }
 
+/* vtysh 服务端写回调：把输出缓冲刷给客户端（调用 vtysh_flush）。 */
 static void vtysh_write(struct event *event)
 {
 	struct vty *vty = EVENT_ARG(event);
@@ -2384,6 +2662,9 @@ static void vtysh_write(struct event *event)
 
 #endif /* VTYSH */
 
+/* 启动 VTY 服务：port 非 0 则监听 TCP（vty_serv_sock_addrinfo）；
+ * 若编译了 VTYSH 则再创建 UNIX 域套接字（vty_serv_un）。
+ * 参数：addr 监听地址；port 端口（0 表示不监听 TCP）；path 为 vtysh 套接字路径。 */
 /* Determine address family to bind. */
 void vty_serv_start(const char *addr, unsigned short port, const char *path)
 {
@@ -2396,6 +2677,8 @@ void vty_serv_start(const char *addr, unsigned short port, const char *path)
 #endif /* VTYSH */
 }
 
+/* 停止所有 VTY 服务：遍历并弹出全部监听服务端，取消 accept 事件、关闭 socket、
+ * 释放结构，最后重置链表。 */
 void vty_serv_stop(void)
 {
 	struct vty_serv *vtyserv;
@@ -2410,6 +2693,7 @@ void vty_serv_stop(void)
 	vtyservs_init(vty_servs);
 }
 
+/* vty->error 列表元素的删除回调：释放一个 struct vty_error（MTYPE_TMP）。 */
 static void vty_error_delete(void *arg)
 {
 	struct vty_error *ve = arg;
@@ -2417,6 +2701,12 @@ static void vty_error_delete(void *arg)
 	XFREE(MTYPE_TMP, ve);
 }
 
+/* 关闭并释放一个 vty。警告：调用后 vty 已被释放，切勿再访问；最好只在
+ * 事件派发器直接调用的顶层函数里调用。
+ * 关键步骤：标记 VTY_CLOSE、有未提交配置则告警、退出配置模式、触发 close 回调、
+ * 取消读写/超时事件、关闭 pass_fd、刷新并释放输入输出缓冲、清历史、
+ * 从会话链表摘除、必要时 fsync 配置文件、关闭 socket（但不关 stdin/stdout/stderr）、
+ * 释放命令缓冲与 error 列表，最后释放 vty 本体；若是 stdio vty 则复位终端。 */
 /* Close vty interface.  Warning: call this only from functions that
    will be careful not to access the vty afterwards (since it has
    now been freed).  This is safest from top-level functions (called
@@ -2503,6 +2793,7 @@ void vty_close(struct vty *vty)
 		vty_stdio_reset(0);
 }
 
+/* vty 空闲超时回调：清空缓冲、提示“连接超时”，随后关闭该 vty。 */
 /* When time out occur output message then close connection. */
 static void vty_timeout(struct event *event)
 {
@@ -2521,6 +2812,10 @@ static void vty_timeout(struct event *event)
 	vty_close(vty);
 }
 
+/* 从一个已打开的配置文件把整份配置读入。
+ * 参数：config 为目标候选配置（NULL 表示先建私有候选配置）；confp 为已打开的 FILE*。
+ * 说明：新建一个 VTY_FILE 型 vty，wfd 指向 STDERR（配置文件里的报错输出到 stderr），
+ * 节点置 CONFIG_NODE，由 config_from_file 逐行解析，最后调用 vty_read_file_finish 收尾。 */
 /* Read up configuration file from file_name. */
 void vty_read_file(struct nb_config *config, FILE *confp)
 {
@@ -2552,6 +2847,10 @@ void vty_read_file(struct nb_config *config, FILE *confp)
 	vty_read_file_finish(vty, config);
 }
 
+/* 配置文件读取收尾：先冲刷缓冲，再把读取期间记录的错误逐条打日志，
+ * 最后（当 config 为 NULL，即非外部候选配置时）自动提交候选配置并关闭 vty。
+ * 参数：vty 为读取用的 vty；config 为外部候选配置（可为 NULL）。
+ * 坑：各 cmd_ret 都会映射成一句人类可读的 message；error_buf 只取第一行。 */
 void vty_read_file_finish(struct vty *vty, struct nb_config *config)
 {
 	struct vty_error *ve;
@@ -2625,6 +2924,11 @@ void vty_read_file_finish(struct vty *vty, struct nb_config *config)
 	vty_close(vty);
 }
 
+/* 当主配置文件打不开时，尝试使用备份文件（路径追加 CONF_BACKUP_EXT）。
+ * 做法：把备份内容复制到一个临时文件（mkstemp、权限 CONFIGFILE_MASK），
+ * 再 rename 覆盖回原路径并打开返回。
+ * 参数：fullpath 为原配置文件全路径。返回：打开的 FILE*，失败返回 NULL。
+ * 注意：内部用 malloc/free（而非 MTYPE）管理路径字符串。 */
 static FILE *vty_use_backup_config(const char *fullpath)
 {
 	char *fullpath_sav, *fullpath_tmp;
@@ -2680,6 +2984,12 @@ static FILE *vty_use_backup_config(const char *fullpath)
 	return ret;
 }
 
+/* 打开配置文件：优先用显式指定的 config_file，否则用 config_default_dir。
+ * 相对路径会拼上当前工作目录；打开失败时退回到备份文件。
+ * 参数：config_file 用户指定的文件（可为 NULL）；config_default_dir 默认目录配置。
+ * 返回：打开的 FILE*（失败返回 NULL）。
+ * 说明：VTYSH 场景下，若存在整合配置 frr.conf 则不读本 daemon 配置，
+ *   等待 vtysh -b 的启动配置（见函数内的英文说明）。 */
 FILE *vty_open_config(const char *config_file, char *config_default_dir)
 {
 	char cwd[MAXPATHLEN];
@@ -2784,6 +3094,9 @@ tmp_free_and_out:
 }
 
 
+/* 打开并读取一份配置文件（= vty_open_config + vty_read_file + 关闭）。
+ * 参数：config 目标候选配置；config_file 指定文件；config_default_dir 默认目录。
+ * 返回：成功读取 true，打不开文件 false。 */
 bool vty_read_config(struct nb_config *config, const char *config_file,
 		     char *config_default_dir)
 {
@@ -2800,6 +3113,11 @@ bool vty_read_config(struct nb_config *config, const char *config_file,
 	return true;
 }
 
+/* 进入配置模式。参数：private_config 私有配置；exclusive 是否独占（加运行锁）；
+ * file_lock 是否加文件锁。
+ * 返回：CMD_SUCCESS 或 CMD_WARNING（被其它客户端锁定时）。
+ * 说明：有 mgmtd 回调时交由它处理；私有配置会拷贝 running 配置；非私有则指向
+ * mgmtd / 共享候选配置，事务模式下再拷贝一份基线配置。 */
 int vty_config_enter(struct vty *vty, bool private_config, bool exclusive,
 		     bool file_lock)
 {
@@ -2843,6 +3161,9 @@ int vty_config_enter(struct vty *vty, bool private_config, bool exclusive,
 }
 
 
+/* 退出配置模式：若当前节点在 CONFIG_NODE 之下，则逐级调用 cmd_exit 一直退到
+ * ENABLE_NODE（其间会触发 vty_config_node_exit 做清理与提交检查）。
+ * 若本就不在配置子树内则直接返回（例如在 ENABLE_NODE 调 vty_close 的情形）。 */
 void vty_config_exit(struct vty *vty)
 {
 	enum node_type node = vty->node;
@@ -2863,6 +3184,11 @@ void vty_config_exit(struct vty *vty)
 		cmd_exit(vty);
 }
 
+/* 退出当前配置节点的清理钩子（由 cmd_exit 调用）。
+ * 依次：清 xpath 索引、关闭 pending_allowed、触发 mgmtd 回调、做待提交检查、
+ * 若有“确认提交（confirmed-commit）”超时在挂则回滚并清理、释放运行锁、
+ * 释放候选配置（私有配置）与基线配置、复位 config 标志。
+ * 返回：1。特殊：读配置文件过程中退到配置节点会提示并置 VTY_CLOSE。 */
 int vty_config_node_exit(struct vty *vty)
 {
 	vty->xpath_index = 0;
@@ -2911,9 +3237,12 @@ int vty_config_node_exit(struct vty *vty)
 	return 1;
 }
 
+/* 所有 vty 事件（服务器与各会话）统一注册到的事件循环，由 vty_init 设置。 */
 /* Master of the threads. */
 static struct event_loop *vty_master;
 
+/* 为监听服务端注册事件。参数：event 仅支持 VTY_SERV（或 VTYSH_SERV）；
+ * vty_serv 为对应服务端。传入其它事件类型属于误用，会触发断言。 */
 static void vty_event_serv(enum vty_event event, struct vty_serv *vty_serv)
 {
 	switch (event) {
@@ -2936,6 +3265,11 @@ static void vty_event_serv(enum vty_event event, struct vty_serv *vty_serv)
 	}
 }
 
+/* 为某个 vty 会话注册 / 重置事件：
+ *   VTY_READ / VTYSH_READ   挂读事件（VTY_READ 还会重置空闲超时定时器）。
+ *   VTY_WRITE / VTYSH_WRITE 挂写事件。
+ *   VTY_TIMEOUT_RESET       取消并重设超时定时器。
+ * 参数：event；vty。传入服务端类事件会触发断言。 */
 static void vty_event(enum vty_event event, struct vty *vty)
 {
 	switch (event) {
@@ -2976,6 +3310,8 @@ static void vty_event(enum vty_event event, struct vty *vty)
 	}
 }
 
+/* VTY 命令 "who"：列出当前所有 vty 会话及其来源地址；
+ * 配置模式中的会话用 * 标记，启用了 live log 的追加提示。返回 CMD_SUCCESS。 */
 DEFUN_NOSH (config_who,
        config_who_cmd,
        "who",
@@ -2990,6 +3326,8 @@ DEFUN_NOSH (config_who,
 	return CMD_SUCCESS;
 }
 
+/* VTY 命令 "line vty"：进入 VTY_NODE 配置节点（配置终端行参数）。
+ * 仅切换节点并返回 CMD_SUCCESS。 */
 /* Move to vty configuration mode. */
 DEFUN_NOSH (line_vty,
        line_vty_cmd,
@@ -3001,6 +3339,9 @@ DEFUN_NOSH (line_vty,
 	return CMD_SUCCESS;
 }
 
+/* 设置 exec 超时（内部实现）。参数：min_str 分钟、sec_str 秒（均可能为 NULL）。
+ * 换算成秒后存入全局 vty_timeout_val 与当前 vty->v_timeout，并重置超时事件。
+ * 返回 CMD_SUCCESS。 */
 /* Set time out value. */
 static int exec_timeout(struct vty *vty, const char *min_str,
 			const char *sec_str)
@@ -3024,6 +3365,7 @@ static int exec_timeout(struct vty *vty, const char *min_str,
 	return CMD_SUCCESS;
 }
 
+/* VTY 命令 "exec-timeout (0-35791)"：只给分钟，转调 exec_timeout。 */
 DEFUN (exec_timeout_min,
        exec_timeout_min_cmd,
        "exec-timeout (0-35791)",
@@ -3034,6 +3376,7 @@ DEFUN (exec_timeout_min,
 	return exec_timeout(vty, argv[idx_number]->arg, NULL);
 }
 
+/* VTY 命令 "exec-timeout (0-35791) (0-2147483)"：分 + 秒，转调 exec_timeout。 */
 DEFUN (exec_timeout_sec,
        exec_timeout_sec_cmd,
        "exec-timeout (0-35791) (0-2147483)",
@@ -3047,6 +3390,7 @@ DEFUN (exec_timeout_sec,
 			    argv[idx_number_2]->arg);
 }
 
+/* VTY 命令 "no exec-timeout"：把超时清零（即不超时），转调 exec_timeout(NULL, NULL)。 */
 DEFUN (no_exec_timeout,
        no_exec_timeout_cmd,
        "no exec-timeout",
@@ -3056,6 +3400,8 @@ DEFUN (no_exec_timeout,
 	return exec_timeout(vty, NULL, NULL);
 }
 
+/* VTY 命令 "access-class WORD"：设置 IPv4 访问控制列表名。
+ * 释放旧名并把新名复制进 vty_accesslist_name。返回 CMD_SUCCESS。 */
 /* Set vty access class. */
 DEFUN (vty_access_class,
        vty_access_class_cmd,
@@ -3072,6 +3418,9 @@ DEFUN (vty_access_class,
 	return CMD_SUCCESS;
 }
 
+/* VTY 命令 "no access-class [WORD]"：清除（或按名清除）IPv4 访问控制列表。
+ * 若当前未设置、或指定名与当前不符，则报错返回 CMD_WARNING_CONFIG_FAILED；
+ * 命中则释放并置空。 */
 /* Clear vty access class. */
 DEFUN (no_vty_access_class,
        no_vty_access_class_cmd,
@@ -3095,6 +3444,7 @@ DEFUN (no_vty_access_class,
 	return CMD_SUCCESS;
 }
 
+/* VTY 命令 "ipv6 access-class WORD"：设置 IPv6 访问控制列表名（释放旧值后复制新值）。 */
 /* Set vty access class. */
 DEFUN (vty_ipv6_access_class,
        vty_ipv6_access_class_cmd,
@@ -3112,6 +3462,8 @@ DEFUN (vty_ipv6_access_class,
 	return CMD_SUCCESS;
 }
 
+/* VTY 命令 "no ipv6 access-class [WORD]"：清除（或按名清除）IPv6 访问控制列表；
+ * 未设置或名不符时报错返回 CMD_WARNING_CONFIG_FAILED。 */
 /* Clear vty access class. */
 DEFUN (no_vty_ipv6_access_class,
        no_vty_ipv6_access_class_cmd,
@@ -3138,6 +3490,7 @@ DEFUN (no_vty_ipv6_access_class,
 	return CMD_SUCCESS;
 }
 
+/* VTY 命令 "login"：开启登录密码校验（no_password_check = 0）。返回 CMD_SUCCESS。 */
 /* vty login. */
 DEFUN (vty_login,
        vty_login_cmd,
@@ -3148,6 +3501,7 @@ DEFUN (vty_login,
 	return CMD_SUCCESS;
 }
 
+/* VTY 命令 "no login"：跳过登录密码校验（no_password_check = 1）。返回 CMD_SUCCESS。 */
 DEFUN (no_vty_login,
        no_vty_login_cmd,
        "no login",
@@ -3158,6 +3512,7 @@ DEFUN (no_vty_login,
 	return CMD_SUCCESS;
 }
 
+/* VTY 命令 "service advanced-vty"：开启高级模式 vty（host.advanced = 1）。 */
 DEFUN (service_advanced_vty,
        service_advanced_vty_cmd,
        "service advanced-vty",
@@ -3168,6 +3523,7 @@ DEFUN (service_advanced_vty,
 	return CMD_SUCCESS;
 }
 
+/* VTY 命令 "no service advanced-vty"：关闭高级模式 vty（host.advanced = 0）。 */
 DEFUN (no_service_advanced_vty,
        no_service_advanced_vty_cmd,
        "no service advanced-vty",
@@ -3179,6 +3535,9 @@ DEFUN (no_service_advanced_vty,
 	return CMD_SUCCESS;
 }
 
+/* VTY 命令 "terminal monitor [detach]"：把 debug 日志复制到当前终端。
+ * 仅支持 vtysh 服务端会话；打开 live log 拿到一个 fd，再经 vty_pass_fd 传给客户端。
+ * detach 时使用一个“独立且脱管”的 live log（会话退出后继续）。返回 CMD_SUCCESS。 */
 DEFUN_NOSH(terminal_monitor,
 	   terminal_monitor_cmd,
 	   "terminal monitor [detach]",
@@ -3210,6 +3569,7 @@ DEFUN_NOSH(terminal_monitor,
 	return CMD_SUCCESS;
 }
 
+/* VTY 命令 "no terminal monitor"：关闭本会话的 live log（terminal monitor）。 */
 DEFUN_NOSH(no_terminal_monitor,
 	   no_terminal_monitor_cmd,
 	   "no terminal monitor",
@@ -3221,6 +3581,7 @@ DEFUN_NOSH(no_terminal_monitor,
 	return CMD_SUCCESS;
 }
 
+/* VTY 命令 "terminal no monitor"：别名，转调 no_terminal_monitor。 */
 DEFUN_NOSH(terminal_no_monitor,
 	   terminal_no_monitor_cmd,
 	   "terminal no monitor",
@@ -3232,6 +3593,8 @@ DEFUN_NOSH(terminal_no_monitor,
 }
 
 
+/* VTY 命令 "show history"：按时间顺序打印本会话的命令历史
+ * （环形缓冲，从 hindex+1 起绕一圈遍历）。 */
 DEFUN_NOSH (show_history,
        show_history_cmd,
        "show history",
@@ -3255,6 +3618,9 @@ DEFUN_NOSH (show_history,
 	return CMD_SUCCESS;
 }
 
+/* VTY 命令 "[no] log commands"：开启 / 关闭命令日志。
+ * 若守护进程以“永久记录命令”方式启动（vty_log_commands_perm），则 no 分支
+ * 只提示并返回 CMD_WARNING，不能关闭。 */
 /* vty login. */
 DEFPY (log_commands,
        log_commands_cmd,
@@ -3277,6 +3643,10 @@ DEFPY (log_commands,
 	return CMD_SUCCESS;
 }
 
+/* 把与 vty 相关的当前配置写回配置文本（用于 show running-config）。
+ * 依次输出 line vty、access-class（IPv4 / IPv6）、exec-timeout、no login，
+ * 以及 log commands；frame 机制保证有内容时才输出 line vty 段。
+ * 返回 CMD_SUCCESS。 */
 /* Display current configuration. */
 static int vty_config_write(struct vty *vty)
 {
@@ -3316,6 +3686,8 @@ static int vty_config_write(struct vty *vty)
 #include "gperftools/tcmalloc.h"
 #include "gperftools/malloc_extension_c.h"
 
+/* tcmalloc 统计表的表项结构（label + val）与预置空表；
+ * 末尾以 {NULL, 0} 作为哨兵。仅在 HAVE_TCMALLOC 下编译。 */
 struct tcm_stats_s {
 	const char *label;
 	size_t val;
@@ -3327,6 +3699,8 @@ struct tcm_stats_s {
 	{NULL, 0},
 };
 
+/* VTY 命令 "show tcmalloc stats"：打印 tcmalloc 版本、mallinfo2 统计，
+ * 以及若干 MallocExtension 数值属性。仅在 HAVE_TCMALLOC 下编译。 */
 DEFUN_NOSH (show_tcmalloc_stats,
 	    show_tcmalloc_stats_cmd,
 	    "show tcmalloc stats",
@@ -3382,6 +3756,8 @@ DEFUN_NOSH (show_tcmalloc_stats,
 	return CMD_SUCCESS;
 }
 
+/* VTY 命令 "memory release rate (0-100)"：设置向 OS 释放空闲内存的速率。
+ * 参数取自 argv[3]；调用 frr_mem_release_config。返回 CMD_SUCCESS。 */
 DEFUN_NOSH (lib_tcmalloc_config,
 	    lib_tcmalloc_config_cmd,
 	    "memory release rate (0-100)",
@@ -3400,6 +3776,9 @@ DEFUN_NOSH (lib_tcmalloc_config,
 }
 #endif /* HAVE_TCMALLOC */
 
+/* VTY_NODE 命令节点定义：父节点为 CONFIG_NODE，提示符 "%s(config-line)# "，
+ * 其 config_write 回调为 vty_config_write（把 line vty 段的配置写回）。
+ * 上面一行是 vty_config_write 的前向声明。 */
 static int vty_config_write(struct vty *vty);
 struct cmd_node vty_node = {
 	.name = "vty",
@@ -3409,6 +3788,9 @@ struct cmd_node vty_node = {
 	.config_write = vty_config_write,
 };
 
+/* 复位所有 VTY 状态：关闭全部普通会话（清缓冲后 vty_close），
+ * 把空闲超时恢复默认值，并释放 IPv4 / IPv6 访问控制列表名。
+ * 注意：不处理 vtysh 会话（由 vty_terminate 另行处理）。 */
 /* Reset all VTY status. */
 void vty_reset(void)
 {
@@ -3427,6 +3809,8 @@ void vty_reset(void)
 	XFREE(MTYPE_VTY, vty_ipv6_accesslist_name);
 }
 
+/* 记录当前工作目录到 vty_cwd（供后续读配置用）。
+ * 若 getcwd 失败，则切到 SYSCONFDIR 再取一次；仍失败则记致命错误并 exit(-1)。 */
 static void vty_save_cwd(void)
 {
 	char *c;
@@ -3453,26 +3837,36 @@ static void vty_save_cwd(void)
 	}
 }
 
+/* 返回缓存的当前工作目录字符串 vty_cwd（静态存储，勿释放）。 */
 char *vty_get_cwd(void)
 {
 	return vty_cwd;
 }
 
+/* 判断该 vty 是否为 vtysh 客户端外壳（VTY_SHELL）。返回 1 / 0。 */
 int vty_shell(struct vty *vty)
 {
 	return vty->type == VTY_SHELL ? 1 : 0;
 }
 
+/* 判断该 vty 是否为 vtysh 服务端会话（VTY_SHELL_SERV）。返回 1 / 0。 */
 int vty_shell_serv(struct vty *vty)
 {
 	return vty->type == VTY_SHELL_SERV ? 1 : 0;
 }
 
+/* vtysh 侧的 vty 初始化占位函数（当前无内容，预留给将来使用）。 */
 void vty_init_vtysh(void)
 {
 	/* currently nothing to do, but likely to have future use */
 }
 
+/* VTY 子系统初始化：各守护进程启动时调用一次。
+ * 参数：master_thread 事件循环；do_command_logging 是否永久记录命令日志。
+ * 行为：保存当前目录、记录事件循环、注册 atexit 清理、安装 vty 节点与一批命令
+ * （who / show history / line vty / service advanced-vty / log commands /
+ *  terminal monitor 系 / exec-timeout / access-class / login 等）。
+ * 副作用：修改全局命令树，重复调用会重复安装。 */
 /* Install vty's own commands like `who' command. */
 void vty_init(struct event_loop *master_thread, bool do_command_logging)
 {
@@ -3520,6 +3914,8 @@ void vty_init(struct event_loop *master_thread, bool do_command_logging)
 #endif /* HAVE_TCMALLOC */
 }
 
+/* 关闭 VTY 子系统：清空 cwd 缓存，调用 vty_reset 关掉普通会话，
+ * 再单独关闭全部 vtysh 会话（vty_reset 不处理它们），最后停掉所有监听服务端。 */
 void vty_terminate(void)
 {
 	struct vty *vty;

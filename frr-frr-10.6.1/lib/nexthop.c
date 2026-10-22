@@ -2,6 +2,35 @@
 /* A generic nexthop structure
  * Copyright (C) 2013 Cumulus Networks, Inc.
  */
+/*
+ * 文件导读：nexthop.c —— 下一跳（nexthop）对象的实现。
+ *
+ * 本文件实现 nexthop.h 声明的对象：分配 / 释放、比较 / 相等判定、哈希、
+ * 拷贝与复制、标签栈与 SRv6 的增删、以及字符串 / JSON / VTY 输出。
+ *
+ * 一、比较的“分层”设计（本文件核心）
+ *   _nexthop_labels_cmp   比较 MPLS 标签栈（个数 + 逐个标签）；
+ *   _nexthop_srv6_cmp     比较 SRv6 seg6local 行为 / 上下文 / SID 列表；
+ *   _nexthop_gateway_cmp  比较网关地址（按类型走 IPv4 / IPv6）；
+ *   _nexthop_source_cmp   比较源地址；
+ *   _nexthop_cmp_no_labels 比较“除标签与 SRv6 外”的字段：vrf → type →
+ *                         weight（可选）→ 网关 / 接口 / 黑洞类型 →
+ *                         srte_color → 源地址 → 备份索引；
+ *   nexthop_cmp_internal  把上面三者按 无标签段 → 标签 → SRv6 串起来。
+ *   对外暴露 nexthop_cmp（含 weight）与 nexthop_cmp_no_weight（忽略 weight）。
+ *
+ * 二、相等与哈希
+ *   nexthop_same 系列基于 cmp 实现；nexthop_cmp_basic 是更弱的比较，只用于
+ *   识别“重复 nexthop”（某条链路上同一个出口只应出现一次）。哈希函数对
+ *   struct 内 _hash_begin.._hash_end 的连续块求 jhash，见 nexthop.h。
+ *
+ * 三、易踩的坑
+ *   - 很多 cmp 函数假定 nh1 / nh2 非空，只有少数显式判 NULL；
+ *   - 比较顺序即排序顺序，nexthop_group 的规范排序依赖它，改动会破坏
+ *     已排序前提；
+ *   - IPv4 地址必须放在清零过的 16 字节 union 中，否则哈希会读到垃圾字节。
+ */
+
 #include <zebra.h>
 
 #include "prefix.h"
@@ -20,10 +49,17 @@
 #include "nexthop_group.h"
 #include "lib/json.h"
 
+/* 内存类型注册：分别用于 nexthop 本体、MPLS 标签栈、SRv6 子结构，
+ * 便于内存统计与泄漏定位（仅本文件可见）。
+ */
 DEFINE_MTYPE_STATIC(LIB, NEXTHOP, "Nexthop");
 DEFINE_MTYPE_STATIC(LIB, NH_LABEL, "Nexthop label");
 DEFINE_MTYPE_STATIC(LIB, NH_SRV6, "Nexthop srv6");
 
+/* 比较两个 nexthop 的 MPLS 标签栈 nh_label，返回 -1 / 0 / 1（语义同 memcmp）。
+ * 规则：都无标签视为相等；有标签者大于无标签者；否则先比标签个数，再逐个
+ * 字节比较标签数组。不修改入参。
+ */
 static int _nexthop_labels_cmp(const struct nexthop *nh1,
 			       const struct nexthop *nh2)
 {
@@ -53,6 +89,11 @@ static int _nexthop_labels_cmp(const struct nexthop *nh1,
 		      (nhl1->num_labels * sizeof(mpls_label_t)));
 }
 
+/* 比较两个 nexthop 的 SRv6 信息 nh_srv6，返回 -1 / 0 / 1。
+ * 依次比较：是否有 SRv6 信息 → seg6local_action → seg6local_ctx →
+ * SID 列表（num_segs、逐个 SID）→ encap_behavior。都无 SRv6 视为相等。
+ * 副作用：无。注意 SID 个数不同直接返回 -1（不区分大小）。
+ */
 static int _nexthop_srv6_cmp(const struct nexthop *nh1,
 			     const struct nexthop *nh2)
 {
@@ -110,6 +151,9 @@ static int _nexthop_srv6_cmp(const struct nexthop *nh1,
 	return ret;
 }
 
+/* 按 nexthop 类型比较两个网关地址：IPv4 类型走 IPV4_ADDR_CMP，IPv6 类型走
+ * IPV6_ADDR_CMP，IFINDEX / BLACKHOLE 类型无地址，直接返回 0。返回 cmp 值。
+ */
 int nexthop_g_addr_cmp(enum nexthop_types_t type, const union g_addr *addr1,
 		       const union g_addr *addr2)
 {
@@ -133,18 +177,26 @@ int nexthop_g_addr_cmp(enum nexthop_types_t type, const union g_addr *addr1,
 	return ret;
 }
 
+/* 比较两个 nexthop 的网关地址（gate）。用 nh1 的类型决定地址族。 */
 static int _nexthop_gateway_cmp(const struct nexthop *nh1,
 				const struct nexthop *nh2)
 {
 	return nexthop_g_addr_cmp(nh1->type, &nh1->gate, &nh2->gate);
 }
 
+/* 比较两个 nexthop 的源地址（src）。同样用 nh1 的类型决定地址族。 */
 static int _nexthop_source_cmp(const struct nexthop *nh1,
 			       const struct nexthop *nh2)
 {
 	return nexthop_g_addr_cmp(nh1->type, &nh1->src, &nh2->src);
 }
 
+/* 比较两个 nexthop 中“除标签与 SRv6 外”的字段，返回 -1 / 0 / 1。
+ * 比较顺序：vrf_id → type → weight（仅当 use_weight）→ 按类型的网关 / 接口 /
+ * 黑洞类型 → srte_color → 源地址 → 是否带备份（HAS_BACKUP）→ 备份个数与索引。
+ * use_ifindex 为 false 时，IPV4_IFINDEX / IPV6_IFINDEX 类型不比较 ifindex。
+ * 副作用：无。这是规范排序的主比较体，改动顺序会影响所有依赖方。
+ */
 static int _nexthop_cmp_no_labels(const struct nexthop *next1,
 				  const struct nexthop *next2, bool use_weight, bool use_ifindex)
 {
@@ -238,6 +290,9 @@ done:
 	return ret;
 }
 
+/* 完整比较的统一入口：先比“无标签段”，再比标签栈，最后比 SRv6 信息。
+ * use_weight / use_ifindex 透传给 _nexthop_cmp_no_labels。返回 cmp 值。
+ */
 static int nexthop_cmp_internal(const struct nexthop *next1,
 				const struct nexthop *next2, bool use_weight, bool use_ifindex)
 {
@@ -256,17 +311,23 @@ static int nexthop_cmp_internal(const struct nexthop *next1,
 	return ret;
 }
 
+/* 完整比较（含 weight 与 ifindex）。返回 -1 / 0 / 1。 */
 int nexthop_cmp(const struct nexthop *next1, const struct nexthop *next2)
 {
 	return nexthop_cmp_internal(next1, next2, true, true);
 }
 
+/* 完整比较但忽略 weight（其它字段照比）。返回 -1 / 0 / 1。 */
 int nexthop_cmp_no_weight(const struct nexthop *next1,
 			  const struct nexthop *next2)
 {
 	return nexthop_cmp_internal(next1, next2, false, true);
 }
 
+/* 受限比较：只比 vrf_id、type、网关 / 接口等基本键，用于识别重复 nexthop。
+ * 返回 -1 / 0 / 1。与 nexthop_cmp 不同，它忽略 weight、源地址、SRv6、
+ * srte_color、备份等，且显式支持 nh1 / nh2 为 NULL 的情形。
+ */
 /*
  * More-limited comparison function used to detect duplicate
  * nexthops. This is used in places where we don't need the full
@@ -366,6 +427,9 @@ done:
 	return ret;
 }
 
+/* 把 nexthop 类型枚举转成人类可读字符串（查表 desc）。调用者需保证 nh_type
+ * 落在合法范围内，否则会数组越界。
+ */
 /*
  * nexthop_type_to_str
  */
@@ -381,6 +445,9 @@ const char *nexthop_type_to_str(enum nexthop_types_t nh_type)
 	return desc[nh_type];
 }
 
+/* 判断两个 nexthop 的标签栈是否一致，一致返回 true。内部复用
+ * _nexthop_labels_cmp。
+ */
 /*
  * Check if the labels match for the 2 nexthops specified.
  */
@@ -392,6 +459,10 @@ bool nexthop_labels_match(const struct nexthop *nh1, const struct nexthop *nh2)
 	return true;
 }
 
+/* 分配并零初始化一个 nexthop（XCALLOC，失败即断言 / 终止）。特别注意：
+ * weight 默认置 1，因为 Linux 内核在 netlink 上会给权重加 1，这里统一以 1
+ * 为基准，避免在 netlink 代码里特殊处理默认权重。
+ */
 struct nexthop *nexthop_new(void)
 {
 	struct nexthop *nh;
@@ -413,6 +484,9 @@ struct nexthop *nexthop_new(void)
 	return nh;
 }
 
+/* 释放单个 nexthop：先释放其标签栈、SRv6 seg6local 与 SID 列表，再递归释放
+ * 其 resolved 递归链，最后释放结构体本身。调用后指针失效。
+ */
 /* Free nexthop. */
 void nexthop_free(struct nexthop *nexthop)
 {
@@ -424,6 +498,7 @@ void nexthop_free(struct nexthop *nexthop)
 	XFREE(MTYPE_NEXTHOP, nexthop);
 }
 
+/* 释放整条 nexthop 链表：先保存 next 再释放当前节点，避免释放后解引用。 */
 /* Frees a list of nexthops */
 void nexthops_free(struct nexthop *nexthop)
 {
@@ -435,6 +510,9 @@ void nexthops_free(struct nexthop *nexthop)
 	}
 }
 
+/* 忽略 ifindex 的相等判定。NULL 规则：一方为空返回 false；同一指针视为
+ * 相等；否则走 nexthop_cmp_internal（use_ifindex=false）。
+ */
 bool nexthop_same_no_ifindex(const struct nexthop *nh1, const struct nexthop *nh2)
 {
 	if (nh1 && !nh2)
@@ -449,6 +527,9 @@ bool nexthop_same_no_ifindex(const struct nexthop *nh1, const struct nexthop *nh
 	return nexthop_cmp_internal(nh1, nh2, true, false);
 }
 
+/* 完整相等判定（含 weight、ifindex、标签、SRv6）。NULL 规则同上；
+ * 使用完整 nexthop_cmp。
+ */
 bool nexthop_same(const struct nexthop *nh1, const struct nexthop *nh2)
 {
 	if (nh1 && !nh2)
@@ -466,6 +547,7 @@ bool nexthop_same(const struct nexthop *nh1, const struct nexthop *nh2)
 	return true;
 }
 
+/* 忽略标签栈的相等判定：只比“无标签段”（weight 与 ifindex 均参与）。 */
 bool nexthop_same_no_labels(const struct nexthop *nh1,
 			    const struct nexthop *nh2)
 {
@@ -484,6 +566,7 @@ bool nexthop_same_no_labels(const struct nexthop *nh1,
 	return true;
 }
 
+/* 忽略 weight 的相等判定（其余字段照比）。NULL 规则与上面一致。 */
 bool nexthop_same_no_weight(const struct nexthop *nh1, const struct nexthop *nh2)
 {
 	if (nh1 == nh2)
@@ -495,6 +578,9 @@ bool nexthop_same_no_weight(const struct nexthop *nh1, const struct nexthop *nh2
 	return (nexthop_cmp_no_weight(nh1, nh2) == 0);
 }
 
+/* 构造直连型 nexthop（NEXTHOP_TYPE_IFINDEX）：仅设置 ifindex 与 vrf_id。
+ * 以下 nexthop_from_* 系列都基于 nexthop_new()，失败由 XCALLOC 保证不返回。
+ */
 /*
  * Allocate a new nexthop object and initialize it from various args.
  */
@@ -510,6 +596,9 @@ struct nexthop *nexthop_from_ifindex(ifindex_t ifindex, vrf_id_t vrf_id)
 	return nexthop;
 }
 
+/* 构造 IPv4 网关型 nexthop（NEXTHOP_TYPE_IPV4）：设置网关 ipv4、vrf_id；
+ * src 非空时一并设置源地址。注意 gate union 已整体清零，IPv4 只填低 4 字节。
+ */
 struct nexthop *nexthop_from_ipv4(const struct in_addr *ipv4,
 				  const struct in_addr *src,
 				  vrf_id_t vrf_id)
@@ -526,6 +615,9 @@ struct nexthop *nexthop_from_ipv4(const struct in_addr *ipv4,
 	return nexthop;
 }
 
+/* 构造 IPv4 网关 + 出接口型 nexthop（NEXTHOP_TYPE_IPV4_IFINDEX）：在
+ * nexthop_from_ipv4 基础上额外设置 ifindex。
+ */
 struct nexthop *nexthop_from_ipv4_ifindex(const struct in_addr *ipv4,
 					  const struct in_addr *src,
 					  ifindex_t ifindex, vrf_id_t vrf_id)
@@ -543,6 +635,9 @@ struct nexthop *nexthop_from_ipv4_ifindex(const struct in_addr *ipv4,
 	return nexthop;
 }
 
+/* 构造 IPv6 网关型 nexthop（NEXTHOP_TYPE_IPV6）：设置网关 ipv6 与 vrf_id，
+ * 出接口留待递归解析。
+ */
 struct nexthop *nexthop_from_ipv6(const struct in6_addr *ipv6,
 				  vrf_id_t vrf_id)
 {
@@ -556,6 +651,7 @@ struct nexthop *nexthop_from_ipv6(const struct in6_addr *ipv6,
 	return nexthop;
 }
 
+/* 构造 IPv6 网关 + 出接口型 nexthop（NEXTHOP_TYPE_IPV6_IFINDEX）。 */
 struct nexthop *nexthop_from_ipv6_ifindex(const struct in6_addr *ipv6,
 					  ifindex_t ifindex, vrf_id_t vrf_id)
 {
@@ -570,6 +666,9 @@ struct nexthop *nexthop_from_ipv6_ifindex(const struct in6_addr *ipv6,
 	return nexthop;
 }
 
+/* 构造黑洞型 nexthop（NEXTHOP_TYPE_BLACKHOLE）：设置 bh_type 与 vrf_id。
+ * bh_type 与 gate 共用同一段 union 内存。
+ */
 struct nexthop *nexthop_from_blackhole(enum blackhole_type bh_type,
 				       vrf_id_t nh_vrf_id)
 {
@@ -583,6 +682,10 @@ struct nexthop *nexthop_from_blackhole(enum blackhole_type bh_type,
 	return nexthop;
 }
 
+/* 给 nexthop 设置标签栈。num_labels 为 0 时直接返回；会先释放已有标签避免
+ * 泄漏；标签数超过 MPLS_MAX_LABELS 会被截断；同时记录标签类型 ltype。
+ * 分配的内存由 nexthop_del_labels / nexthop_free 负责回收。
+ */
 /* Update nexthop with label information. */
 void nexthop_add_labels(struct nexthop *nexthop, enum lsp_types_t ltype,
 			uint8_t num_labels, const mpls_label_t *labels)
@@ -614,6 +717,9 @@ void nexthop_add_labels(struct nexthop *nexthop, enum lsp_types_t ltype,
 	nexthop->nh_label = nh_label;
 }
 
+/* 释放 nexthop 的标签栈并把标签类型复位为 ZEBRA_LSP_NONE。可安全重复调用
+ * （XFREE 对 NULL 安全）。
+ */
 /* Free label information of nexthop, if present. */
 void nexthop_del_labels(struct nexthop *nexthop)
 {
@@ -621,6 +727,11 @@ void nexthop_del_labels(struct nexthop *nexthop)
 	nexthop->nh_label_type = ZEBRA_LSP_NONE;
 }
 
+/* 用 new_stack 替换 nexthop 的标签栈：标签数超限会截断；仅当新栈更长时才
+ * 重新分配并扩容（XREALLOC），否则复用原缓冲区。最后把标签逐个拷入。
+ * 若 nexthop 当前没有标签栈（nh_label 为 NULL）会直接解引用崩溃，属调用者
+ * 需保证的前提。
+ */
 void nexthop_change_labels(struct nexthop *nexthop, struct mpls_label_stack *new_stack)
 {
 	struct mpls_label_stack *nh_label_tmp;
@@ -647,6 +758,9 @@ void nexthop_change_labels(struct nexthop *nexthop, struct mpls_label_stack *new
 		nexthop->nh_label->label[i] = new_stack->label[i];
 }
 
+/* 设置 SRv6 seg6local 端点行为：action 为动作码（UNSPEC 时直接返回），
+ * ctx 为其上下文（整块拷贝）。必要时先分配 nh_srv6。
+ */
 void nexthop_add_srv6_seg6local(struct nexthop *nexthop, uint32_t action,
 				const struct seg6local_context *ctx)
 {
@@ -661,6 +775,10 @@ void nexthop_add_srv6_seg6local(struct nexthop *nexthop, uint32_t action,
 	nexthop->nh_srv6->seg6local_ctx = *ctx;
 }
 
+/* 清除 seg6local 行为：把 action 复位为 UNSPEC；若无 SID 列表或 SID 全零，
+ * 一并释放 seg6_segs；若 seg6_segs 已为空则释放整个 nh_srv6。无副作用时的
+ * 前提：nh_srv6 为空则直接返回。
+ */
 void nexthop_del_srv6_seg6local(struct nexthop *nexthop)
 {
 	if (!nexthop->nh_srv6)
@@ -680,6 +798,11 @@ void nexthop_del_srv6_seg6local(struct nexthop *nexthop)
 		XFREE(MTYPE_NH_SRV6, nexthop->nh_srv6);
 }
 
+/* 设置 SRv6 封装的 SID 列表：segs 为 SID 数组（为空直接返回），num_segs 个，
+ * 超过 SRV6_MAX_SIDS 会截断；记录 encap_behavior。必要时分配 nh_srv6 与
+ * seg6_segs。注意：已存在 seg6_segs 时复用其缓冲，可能容量不足——需靠调用
+ * 者保证一致的使用方式。
+ */
 void nexthop_add_srv6_seg6(struct nexthop *nexthop, const struct in6_addr *segs, int num_segs,
 			   enum srv6_headend_behavior encap_behavior)
 {
@@ -712,6 +835,10 @@ void nexthop_add_srv6_seg6(struct nexthop *nexthop, const struct in6_addr *segs,
 	nexthop->nh_srv6->seg6_segs->encap_behavior = encap_behavior;
 }
 
+/* 清除 SRv6 的 SID 列表信息：仅在“无 seg6local 行为但存在 SID 列表”时清零
+ * SID 并释放列表；随后释放 nh_srv6 本体。若存在 seg6local 行为，则只清列表、
+ * 保留 nh_srv6（由 del_srv6_seg6local 负责其余清理）。
+ */
 void nexthop_del_srv6_seg6(struct nexthop *nexthop)
 {
 	if (!nexthop->nh_srv6)
@@ -727,6 +854,11 @@ void nexthop_del_srv6_seg6(struct nexthop *nexthop)
 	XFREE(MTYPE_NH_SRV6, nexthop->nh_srv6);
 }
 
+/* 把 nexthop 格式化为可读字符串写入 str（容量 size），返回 str。
+ * 形式随类型不同：接口型 “if N (A/I)”、地址型 “addr if N (A/I)”、
+ * 黑洞型 “blackhole”。括号内 A 表示 ACTIVE，I 表示非活动。调用者需保证
+ * str 足够大（建议 NEXTHOP_STRLEN）。
+ */
 const char *nexthop2str(const struct nexthop *nexthop, char *str, int size)
 {
 	switch (nexthop->type) {
@@ -752,6 +884,11 @@ const char *nexthop2str(const struct nexthop *nexthop, char *str, int size)
 	return str;
 }
 
+/* ALL_NEXTHOPS 的步进函数：实现“先序遍历”式遍历，左子树为 resolved（递归
+ * 解析链），右子树为 next（同级链）。若当前跳带 RECURSIVE 标志，下一步进入
+ * resolved；否则沿 next 走；next 到头则沿 rparent 向上找第一个还有 next 的
+ * 祖先。返回下一个 nexthop，遍历结束返回 NULL。
+ */
 /*
  * Iteration step for ALL_NEXTHOPS macro:
  * This is the tricky part. Check if `nexthop' has
@@ -782,6 +919,9 @@ struct nexthop *nexthop_next(const struct nexthop *nexthop)
 	return NULL;
 }
 
+/* 遍历步进的封装：nexthop_resolution 为真时等价于 nexthop_next（会下钻递归
+ * 链），为假时只在当前 next 链上前进，不进入 resolved。
+ */
 struct nexthop *nexthop_next_resolution(const struct nexthop *nexthop,
 					bool nexthop_resolution)
 {
@@ -791,6 +931,9 @@ struct nexthop *nexthop_next_resolution(const struct nexthop *nexthop,
 	return nexthop->next;
 }
 
+/* 返回遍历树中下一个“已解析且 active”的 nexthop：从 nexthop_next 开始，
+ * 跳过仍是 RECURSIVE 或非 ACTIVE 的节点。找不到返回 NULL。
+ */
 /* Return the next nexthop in the tree that is resolved and active */
 struct nexthop *nexthop_next_active_resolved(const struct nexthop *nexthop)
 {
@@ -804,6 +947,7 @@ struct nexthop *nexthop_next_active_resolved(const struct nexthop *nexthop)
 	return next;
 }
 
+/* 计算 nexthop 的递归层级：沿 rparent 一路向上计数，顶层为 0。 */
 unsigned int nexthop_level(const struct nexthop *nexthop)
 {
 	unsigned int rv = 0;
@@ -815,6 +959,14 @@ unsigned int nexthop_level(const struct nexthop *nexthop)
 	return rv;
 }
 
+/* 计算 nexthop 的哈希值（种子常量 0x45afe398）。哈希内容依次为：
+ *   1) _hash_begin.._hash_end 连续块（type / vrf_id / ifindex / 地址等）；
+ *   2) flags 中参与哈希的位（NEXTHOP_FLAGS_HASHED，目前仅 ONLINK）；
+ *   3) 标签栈（标签个数不同自然导致哈希不同，故不单独哈希 num_labels）；
+ *   4) 备份索引（仅当 HAS_BACKUP）；
+ *   5) SRv6：seg6local 动作与上下文，或 SID 列表与 encap_behavior。
+ * 副作用：无。返回 32 位哈希。
+ */
 uint32_t nexthop_hash(const struct nexthop *nexthop)
 {
 	uint32_t key = 0x45afe398;
@@ -874,6 +1026,11 @@ uint32_t nexthop_hash(const struct nexthop *nexthop)
 	return key;
 }
 
+/* 把 nexthop 的非递归字段拷贝到已分配的 copy：vrf_id、ifindex、type、
+ * flags、weight、备份（含 assert 校验）、srte_color、gate / src / rmap_src /
+ * rmac、rparent，以及标签栈与 SRv6（通过 add 系列函数深拷贝）。
+ * 不拷贝 resolved / next 链。copy 需已由 nexthop_new 分配。
+ */
 void nexthop_copy_no_recurse(struct nexthop *copy,
 			     const struct nexthop *nexthop,
 			     struct nexthop *rparent)
@@ -915,6 +1072,9 @@ void nexthop_copy_no_recurse(struct nexthop *copy,
 	}
 }
 
+/* 完整拷贝（含递归）：先 copy_no_recurse，若带 RECURSIVE 标志则用
+ * copy_nexthops 递归复制 resolved 链（因为解析结果可能是一整个组）。
+ */
 void nexthop_copy(struct nexthop *copy, const struct nexthop *nexthop,
 		  struct nexthop *rparent)
 {
@@ -928,6 +1088,7 @@ void nexthop_copy(struct nexthop *copy, const struct nexthop *nexthop,
 		copy_nexthops(&copy->resolved, nexthop->resolved, copy);
 }
 
+/* 分配一个新 nexthop 并拷贝非递归字段，返回新对象。 */
 struct nexthop *nexthop_dup_no_recurse(const struct nexthop *nexthop,
 				       struct nexthop *rparent)
 {
@@ -937,6 +1098,7 @@ struct nexthop *nexthop_dup_no_recurse(const struct nexthop *nexthop,
 	return new;
 }
 
+/* 分配一个新 nexthop 并完整拷贝（含递归），返回新对象。 */
 struct nexthop *nexthop_dup(const struct nexthop *nexthop,
 			    struct nexthop *rparent)
 {
@@ -946,6 +1108,11 @@ struct nexthop *nexthop_dup(const struct nexthop *nexthop,
 	return new;
 }
 
+/* 解析逗号分隔的备份索引串进 backups 数组（容量 NEXTHOP_MAX_BACKUPS）。
+ * *num_backups 回填成功解析的个数。成功返回 0，解析失败返回负值。
+ * 错误情形：段非纯数字、空段、值大于 255、段数超过上限。内部会复制字符串
+ * （strsep 具破坏性），用完即释放。
+ */
 /*
  * Parse one or more backup index values, as comma-separated numbers,
  * into caller's array of uint8_ts. The array must be NEXTHOP_MAX_BACKUPS
@@ -1007,6 +1174,7 @@ int nexthop_str2backups(const char *str, int *num_backups,
 	return ret;
 }
 
+/* printfrr 的 %pNHs 扩展：把 nexthop 追加写入 fbuf，返回写入长度。 */
 ssize_t printfrr_nhs(struct fbuf *buf, const struct nexthop *nexthop)
 {
 	ssize_t ret = 0;
@@ -1037,6 +1205,10 @@ ssize_t printfrr_nhs(struct fbuf *buf, const struct nexthop *nexthop)
 	return ret;
 }
 
+/* printfrr 的 %pNH 家族扩展实现。printfrr_nh 是注册的回调，按 ea->fmt 的
+ * 后续字符选择打印风格：v（含 vv）、s、c 后接 g（网关）或 i（接口名）。
+ * 下方英文块列出各风格对应的输出示例。返回写入长度，未知格式返回 -1。
+ */
 /*
  * nexthop printing variants:
  *	%pNHvv
@@ -1058,6 +1230,7 @@ ssize_t printfrr_nhs(struct fbuf *buf, const struct nexthop *nexthop)
  *		eth0
  *		(0-length if no interface present)
  */
+/* 把 "NH" 扩展名与 printfrr_nh 回调绑定（构造期自动注册）。 */
 printfrr_ext_autoreg_p("NH", printfrr_nh);
 static ssize_t printfrr_nh(struct fbuf *buf, struct printfrr_eargs *ea,
 			   const void *ptr)
@@ -1179,11 +1352,18 @@ static ssize_t printfrr_nh(struct fbuf *buf, struct printfrr_eargs *ea,
 	return -1;
 }
 
+/* 判断是否为黑洞 nexthop：仅看 type 是否等于 NEXTHOP_TYPE_BLACKHOLE。 */
 bool nexthop_is_blackhole(const struct nexthop *nh)
 {
 	return nh->type == NEXTHOP_TYPE_BLACKHOLE;
 }
 
+/* 把一个 nexthop 渲染进已存在的 json 对象 json_nexthop 中，调用者负责该
+ * json 对象的分配与释放。输出内容随类型不同：地址 / 接口、flags、active /
+ * onLink / linkDown / recursive、备份索引、源 / rmap 源地址、标签（EVPN 时
+ * 转成 VNI）、weight、srteColor、seg6local 与 seg6 SID 等；display_vrfid
+ * 为真时附带 vrf 名，rn_family 用于 IPv4 前缀 + IPv6 下一跳的特例。
+ */
 /*
  * Render a nexthop into a json object; the caller allocates and owns
  * the json object memory.
@@ -1414,6 +1594,12 @@ void nexthop_json_helper(json_object *json_nexthop,
 	}
 }
 
+/* 把 nexthop 以 CLI 文本形式输出到 vty。先按类型打印“via / is directly
+ * connected / unreachable”，再依次追加 vrf、inactive / onlink / linkdown /
+ * recursive / dup 标志，随后是 rmap 源 / 源地址、SR-TE color、MPLS 标签、
+ * seg6local 与 seg6 SID、weight、备份索引。rn_family 用于 IPv4 前缀 + IPv6
+ * 下一跳的特例。无返回值，输出直接写 vty。
+ */
 /*
  * Helper for nexthop output
  */

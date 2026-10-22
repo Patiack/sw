@@ -8,6 +8,32 @@
  * This file is part of FRR
  */
 
+/*
+ * 文件导读：BGP 多路径（Multipath）选择与聚合属性
+ *
+ * 本模块负责 BGP 的等价多路径（ECMP）：在最佳路径选择完成后，决定哪些次优
+ * 路径与最佳路径“等价”从而可一起参与转发，并把这些多路径聚合成一条对外通告
+ * 的属性。它是“路径选择（bgp_route.c 的 bestpath）”的补充：bestpath 选出
+ * 一条最佳路径，本模块再挑出与之并列的多条路径。
+ *
+ * 关键数据结构：每个前缀（bgp_dest）的 mpath 字段是一个 struct
+ * bgp_path_info_mpath，惰性分配，记录多路径条数（mp_count）、聚合后的属性
+ * （mp_attr）、累计链路带宽（cum_bw）以及若干标志（mp_flags：是否有链路带宽
+ * BGP_MP_LB_PRESENT、是否所有路径都有带宽 BGP_MP_LB_ALL）。参与多路径的路径
+ * 会被打上 BGP_PATH_MULTIPATH 标志。
+ *
+ * 与相邻模块的配合：
+ *   - 由 bgp_route.c 在最佳路径变化后调用 bgp_path_info_mpath_update 同步标志，
+ *     再调用 bgp_path_info_mpath_aggregate_update 生成聚合属性；
+ *   - 链路带宽（link-bandwidth, lb）相关的加权 ECMP 依赖 bgp_nhc.c 的 NNHN 计数
+ *     与扩展团体里的带宽值；
+ *   - 对外通告时读取 bgp_path_info_mpath_attr / cumbw / chkwtd 提供聚合结果。
+ *
+ * 读的顺序：先看 maxpaths 配置的 set / unset，再看下一跳比较（判断“等价”的
+ * 核心），然后是 mpath 元素的分配 / 释放 / 取用与各种 get / set 访问器，
+ * 最后看庞大的 mpath_update 标志同步与 aggregate_update 属性聚合。
+ */
+
 #include <zebra.h>
 
 #include "command.h"
@@ -29,6 +55,11 @@
 #include "bgpd/bgp_mpath.h"
 #include "bgpd/bgp_nhc.h"
 
+/*
+ * 记录某实例在指定 AFI / SAFI 下的 maximum-paths 配置。ibgp 类型同时记录
+ * same_clusterlen（是否把 cluster list 长度纳入等价比较），ebgp 类型只记条数。
+ * 成功返回 0；bgp 为空或 afi / safi 越界、peertype 非法时返回 -1。
+ */
 /*
  * bgp_maximum_paths_set
  *
@@ -56,6 +87,10 @@ int bgp_maximum_paths_set(struct bgp *bgp, afi_t afi, safi_t safi, int peertype,
 }
 
 /*
+ * 移除某实例的 maximum-paths 配置（回到默认值 multipath_num，并清除 ibgp 的
+ * same_clusterlen）。成功返回 0；参数非法时返回 -1。
+ */
+/*
  * bgp_maximum_paths_unset
  *
  * Remove maximum-paths configuration from BGP instance
@@ -82,6 +117,11 @@ int bgp_maximum_paths_unset(struct bgp *bgp, afi_t afi, safi_t safi,
 }
 
 /*
+ * 判断两个接口是否为同一接口（比较 ifindex）。两者皆空视为相同（返回 1），
+ * 仅一个为空视为不同（返回 0）。用于 IPv6 全局加链路本地下一跳的场景下，
+ * 判断下一跳是否落在同一接口上。
+ */
+/*
  * bgp_interface_same
  *
  * Return true if ifindex for ifp1 and ifp2 are the same, else return false.
@@ -101,6 +141,14 @@ static int bgp_interface_same(struct interface *ifp1, struct interface *ifp2)
 }
 
 
+/*
+ * 比较两条路径的下一跳，是判断“多路径等价”的核心。返回小于 / 等于 / 大于 0，
+ * 分别表示 bpi1 的下一跳小于 / 等于 / 大于 bpi2。比较顺序：先比 IPv4 下一跳，
+ * 再按 mp_nexthop_len 类型分别比 IPv4 / IPv6 全局 / IPv6 全局加链路本地地址；
+ * 对全局加链路本地情形，若双方都未偏好全局地址还要先比接口是否相同。
+ * 最后若下一跳相同且不是黑洞下一跳，还要检查两者来源 VRF 是否相同（vrfleak）。
+ * 该函数在 bestpath 之后被调用，供多路径判定使用。
+ */
 /*
  * bgp_path_info_nexthop_cmp
  *
@@ -193,6 +241,10 @@ int bgp_path_info_nexthop_cmp(struct bgp_path_info *bpi1,
 }
 
 /*
+ * 分配并清零一个新的多路径元素（struct bgp_path_info_mpath），初始 mp_count
+ * 置 1，其余字段为 0。返回新对象，由调用方负责释放。
+ */
+/*
  * bgp_path_info_mpath_new
  *
  * Allocate and zero memory for a new bgp_path_info_mpath element
@@ -209,6 +261,10 @@ static struct bgp_path_info_mpath *bgp_path_info_mpath_new(void)
 }
 
 /*
+ * 释放多路径元素：若存在会先 unintern 其聚合属性（mp_attr），再释放结构体。
+ * 传入的是二级指针，便于调用方在释放后置空。mpath 或 *mpath 为空时安全返回。
+ */
+/*
  * bgp_path_info_mpath_free
  *
  * Release resources for a bgp_path_info_mpath element and zero out pointer
@@ -224,6 +280,10 @@ void bgp_path_info_mpath_free(struct bgp_path_info_mpath **mpath)
 	}
 }
 
+/*
+ * 取某前缀的多路径元素，若尚未分配则惰性新建（并把 mp_dest 回指 dest）。
+ * dest 为空返回 NULL。这是所有 mpath 写入路径的统一入口，保证用到才分配。
+ */
 /*
  * bgp_path_info_mpath_get
  *
@@ -246,6 +306,10 @@ static struct bgp_path_info_mpath *bgp_path_info_mpath_get(struct bgp_dest *dest
 }
 
 /*
+ * 从给定路径出发，沿 next 链向后找下一条带 BGP_PATH_MULTIPATH 标志的路径，
+ * 即“下一条多路径”。未找到返回 NULL。注意是从 path->next 开始找，不含自身。
+ */
+/*
  * bgp_path_info_mpath_next
  *
  * Given a bgp_path_info, return the next multipath entry
@@ -265,6 +329,10 @@ struct bgp_path_info *bgp_path_info_mpath_next(struct bgp_path_info *path)
 }
 
 /*
+ * 给定最佳路径，返回第一条多路径（即从其后起第一条带多路径标志的路径）。
+ * 直接复用 bgp_path_info_mpath_next。
+ */
+/*
  * bgp_path_info_mpath_first
  *
  * Given bestpath bgp_path_info, return the first multipath entry.
@@ -274,6 +342,10 @@ struct bgp_path_info *bgp_path_info_mpath_first(struct bgp_path_info *path)
 	return bgp_path_info_mpath_next(path);
 }
 
+/*
+ * 返回某前缀的多路径总数（含最佳路径自身）。dest 为空或尚无 mpath 元素时
+ * 返回 1，表示“只有一条路径”。
+ */
 /*
  * bgp_path_info_mpath_count
  *
@@ -287,6 +359,11 @@ uint32_t bgp_path_info_mpath_count(struct bgp_dest *dest)
 	return dest->mpath->mp_count;
 }
 
+/*
+ * 把多路径条数写入前缀的 mpath 元素。特殊情形：count 为 0 且该前缀本来就没有
+ * mpath 元素时直接返回（不为清零而分配）。否则取（必要时惰性新建）mpath 元素
+ * 并写 mp_count。注意 count 参数类型是 uint16_t，而 getter 返回 uint32_t。
+ */
 /*
  * bgp_path_info_mpath_count_set
  *
@@ -303,6 +380,14 @@ static void bgp_path_info_mpath_count_set(struct bgp_dest *dest, uint16_t count)
 	mpath->mp_count = count;
 }
 
+/*
+ * 更新与前缀 mpath 元素相关的链路带宽（link-bandwidth）累计信息。
+ * set 为真：按 cum_bw 是否非零置 / 清 BGP_MP_LB_PRESENT，按 all_paths_lb 置 /
+ * 清 BGP_MP_LB_ALL，并记录累计带宽 cum_bw。
+ * set 为假：清除全部标志与累计带宽（移除时务必清干净，避免残留标志误触发）。
+ * 当前缀没有 mpath 元素时，只有在 set 且确实有数据（cum_bw 非零或 all_paths_lb）
+ * 才惰性新建，否则直接返回，避免无谓分配。
+ */
 /*
  * bgp_path_info_mpath_lb_update
  *
@@ -346,6 +431,10 @@ static void bgp_path_info_mpath_lb_update(struct bgp_dest *dest, bool set, bool 
 }
 
 /*
+ * 返回用于对外通告该多路径路由的聚合属性（mp_attr）。dest 为空或没有 mpath
+ * 元素时返回 NULL。
+ */
+/*
  * bgp_path_info_mpath_attr
  *
  * Given bgp_dest, return aggregated attribute set used
@@ -358,6 +447,14 @@ struct attr *bgp_path_info_mpath_attr(struct bgp_dest *dest)
 	return dest->mpath->mp_attr;
 }
 
+/*
+ * 决定是否对某前缀做加权 ECMP，返回具体行为枚举。默认行为由实例是否开启
+ * 递归权重（BGP_FLAG_USE_RECURSIVE_WEIGHT）决定。若不是多路径则直接返回默认。
+ * 当链路带宽被配置为忽略（IGNORE_BW）且路径带 NHC 属性时，改用 NNHN 计数做
+ * 加权。否则根据 lb_handling 配置：非“跳过缺失 / 缺失用默认权重”时，只有
+ * 所有路径都有带宽（BGP_MP_LB_ALL）才用带宽加权；在该两种配置下则只要有带宽
+ * 存在（BGP_MP_LB_PRESENT）即可。
+ */
 /*
  * bgp_path_info_chkwtd
  *
@@ -403,6 +500,9 @@ enum bgp_wecmp_behavior bgp_path_info_mpath_chkwtd(struct bgp *bgp, struct bgp_d
 }
 
 /*
+ * 返回该前缀所有带带宽信息的多路径累计带宽。dest 为空或没有 mpath 元素时返回 0。
+ */
+/*
  * bgp_path_info_mpath_attr
  *
  * Given bgp_dest, return cumulative bandwidth
@@ -415,6 +515,11 @@ uint64_t bgp_path_info_mpath_cumbw(struct bgp_dest *dest)
 	return dest->mpath->cum_bw;
 }
 
+/*
+ * 把聚合属性写入前缀的 mpath 元素。特殊情形：attr 为空且该前缀本无 mpath 元素时
+ * 直接返回（不为置空而分配）。否则取（必要时惰性新建）mpath 元素并写 mp_attr。
+ * 注意本函数不管理 attr 的引用计数，交给调用方处理。
+ */
 /*
  * bgp_path_info_mpath_attr_set
  *
@@ -431,6 +536,17 @@ static void bgp_path_info_mpath_attr_set(struct bgp_dest *dest, struct attr *att
 	mpath->mp_attr = attr;
 }
 
+/*
+ * 多路径标志同步：把路径上的 BGP_PATH_MULTIPATH 标志与本次最佳路径选择的结果
+ * 对齐，并更新条数与链路带宽累计。是 bestpath 之后的核心步骤。
+ * 参数：dest 前缀、new_best 新最佳、old_best 旧最佳、num_candidates 候选数、
+ * mpath_cfg 该实例的最大路径配置。流程：先按 old_best 清理旧的 mpath 元素并
+ * 记下旧条数 / 旧累计带宽；再依据 new_best 的 peer 类型取 ibgp / ebgp 的上限；
+ * 然后沿路径链有序地扫描，用旧标志（MULTIPATH）与新标志（MULTIPATH_NEW）判断
+ * 一条路径是否被新选为多路径，达到 maxpaths 上限即清理余下标志并结束；据此
+ * 累计条数、带宽并判断 all_paths_lb；最后回写 mpath 元素，设置 MULTIPATH_CHG
+ * 与 LINK_BW_CHG 标志以驱动后续对邻居的更新。附带大量调试题日志。
+ */
 /*
  * bgp_path_info_mpath_update
  *
@@ -593,6 +709,18 @@ void bgp_path_info_mpath_update(struct bgp *bgp, struct bgp_dest *dest,
 	}
 }
 
+/*
+ * 生成 / 更新多路径的聚合属性，并在其变化时给最佳路径打上 BGP_PATH_ATTR_CHANGED，
+ * 以驱动对邻居的更新。判定“是否变化”的办法是：生成当前聚合属性、intern（去重
+ * 引用）后与已有聚合属性指针比较。若多路径选择与各路径属性都没有变化，可直接跳过
+ * 生成比较这一步。
+ * 逻辑：先处理旧最佳（若换了最佳则 unintern 其旧聚合属性）；new_best 为空则返回；
+ * 条数为 1 时清除聚合属性并标记变化后返回。随后在开启 MULTIPATH_RELAX_AS_SET 时，
+ * 从最佳路径起逐条合并多路径成员的 AS_PATH（聚合）、origin（取较大者）、标准 /
+ * 扩展 / 大团体（合并去重排序），并把下一跳清为 0（表示改由本机作为下一跳）。
+ * 最后 intern 新属性，与旧指针不同则替换并标记 ATTR_CHANGED，否则释放新引用。
+ * 注意：属性各字段的 dup / merge / unintern 引用计数必须成对，避免泄漏或悬垂。
+ */
 /*
  * bgp_path_info_mpath_aggregate_update
  *

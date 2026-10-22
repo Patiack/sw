@@ -9,6 +9,34 @@
  * Copyright (C) 2013 by Internet Systems Consortium, Inc. ("ISC")
  */
 
+/*
+ * 【文件导读】command.c —— FRR 命令行后端（CLI backend）主实现
+ *
+ * 本文件是命令树的“大脑”，把 command.h 里声明的一整套接口落地：
+ *
+ * 1) 全局状态：cmdvec（所有节点组成的大向量）、host（主机信息）、tokennames
+ *    （token 类型名，供日志与 DOT 打印）、defer_cli_tree（是否延迟构建命令图）。
+ *
+ * 2) 命令安装/卸载：install_node 建节点与空图；_install_element / uninstall_element
+ *    把 cmd_element 编译成 token 图后合并进（或移出）节点图，并做重复安装检查。
+ *    defer_cli_tree 为真时（vtysh）延迟到 cmd_finalize_node 才真正建图。
+ *
+ * 3) 输入解析与执行：cmd_make_strvec 切词 -> cmd_execute_command 在节点图上
+ *    匹配（command_match）-> 命中后调用回调；cmd_execute 是更上层的封装；
+ *    配置文件读取走 command_config_read_one_line / config_from_file。
+ *
+ * 4) 补全：cmd_complete_command / cmd_describe_command 结合 command_complete
+ *    产出候选，并用 completions_to_vec 去重排序。
+ *
+ * 5) 节点切换、help 输出（“?”）、show running-config 组装、命令行历史与口令等
+ *    杂项也都在这里。
+ *
+ * 易踩的坑：
+ *   - cmdvec 必须先 cmd_init 再 install_element，否则直接报错退出；
+ *   - 装到 VIEW_NODE 的命令会被自动复制安装到 ENABLE_NODE；
+ *   - 命令图是按节点懒构建的（见 graph_built / defer_cli_tree）。
+ */
+
 #include <zebra.h>
 #include <sys/utsname.h>
 #include <sys/stat.h>
@@ -58,11 +86,19 @@
 DEFINE_MTYPE_STATIC(LIB, HOST, "Host config");
 DEFINE_MTYPE(LIB, COMPLETION, "Completion item");
 
+/*
+ * item(x) —— 构造 {值, 名字} 表项：把枚举常量同时作为数值和它的名字字符串，
+ * 用于 tokennames 这类“类型 -> 名字”表，省去手写字符串。
+ */
 #define item(x)                                                                \
 	{                                                                      \
 		x, #x                                                          \
 	}
 
+/*
+ * tokennames —— token 类型到名字的映射表，供日志与 DOT 图打印时显示 token 类型。
+ * 顺序必须与 enum cmd_token_type 保持一致（最后以 {0} 结尾）。
+ */
 /* clang-format off */
 const struct message tokennames[] = {
 	item(WORD_TKN),
@@ -84,6 +120,11 @@ const struct message tokennames[] = {
 };
 /* clang-format on */
 
+/*
+ * cmdvec —— 全局命令节点向量，下标为 enum node_type；每个守护进程各自维护一份。
+ * host —— 本机信息（主机名、口令、banner 等），由命令模块统一持有。
+ * defer_cli_tree —— vtysh 专用：为真时只在切入节点时才组装该节点的命令树。
+ */
 /* Command vector which includes some level of command lists. Normally
    each daemon maintains each own cmdvec. */
 vector cmdvec = NULL;
@@ -98,6 +139,9 @@ static bool defer_cli_tree;
  * Returns host.name if any, otherwise
  * it returns the system hostname.
  */
+/*
+ * cmd_hostname_get —— 返回本机主机名（host.name），未设置时为 NULL。返回值不可释放。
+ */
 const char *cmd_hostname_get(void)
 {
 	return host.name;
@@ -106,38 +150,65 @@ const char *cmd_hostname_get(void)
 /*
  * Returns unix domainname
  */
+/*
+ * cmd_domainname_get —— 返回本机域名（host.domainname），未设置时为 NULL。
+ */
 const char *cmd_domainname_get(void)
 {
 	return host.domainname;
 }
 
+/*
+ * cmd_system_get —— 返回 host 中记录的系统标识串，未设置时为 NULL。
+ */
 const char *cmd_system_get(void)
 {
 	return host.system;
 }
 
+/*
+ * cmd_release_get —— 返回 host 中记录的发行版标识串，未设置时为 NULL。
+ */
 const char *cmd_release_get(void)
 {
 	return host.release;
 }
 
+/*
+ * cmd_version_get —— 返回 host 中记录的版本串，未设置时为 NULL。
+ */
 const char *cmd_version_get(void)
 {
 	return host.version;
 }
 
+/*
+ * cmd_allow_reserved_ranges_get —— 是否允许使用 IPv4 保留地址段（如 Class E 实验段）。
+ */
 bool cmd_allow_reserved_ranges_get(void)
 {
 	return host.allow_reserved_ranges;
 }
 
+/*
+ * cmd_software_version_get —— 返回编译进二进制的软件全名与版本串
+ * （由 FRR_FULL_NAME / FRR_VERSION 拼成），与运行期设置的 host.version 无关。
+ */
 const char *cmd_software_version_get(void)
 {
 	return FRR_FULL_NAME "/" FRR_VERSION;
 }
 
+/*
+ * root_on_exit —— 从 view / enable 节点退出时的回调；此处仅前置声明，定义见文件后部。
+ */
 static int root_on_exit(struct vty *vty);
 
+/*
+ * FRR 内置的基础节点定义：auth / view / auth-enable / enable / config。
+ * 每个 cmd_node 绑定提示符、父节点与进出回调；例如 config 节点用 config_write_host
+ * 回写主机级配置、用 vty_config_node_exit 处理退出。
+ */
 /* Standard command node structures. */
 static struct cmd_node auth_node = {
 	.name = "auth",
@@ -175,6 +246,10 @@ static struct cmd_node config_node = {
 	.node_exit = vty_config_node_exit,
 };
 
+/*
+ * print_version —— 命令行 -v / --version 时打印程序名、版本与版权。
+ * 若编译时启用了 ENABLE_VERSION_BUILD_CONFIG，还会附带 configure 参数。
+ */
 /* This is called from main when a daemon is invoked with -v or --version. */
 void print_version(const char *progname)
 {
@@ -185,6 +260,10 @@ void print_version(const char *progname)
 #endif
 }
 
+/*
+ * argv_concat —— 把 argv 中从 shift 到 argc-1 的每个 token 的 arg 用空格拼成一个
+ * 新字符串（MTYPE_TMP 分配，调用方负责释放）。shift >= argc（即无内容）时返回 NULL。
+ */
 char *argv_concat(struct cmd_token **argv, int argc, int shift)
 {
 	int cnt = MAX(argc - shift, 0);
@@ -199,6 +278,11 @@ char *argv_concat(struct cmd_token **argv, int argc, int shift)
 	return frrstr_join(argstr, cnt, " ");
 }
 
+/*
+ * cmd_make_strvec —— 把一行配置 / 命令字符串切成 token 向量。
+ * 先跳过前导空白；整行是空、或是注释（以 ! 或 # 开头）时返回 NULL；
+ * 否则按空白切分，剔除切出的空串并压实。返回值需用 cmd_free_strvec 释放。
+ */
 vector cmd_make_strvec(const char *string)
 {
 	if (!string)
@@ -228,6 +312,9 @@ vector cmd_make_strvec(const char *string)
 	return result;
 }
 
+/*
+ * cmd_free_strvec —— 释放 cmd_make_strvec 产生的 token 向量。
+ */
 void cmd_free_strvec(vector v)
 {
 	frrstr_strvec_free(v);
@@ -243,6 +330,10 @@ void cmd_free_strvec(vector v)
  *        index of the found token if it exists
  * @return 1 if found, 0 otherwise
  */
+/*
+ * argv_find —— 在 argv 中从 *index 开始查找 text 描述的那个 token。
+ * 找到则把其下标写回 *index 并返回 1，未找到返回 0。用于在回调里定位具名参数。
+ */
 int argv_find(struct cmd_token **argv, int argc, const char *text, int *index)
 {
 	int found = 0;
@@ -252,6 +343,10 @@ int argv_find(struct cmd_token **argv, int argc, const char *text, int *index)
 	return found;
 }
 
+/*
+ * cmd_hash_key / cmd_hash_cmp —— 命令去重哈希的键函数与比较函数。
+ * 键是 cmd_element 指针地址的哈希，比较即指针相等，因此该哈希表按指针判别重复安装。
+ */
 static unsigned int cmd_hash_key(const void *p)
 {
 	int size = sizeof(p);
@@ -264,6 +359,12 @@ static bool cmd_hash_cmp(const void *a, const void *b)
 	return a == b;
 }
 
+/*
+ * install_node —— 安装一个命令节点（配置模式）。
+ * 把 node 放进 cmdvec 的对应下标，创建空命令图（先放一个 START_TKN 起点）、
+ * 命令向量与去重哈希表。必须在任何 install_element 之前调用。
+ * 注意 CMD_HASH_STR_SIZE 仅用于拼哈希表名，长度固定 256。
+ */
 /* Install top node of command vector. */
 void install_node(struct cmd_node *node)
 {
@@ -283,6 +384,9 @@ void install_node(struct cmd_node *node)
 		hash_create_size(16, cmd_hash_key, cmd_hash_cmp, hash_name);
 }
 
+/*
+ * cmd_prompt —— 返回指定节点的提示符字符串。节点未安装时行为未定义（会解引用空指针）。
+ */
 /* Return prompt character of specified node. */
 const char *cmd_prompt(enum node_type node)
 {
@@ -292,11 +396,21 @@ const char *cmd_prompt(enum node_type node)
 	return cnode->prompt;
 }
 
+/*
+ * cmd_defer_tree —— 设置是否延迟构建命令树（vtysh 用它把建图推迟到切入节点时）。
+ */
 void cmd_defer_tree(bool val)
 {
 	defer_cli_tree = val;
 }
 
+/*
+ * _install_element —— 把一条命令真正安装进节点（install_element 宏的落脚点）。
+ * 步骤：确认 cmdvec 已初始化、节点存在、命令未重复安装；记入去重哈希；
+ *   非延迟模式下立即把命令解析成图并合并进节点图；加入节点的命令向量；
+ *   若安装到 VIEW_NODE，则把同一命令再往 ENABLE_NODE 装一份。
+ * 注意：重复安装只告警并返回；节点不存在则直接 exit。
+ */
 /* Install a command into a node. */
 void _install_element(enum node_type ntype, const struct cmd_element *cmd)
 {
@@ -352,6 +466,9 @@ void _install_element(enum node_type ntype, const struct cmd_element *cmd)
 		_install_element(ENABLE_NODE, cmd);
 }
 
+/*
+ * cmd_finalize_iter —— 延迟构建模式下，为单条命令解析成图并并入节点图（哈希遍历回调）。
+ */
 static void cmd_finalize_iter(struct hash_bucket *hb, void *arg)
 {
 	struct cmd_node *cnode = arg;
@@ -367,6 +484,10 @@ static void cmd_finalize_iter(struct hash_bucket *hb, void *arg)
 	graph_delete_graph(graph);
 }
 
+/*
+ * cmd_finalize_node —— 延迟构建的收尾：把该节点尚未建图的命令全部补建，并置 graph_built。
+ * 若已经建过图则直接返回。
+ */
 void cmd_finalize_node(struct cmd_node *cnode)
 {
 	if (cnode->graph_built)
@@ -376,6 +497,12 @@ void cmd_finalize_node(struct cmd_node *cnode)
 	cnode->graph_built = true;
 }
 
+/*
+ * uninstall_element —— 从节点移除一条命令（与 _install_element 对称）。
+ * 校验节点与存在性后，从去重哈希与命令向量中删除；若图已构建，则把该命令从
+ * 节点图中反向合并移除（cmd_graph_merge direction = -1）。
+ * 同样地，从 VIEW_NODE 卸载时 ENABLE_NODE 上的副本也一并卸载。
+ */
 void uninstall_element(enum node_type ntype, const struct cmd_element *cmd)
 {
 	struct cmd_node *cnode;
@@ -427,6 +554,11 @@ void uninstall_element(enum node_type ntype, const struct cmd_element *cmd)
 }
 
 
+/*
+ * itoa64 / to64 —— crypt 口令加盐（salt）用的 base64 变体编码工具。
+ * zencrypt —— 生成随机 salt 并调用 crypt 加密口令，返回加密后的字符串。
+ * 注意：早期与 crypt 强绑定；无 libcrypt 时用 OpenSSL 的 DES_crypt 顶替。
+ */
 static const unsigned char itoa64[] =
 	"./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
@@ -438,6 +570,10 @@ static void to64(char *s, long v, int n)
 	}
 }
 
+/*
+ * zencrypt —— 生成随机 salt 并调用 crypt 加密给定口令，返回加密串（静态缓冲区，
+ * 由 crypt 内部持有）。salt 由 frr_weak_random 与当前微秒共同生成。
+ */
 static char *zencrypt(const char *passwd)
 {
 	char salt[6];
@@ -452,8 +588,17 @@ static char *zencrypt(const char *passwd)
 	return crypt(passwd, salt);
 }
 
+/*
+ * full_cli —— 是否输出完整配置（决定 config_write_host 是否写出 service /
+ * password / banner 等主机级段落）。
+ */
 static bool full_cli;
 
+/*
+ * config_write_host —— CONFIG 节点的写配置回调，把主机名、域名、口令、banner、
+ * cputime / walltime 告警等主机级配置逐行 vty_out 出来。恒返回 1。
+ * 注意：口令等敏感项只在 full_cli 为真时输出，避免干扰 watchfrr 等场景。
+ */
 /* This function write configuration of this host. */
 static int config_write_host(struct vty *vty)
 {
@@ -533,6 +678,9 @@ static int config_write_host(struct vty *vty)
 	return 1;
 }
 
+/*
+ * cmd_node_graph —— 取指定节点的命令图；取之前先 cmd_finalize_node 确保图已建好。
+ */
 /* Utility function for getting command graph. */
 static struct graph *cmd_node_graph(vector v, enum node_type ntype)
 {
@@ -542,6 +690,10 @@ static struct graph *cmd_node_graph(vector v, enum node_type ntype)
 	return cnode->cmdgraph;
 }
 
+/*
+ * cmd_try_do_shortcut —— 判断首词是否为 “do”，且当前节点允许 do 前缀
+ * （auth / view / auth-enable 之外的节点都可）。用于支持 “do show ...” 这类特权命令。
+ */
 static int cmd_try_do_shortcut(enum node_type node, char *first_word)
 {
 	if (first_word != NULL && node != AUTH_NODE && node != VIEW_NODE
@@ -550,6 +702,9 @@ static int cmd_try_do_shortcut(enum node_type node, char *first_word)
 	return 0;
 }
 
+/*
+ * compare_completions —— qsort 的比较函数，按 token 文本的字典序排序候选补全。
+ */
 /**
  * Compare function for cmd_token.
  * Used with qsort to sort command completions.
@@ -561,6 +716,11 @@ static int compare_completions(const void *fst, const void *snd)
 	return strcmp(first->text, secnd->text);
 }
 
+/*
+ * completions_to_vec —— 把 command_complete 返回的候选链表处理成向量：
+ * 去重（默认只比文本；开启 VTYSH_DEBUG 时还比描述）、按文本排序，
+ * 并把 END_TKN（即 <cr>）挪到首位。返回新向量，调用方负责释放。
+ */
 /**
  * Takes a list of completions returned by command_complete,
  * dedeuplicates them based on both text and description,
@@ -619,6 +779,12 @@ vector completions_to_vec(struct list *completions)
  * @param status pointer to matcher status code
  * @return vector of struct cmd_token * with possible completions
  */
+/*
+ * cmd_complete_command_real —— 针对当前 vty 节点执行补全。
+ * 取节点命令图并调用 command_complete；MATCHER_ERROR 时置 status 为
+ * CMD_ERR_NO_MATCH 并返回 NULL；否则把候选整理成向量返回。
+ * （对外的包装是文件后部的 cmd_complete_command。）
+ */
 static vector cmd_complete_command_real(vector vline, struct vty *vty,
 					int *status)
 {
@@ -650,6 +816,11 @@ static vector cmd_complete_command_real(vector vline, struct vty *vty,
 	return comps;
 }
 
+/*
+ * cmd_describe_command —— 输出 “?” 帮助 / 补全描述。
+ * 若首词是 do 且当前节点允许，则临时切到 ENABLE_NODE、去掉 “do” 后再补全，
+ * 完成后恢复原节点与 xpath 下标；否则直接在当前节点补全。
+ */
 vector cmd_describe_command(vector vline, struct vty *vty, int *status)
 {
 	vector ret;
@@ -685,8 +856,12 @@ vector cmd_describe_command(vector vline, struct vty *vty, int *status)
 	return cmd_complete_command_real(vline, vty, status);
 }
 
+/* varhandlers —— 已注册的变量补全处理器链表（每个元素为 cmd_variable_handler）。 */
 static struct list *varhandlers = NULL;
 
+/*
+ * __add_key_comp —— YANG 数据遍历回调：把取到的一个键值加入补全候选集合。
+ */
 static int __add_key_comp(const struct lyd_node *dnode, void *arg)
 {
 	const char *key_value = yang_dnode_get_string(dnode, NULL);
@@ -696,12 +871,22 @@ static int __add_key_comp(const struct lyd_node *dnode, void *arg)
 	return YANG_ITER_CONTINUE;
 }
 
+/*
+ * __get_list_keys —— 按 xpath 遍历共享候选配置里的 YANG 数据，收集所有键值到 comps。
+ */
 static void __get_list_keys(vector comps, const char *xpath)
 {
 	yang_dnode_iterate(__add_key_comp, comps,
 			   vty_shared_candidate_config->dnode, "%s", xpath);
 }
 
+/*
+ * cmd_variable_complete —— 为某个变量型 token 生成补全候选。
+ * 遍历已注册的变量处理器，按 tokenname / varname 命中对应处理器后，可选择地按
+ * xpath 从 YANG 取键值、或调用其 completions 回调来填充 comps。
+ * 若传入了 arg（用户已输入的前缀），仅保留以此为前缀的候选，其余释放。
+ * 注意：未传 arg 时 tmpcomps 直接复用 comps，全量候选原样返回。
+ */
 void cmd_variable_complete(struct cmd_token *token, const char *arg,
 			   vector comps)
 {
@@ -739,8 +924,14 @@ void cmd_variable_complete(struct cmd_token *token, const char *arg,
 	vector_free(tmpcomps);
 }
 
+/* AUTOCOMP_INDENT —— 补全列表输出的缩进列数（用于把候选排成多列显示）。 */
 #define AUTOCOMP_INDENT 5
 
+/*
+ * cmd_variable_comp2str —— 把候选集按总列宽 cols 排版成一个可打印字符串。
+ * 逐项追加，超过当前列宽即换行并重新缩进；返回用 MTYPE_TMP 分配的缓冲，
+ * 过程中会释放每个候选字符串并把向量槽位置空。
+ */
 char *cmd_variable_comp2str(vector comps, unsigned short cols)
 {
 	size_t bsz = 16;
@@ -775,6 +966,11 @@ char *cmd_variable_comp2str(vector comps, unsigned short cols)
 	return buf;
 }
 
+/*
+ * cmd_variable_handler_register —— 注册一批变量补全处理器。
+ * 传入的是一个以空项（completions 与 xpath 均为空）结尾的处理器数组，
+ * 逐个加入 varhandlers 链表。varhandlers 尚未初始化（NULL）时直接返回。
+ */
 void cmd_variable_handler_register(const struct cmd_variable_handler *cvh)
 {
 	if (!varhandlers)
@@ -784,6 +980,11 @@ void cmd_variable_handler_register(const struct cmd_variable_handler *cvh)
 		listnode_add(varhandlers, (void *)cvh);
 }
 
+/*
+ * autocomplete（DEFUN_HIDDEN）—— vtysh 内部命令 “autocomplete TYPE TEXT VARNAME”。
+ * 依据传入的 token 类型 / 文本 / 变量名构造临时 token，调用变量补全处理器生成
+ * 候选并逐行输出，供 vtysh 端补全使用。对用户隐藏。
+ */
 DEFUN_HIDDEN (autocomplete,
               autocomplete_cmd,
               "autocomplete TYPE TEXT VARNAME",
@@ -827,6 +1028,13 @@ DEFUN_HIDDEN (autocomplete,
  * @return set of valid strings for use with Readline as tab-completions.
  */
 
+/*
+ * cmd_complete_command —— 面向 readline / vtysh 的补全入口。
+ * 处理 “do” 前缀（切到 ENABLE_NODE 并偏移一行），对图上补全结果做过滤：
+ * WORD_TKN 直接取文本，可变化 token 交给 cmd_variable_complete。
+ * 最后把候选文本复制成以 NULL 结尾的字符串数组返回（readline 需要该哨兵），
+ * 并依据候选数量设置 status（无匹配 / 唯一完全匹配 / 多候选择列表）。
+ */
 char **cmd_complete_command(vector vline, struct vty *vty, int *status)
 {
 	char **ret = NULL;
@@ -909,6 +1117,10 @@ char **cmd_complete_command(vector vline, struct vty *vty, int *status)
 
 /* return parent node */
 /* MUST eventually converge on CONFIG_NODE */
+/*
+ * node_parent —— 返回某节点的父节点类型（用于 exit 时回退）。
+ * 断言 node 必须深于 CONFIG_NODE。原英文注释：最终必须收敛到 CONFIG_NODE。
+ */
 enum node_type node_parent(enum node_type node)
 {
 	struct cmd_node *cnode;
@@ -921,6 +1133,13 @@ enum node_type node_parent(enum node_type node)
 }
 
 /* Execute command by argument vline vector. */
+/*
+ * cmd_execute_command_real —— 真正执行一行命令（cmd_execute_command 的内核）。
+ * up_level 用于兼容旧式分段配置：先按层数向上回退节点（同时相应调整 xpath_index，
+ *   除非经过 no_xpath 的节点），再在目标节点的命令图上做 command_match。
+ * 匹配成功则调用命中命令的回调，失败时按 MATCHER 结果映射成 CMD_ERR_*。
+ * 注意：*cmd 指向静态实例；argv_list 需视情形释放。
+ */
 static int cmd_execute_command_real(vector vline, struct vty *vty,
 				    const struct cmd_element **cmd,
 				    unsigned int up_level)
@@ -1033,6 +1252,12 @@ static int cmd_execute_command_real(vector vline, struct vty *vty,
  * @return The status of the command that has been executed or an error code
  *         as to why no command could be executed.
  */
+/*
+ * cmd_execute_command —— 执行一行命令的外层封装（内核是 cmd_execute_command_real）。
+ * 功能：支持 “do” 前缀（临时切到 ENABLE_NODE 执行）；若在当前节点执行不了，则逐级
+ *   向上回退到父节点重试（vtysh 模式下不做父节点回退）。
+ * 返回：成功则返回回调结果，失败返回错误码；原节点与 xpath 下标在执行后恢复。
+ */
 int cmd_execute_command(vector vline, struct vty *vty,
 			const struct cmd_element **cmd, int vtysh)
 {
@@ -1114,6 +1339,10 @@ int cmd_execute_command(vector vline, struct vty *vty,
  * @return The status of the command that has been executed or an error code
  *         as to why no command could be executed.
  */
+/*
+ * cmd_execute_command_strict —— 严格模式执行：仅在当前节点匹配，不回退父节点。
+ * 读配置文件时使用。直接转调 cmd_execute_command_real。
+ */
 int cmd_execute_command_strict(vector vline, struct vty *vty,
 			       const struct cmd_element **cmd)
 {
@@ -1141,6 +1370,13 @@ int cmd_execute_command_strict(vector vline, struct vty *vty,
  * cmd_out
  *    The result of any processing.
  */
+/*
+ * cmd_execute / cmd_execute_done 钩子 —— 命令处理系统内部的预处理与善后钩子。
+ * cmd_execute（在解析前触发）：订阅者可改写原始命令串（须用 MTYPE_TMP 新分配并回填
+ *   cmd_out，由调用方释放），用于实现管道动作等；各订阅者的改写必须互斥。
+ * cmd_execute_done（在命令执行后触发）：用于清理（如关闭过滤）。
+ * KOOH 是“后置、逆序调用”的钩子变体。
+ */
 DECLARE_HOOK(cmd_execute,
 	     (struct vty *vty, const char *cmd_in, char **cmd_out),
 	     (vty, cmd_in, cmd_out));
@@ -1155,6 +1391,11 @@ DEFINE_KOOH(cmd_execute_done, (struct vty *vty, const char *cmd_exec),
 
 /*
  * cmd_execute hook subscriber to handle `|` actions.
+ */
+/*
+ * handle_pipe_action —— cmd_execute 钩子的订阅者，处理 “|” 管道动作。
+ * 目前仅支持 “| include <regexp>”：设置 vty 的包含过滤正则，并把命令串里 “|” 之后
+ * 的部分截掉（只保留真正的命令）。识别失败返回非 0，由上层转成 CMD_WARNING。
  */
 static int handle_pipe_action(struct vty *vty, const char *cmd_in,
 			      char **cmd_out)
@@ -1206,6 +1447,9 @@ fail:
 	return ret;
 }
 
+/*
+ * handle_pipe_action_done —— 命令执行后的善后：若 vty 上有过滤则清除包含过滤。
+ */
 static int handle_pipe_action_done(struct vty *vty, const char *cmd_exec)
 {
 	if (vty->filter)
@@ -1214,6 +1458,12 @@ static int handle_pipe_action_done(struct vty *vty, const char *cmd_exec)
 	return 0;
 }
 
+/*
+ * cmd_execute —— 执行一条命令字符串的最高层入口。
+ * 先经 cmd_execute 钩子预处理（可能改写命令串），切词后走 cmd_execute_command，
+ * 最后无论成败都调用 cmd_execute_done 钩子做善后，并释放改写串。
+ * 空行 / 纯注释（切词返回 NULL）视为 CMD_SUCCESS。
+ */
 int cmd_execute(struct vty *vty, const char *cmd,
 		const struct cmd_element **matched, int vtysh)
 {
@@ -1261,6 +1511,13 @@ free:
  *                   or not.
  * @return The status of the command that has been executed or an error code
  *         as to why no command could be executed.
+ */
+/*
+ * command_config_read_one_line —— 解析并执行配置文件中的“一行”命令。
+ * 对 vty->buf 切词（空行 / 注释返回 CMD_SUCCESS），先严格匹配当前节点；失败则在
+ * 循环里逐级 up_level 向上回退父节点重试，直到成功或落到可接受的结果集合。
+ * use_daemon 决定是否把 CMD_SUCCESS_DAEMON 也当作成功。
+ * 失败（非 SUCCESS / WARNING / DAEMON）时把该行与行号等信息记入 vty->error 链表。
  */
 int command_config_read_one_line(struct vty *vty,
 				 const struct cmd_element **cmd,
@@ -1313,6 +1570,12 @@ int command_config_read_one_line(struct vty *vty,
 	return ret;
 }
 
+/*
+ * config_from_file —— 逐行读取配置文件并回放。
+ * 用 fgets 读入 vty->buf，逐行调用 command_config_read_one_line；只要出现过一次非
+ * SUCCESS / WARNING / NOTHING_TODO 的结果就记录 error_ret，最终返回它（否则 SUCCESS）。
+ * line_num 出参累计行号，便于报错定位。
+ */
 /* Configuration make from file. */
 int config_from_file(struct vty *vty, FILE *fp, unsigned int *line_num)
 {
@@ -1344,6 +1607,10 @@ int config_from_file(struct vty *vty, FILE *fp, unsigned int *line_num)
 	return CMD_SUCCESS;
 }
 
+/*
+ * config_terminal（DEFUN）——“configure [terminal [file-lock]]”，从 vty 进入配置模式。
+ * 转调 vty_config_enter，末尾可选参数 file-lock 决定是否对数据存储加锁。
+ */
 /* Configuration from terminal */
 DEFUN (config_terminal,
        config_terminal_cmd,
@@ -1355,6 +1622,11 @@ DEFUN (config_terminal,
 	return vty_config_enter(vty, false, false, argc == 3);
 }
 
+/*
+ * enable（DEFUN）——“enable”，进入特权模式。
+ * 未设置 enable 口令（或来自 shell 服务）时直接进 ENABLE_NODE，否则先进
+ * AUTH_ENABLE_NODE 要求输入口令。
+ */
 /* Enable command */
 DEFUN (enable,
        config_enable_cmd,
@@ -1371,6 +1643,9 @@ DEFUN (enable,
 	return CMD_SUCCESS;
 }
 
+/*
+ * disable（DEFUN）——“disable”，从特权模式退回 VIEW_NODE。
+ */
 /* Disable command */
 DEFUN (disable,
        config_disable_cmd,
@@ -1382,6 +1657,9 @@ DEFUN (disable,
 	return CMD_SUCCESS;
 }
 
+/*
+ * config_exit（DEFUN_YANG）——“exit”，退出当前模式、回到上一级（调用 cmd_exit）。
+ */
 /* Down vty node level. */
 DEFUN_YANG (config_exit,
        config_exit_cmd,
@@ -1392,6 +1670,11 @@ DEFUN_YANG (config_exit,
 	return CMD_SUCCESS;
 }
 
+/*
+ * root_on_exit —— view / enable 节点的退出回调（此处为定义，前置声明见文件前部）。
+ * 若是 shell 会话则直接 exit(0)，否则把 vty 状态设为 VTY_CLOSE 请求关闭连接。
+ * 返回 0 表示抑制常规的退栈处理（本回调自己决定了去向）。
+ */
 static int root_on_exit(struct vty *vty)
 {
 	if (vty_shell(vty))
@@ -1401,6 +1684,11 @@ static int root_on_exit(struct vty *vty)
 	return 0;
 }
 
+/*
+ * cmd_exit —— 通用的“退出一级”实现。
+ * 先调用当前节点的 node_exit 回调，若它返回 0 则中止退栈；否则把 vty 节点切到
+ * parent_node，并在 xpath_index > 0 且节点未设 no_xpath 时把 xpath_index 减一。
+ */
 void cmd_exit(struct vty *vty)
 {
 	struct cmd_node *cnode = vector_lookup(cmdvec, vty->node);
@@ -1415,6 +1703,9 @@ void cmd_exit(struct vty *vty)
 		vty->xpath_index--;
 }
 
+/*
+ * config_quit（DEFUN）——“quit”，等价于 exit，直接转调 config_exit 的回调。
+ */
 /* ALIAS_FIXME */
 DEFUN (config_quit,
        config_quit_cmd,
@@ -1425,6 +1716,9 @@ DEFUN (config_quit,
 }
 
 
+/*
+ * config_end（DEFUN）——“end”，结束配置模式：若处于 config 状态则退出配置并回到特权模式。
+ */
 /* End of configuration. */
 DEFUN (config_end,
        config_end_cmd,
@@ -1438,6 +1732,10 @@ DEFUN (config_end,
 	return CMD_SUCCESS;
 }
 
+/*
+ * show_version（DEFUN）——“show version [json]”，显示版本信息。
+ * 带 json 时输出结构化字段（主机名 / 版本 / 版权 / git 信息等），否则输出人类可读的一行。
+ */
 /* Show version. */
 DEFUN (show_version,
        show_version_cmd,
@@ -1482,6 +1780,9 @@ DEFUN (show_version,
 	return CMD_SUCCESS;
 }
 
+/*
+ * config_help（DEFUN）——“help”，打印交互式帮助系统的说明文字。
+ */
 /* Help display function for all node. */
 DEFUN (config_help,
        config_help_cmd,
@@ -1504,6 +1805,12 @@ argument.\n\
 	return CMD_SUCCESS;
 }
 
+/*
+ * permute —— 深度优先枚举某节点命令的所有排列组合并打印（“list permutations”用）。
+ * 沿命令图递归下钻，收集路径上的可变化 token 文本；到达 END 或成环时打印当前路径
+ * （成环则加 “...”）。用静态 position 链表保存当前路径，HIDDEN 的 token 跳过。
+ * 注意 position 是函数级静态变量，供跨递归层共享。
+ */
 static void permute(struct graph_node *start, struct vty *vty)
 {
 	static struct list *position = NULL;
@@ -1546,6 +1853,11 @@ static void permute(struct graph_node *start, struct vty *vty)
 	list_delete_node(position, listtail(position));
 }
 
+/*
+ * print_cmd —— 把命令模板串规整后打印。
+ * 跳过 $变量 段（从 $ 到下一个分隔符），压缩空白（去掉首尾、开括号后 / 闭括号前、
+ * 连续空白），并把制表符转成空格，最后 vty_out 输出。用于 “list” 展示命令。
+ */
 static void print_cmd(struct vty *vty, const char *cmd)
 {
 	int i, j, len = strlen(cmd);
@@ -1596,6 +1908,11 @@ static void print_cmd(struct vty *vty, const char *cmd)
 	vty_out(vty, "%s\n", buf);
 }
 
+/*
+ * cmd_list_cmds —— 列出当前节点的命令。
+ * do_permute 为真时先建好图再调用 permute 枚举所有排列；否则遍历节点的命令向量，
+ * 跳过 HIDDEN 命令，用 print_cmd 逐条打印。恒返回 CMD_SUCCESS。
+ */
 int cmd_list_cmds(struct vty *vty, int do_permute)
 {
 	struct cmd_node *node = vector_slot(cmdvec, vty->node);
@@ -1617,6 +1934,9 @@ int cmd_list_cmds(struct vty *vty, int do_permute)
 	return CMD_SUCCESS;
 }
 
+/*
+ * config_list（DEFUN）——“list [permutations]”，打印命令列表（带参则打印排列）。
+ */
 /* Help display function for all node. */
 DEFUN (config_list,
        config_list_cmd,
@@ -1627,6 +1947,9 @@ DEFUN (config_list,
 	return cmd_list_cmds(vty, argc == 2);
 }
 
+/*
+ * show_commandtree（DEFUN）——“show commandtree [permutations]”，显示命令树（功能同 list）。
+ */
 DEFUN (show_commandtree,
        show_commandtree_cmd,
        "show commandtree [permutations]",
@@ -1637,6 +1960,10 @@ DEFUN (show_commandtree,
 	return cmd_list_cmds(vty, argc == 3);
 }
 
+/*
+ * show_cli_graph（DEFUN_HIDDEN）——“show cli graph”，把当前节点的命令空间导出为
+ * DOT 图并打印（调试命令，对用户隐藏）。
+ */
 DEFUN_HIDDEN(show_cli_graph,
              show_cli_graph_cmd,
              "show cli graph",
@@ -1655,6 +1982,12 @@ DEFUN_HIDDEN(show_cli_graph,
 	return CMD_SUCCESS;
 }
 
+/*
+ * vty_write_config —— 组装并输出完整运行配置。
+ * 依次写出 frr version / defaults 头，再遍历所有节点调用各自的 config_write 回调
+ * （返回非 0 时补一个 “!” 分隔），终端类型时以 “end” 收尾。
+ * host.noconfig 为真时直接返回、不输出任何内容。
+ */
 static int vty_write_config(struct vty *vty)
 {
 	size_t i;
@@ -1692,6 +2025,13 @@ static int vty_write_config(struct vty *vty)
 /* cross-reference frr_daemon_state_save in libfrr.c
  * the code there is similar but not identical (state files always use the same
  * name for the new write, and don't keep a backup of previous state.)
+ */
+/*
+ * file_write_config —— 把运行配置写入配置文件（原子写）。
+ * 采用“临时文件 + 备份旧文件 + rename”策略：在配置目录下 mkstemp 写临时文件，
+ * 先把旧配置备份成 .sav，再 rename 临时文件为正式配置，并 fsync 所在目录。
+ * 依赖 host.config；vtysh 场景下它可能为 NULL，此时报错返回 CMD_WARNING。
+ * 与 libfrr.c 的 frr_daemon_state_save 类似但不完全相同（见上方英文注释）。
  */
 static int file_write_config(struct vty *vty)
 {
@@ -1802,6 +2142,11 @@ finished:
 	return ret;
 }
 
+/*
+ * config_write（DEFUN）——“write [file|memory|terminal]”。
+ * “write terminal” 走 vty_write_config 输出到终端，其余（含 write memory）走
+ * file_write_config 落盘。
+ */
 /* Write current configuration into file. */
 
 DEFUN (config_write,
@@ -1822,6 +2167,9 @@ DEFUN (config_write,
 	return file_write_config(vty);
 }
 
+/*
+ * show_running_config（DEFUN）——“show running-config”，等价于 write terminal，输出到终端。
+ */
 /* ALIAS_FIXME for 'write <terminal|memory>' */
 DEFUN (show_running_config,
        show_running_config_cmd,
@@ -1832,6 +2180,10 @@ DEFUN (show_running_config,
 	return vty_write_config(vty);
 }
 
+/*
+ * copy_runningconf_startupconf（DEFUN）——“copy running-config startup-config”，
+ * 把运行配置落盘到启动配置（同 write file/memory）。
+ */
 /* ALIAS_FIXME for 'write file' */
 DEFUN (copy_runningconf_startupconf,
        copy_runningconf_startupconf_cmd,
@@ -1844,6 +2196,10 @@ DEFUN (copy_runningconf_startupconf,
 }
 /** -- **/
 
+/*
+ * show_startup_config（DEFUN）——“show startup-config”，把磁盘上的启动配置文件内容打印到终端。
+ * host.noconfig 时直接返回 CMD_SUCCESS；无法打开配置或 host.config 为空返回 CMD_WARNING。
+ */
 /* Write startup configuration into the terminal. */
 DEFUN (show_startup_config,
        show_startup_config_cmd,
@@ -1881,6 +2237,9 @@ DEFUN (show_startup_config,
 	return CMD_SUCCESS;
 }
 
+/*
+ * cmd_domainname_set —— 设置 host.domainname（传 NULL 表示清除）。返回 CMD_SUCCESS。
+ */
 int cmd_domainname_set(const char *domainname)
 {
 	XFREE(MTYPE_HOST, host.domainname);
@@ -1888,6 +2247,9 @@ int cmd_domainname_set(const char *domainname)
 	return CMD_SUCCESS;
 }
 
+/*
+ * config_domainname（DEFUN）——“domainname WORD”，设置域名（要求首字符为字母）。
+ */
 /* Hostname configuration */
 DEFUN(config_domainname,
       domainname_cmd,
@@ -1905,6 +2267,9 @@ DEFUN(config_domainname,
 	return cmd_domainname_set(word->arg);
 }
 
+/*
+ * config_no_domainname（DEFUN）——“no domainname”，清除域名。
+ */
 DEFUN(config_no_domainname,
       no_domainname_cmd,
       "no domainname [DOMAINNAME]",
@@ -1915,6 +2280,9 @@ DEFUN(config_no_domainname,
 	return cmd_domainname_set(NULL);
 }
 
+/*
+ * cmd_hostname_set —— 设置 host.name（传 NULL 表示清除）。返回 CMD_SUCCESS。
+ */
 int cmd_hostname_set(const char *hostname)
 {
 	XFREE(MTYPE_HOST, host.name);
@@ -1922,6 +2290,10 @@ int cmd_hostname_set(const char *hostname)
 	return CMD_SUCCESS;
 }
 
+/*
+ * config_hostname（DEFUN）——“hostname WORD”，设置主机名。
+ * 要求首字符为字母或数字，且长度不超过 HOSTNAME_LEN（依据 RFC 1123）。
+ */
 /* Hostname configuration */
 DEFUN (config_hostname,
        hostname_cmd,
@@ -1947,6 +2319,9 @@ DEFUN (config_hostname,
 	return cmd_hostname_set(word->arg);
 }
 
+/*
+ * config_no_hostname（DEFUN）——“no hostname”，清除主机名。
+ */
 DEFUN (config_no_hostname,
        no_hostname_cmd,
        "no hostname [HOSTNAME]",
@@ -1957,6 +2332,11 @@ DEFUN (config_no_hostname,
 	return cmd_hostname_set(NULL);
 }
 
+/*
+ * config_password（DEFUN）——“password [(8-8)] WORD”，设置 vty 登录口令。
+ * 指定 “8” 时把 WORD 当作已加密串存入 password_encrypt；否则按当前
+ * service password-encryption 状态，决定明文存入 password 还是加密后存入 password_encrypt。
+ */
 /* VTY interface password set. */
 DEFUN (config_password,
        password_cmd,
@@ -2000,6 +2380,10 @@ DEFUN (config_password,
 	return CMD_SUCCESS;
 }
 
+/*
+ * no_config_password（DEFUN）——“no password”，删除登录口令（明文与密文都清）。
+ * 对非 shell 服务会话会先打印安全警告（NO_PASSWD_CMD_WARNING）。
+ */
 /* VTY interface password delete. */
 DEFUN (no_config_password,
        no_password_cmd,
@@ -2028,6 +2412,11 @@ DEFUN (no_config_password,
 	return CMD_SUCCESS;
 }
 
+/*
+ * config_enable_password（DEFUN）——“enable password [(8-8)] WORD”，设置 enable 口令。
+ * 逻辑与 config_password 类似，作用于 host.enable / host.enable_encrypt；
+ * 指定了非 “8” 的加密类型会报错返回。
+ */
 /* VTY enable password set. */
 DEFUN (config_enable_password,
        enable_password_cmd,
@@ -2081,6 +2470,9 @@ DEFUN (config_enable_password,
 	return CMD_SUCCESS;
 }
 
+/*
+ * no_config_enable_password（DEFUN）——“no enable password”，删除 enable 口令（含密文）。
+ */
 /* VTY enable password delete. */
 DEFUN (no_config_enable_password,
        no_enable_password_cmd,
@@ -2110,6 +2502,10 @@ DEFUN (no_config_enable_password,
 	return CMD_SUCCESS;
 }
 
+/*
+ * service_password_encrypt（DEFUN）——“service password-encryption”。
+ * 打开口令加密开关；若已有明文口令，则立即就地加密为密文版本。
+ */
 DEFUN (service_password_encrypt,
        service_password_encrypt_cmd,
        "service password-encryption",
@@ -2137,6 +2533,10 @@ DEFUN (service_password_encrypt,
 	return CMD_SUCCESS;
 }
 
+/*
+ * no_service_password_encrypt（DEFUN）——“no service password-encryption”，
+ * 关闭口令加密并清除密文版本。
+ */
 DEFUN (no_service_password_encrypt,
        no_service_password_encrypt_cmd,
        "no service password-encryption",
@@ -2160,6 +2560,9 @@ DEFUN (no_service_password_encrypt,
 	return CMD_SUCCESS;
 }
 
+/*
+ * config_terminal_length（DEFUN）——“terminal length (0-512)”，设置本 vty 会话每屏行数。
+ */
 DEFUN (config_terminal_length,
        config_terminal_length_cmd,
        "terminal length (0-512)",
@@ -2174,6 +2577,9 @@ DEFUN (config_terminal_length,
 	return CMD_SUCCESS;
 }
 
+/*
+ * config_terminal_no_length（DEFUN）——“terminal no length”，取消本会话的行数限制（设为 -1）。
+ */
 DEFUN (config_terminal_no_length,
        config_terminal_no_length_cmd,
        "terminal no length",
@@ -2185,6 +2591,9 @@ DEFUN (config_terminal_no_length,
 	return CMD_SUCCESS;
 }
 
+/*
+ * service_terminal_length（DEFUN）——“service terminal-length (0-512)”，设置系统级 vty 每屏行数。
+ */
 DEFUN (service_terminal_length,
        service_terminal_length_cmd,
        "service terminal-length (0-512)",
@@ -2199,6 +2608,9 @@ DEFUN (service_terminal_length,
 	return CMD_SUCCESS;
 }
 
+/*
+ * no_service_terminal_length（DEFUN）——“no service terminal-length”，取消系统级行数限制。
+ */
 DEFUN (no_service_terminal_length,
        no_service_terminal_length_cmd,
        "no service terminal-length [(0-512)]",
@@ -2211,6 +2623,9 @@ DEFUN (no_service_terminal_length,
 	return CMD_SUCCESS;
 }
 
+/*
+ * do_echo（DEFUN_HIDDEN）——“echo MESSAGE...”，把消息原样回显到 vty（内部命令）。
+ */
 DEFUN_HIDDEN (do_echo,
               echo_cmd,
               "echo MESSAGE...",
@@ -2226,6 +2641,10 @@ DEFUN_HIDDEN (do_echo,
 	return CMD_SUCCESS;
 }
 
+/*
+ * config_logmsg（DEFUN）——“logmsg <级别> MESSAGE...”，按指定日志级别把一条消息发往日志系统。
+ * 级别无法识别时返回 CMD_ERR_NO_MATCH。
+ */
 DEFUN (config_logmsg,
        config_logmsg_cmd,
        "logmsg <emergencies|alerts|critical|errors|warnings|notifications|informational|debugging> MESSAGE...",
@@ -2250,6 +2669,10 @@ DEFUN (config_logmsg,
 	return CMD_SUCCESS;
 }
 
+/*
+ * debug_memstats（DEFUN）——“[no] debug memstats-at-exit”，开关“退出时打印内存类型统计”。
+ * 通过 argv[0]->text 判断是否带 “no”。
+ */
 DEFUN (debug_memstats,
        debug_memstats_cmd,
        "[no] debug memstats-at-exit",
@@ -2261,6 +2684,11 @@ DEFUN (debug_memstats,
 	return CMD_SUCCESS;
 }
 
+/*
+ * cmd_banner_motd_file —— 设置以文件为来源的 banner motd。
+ * 用 realpath 解析路径，文件不存在返回 CMD_ERR_NO_FILE；仅当文件位于 SYSCONFDIR
+ * 之内才接受，否则返回 CMD_WARNING_CONFIG_FAILED。成功则记录 host.motdfile。
+ */
 int cmd_banner_motd_file(const char *file)
 {
 	int success = CMD_SUCCESS;
@@ -2281,12 +2709,19 @@ int cmd_banner_motd_file(const char *file)
 	return success;
 }
 
+/*
+ * cmd_banner_motd_line —— 用一行文本设置 banner motd（存入 host.motd）。
+ */
 void cmd_banner_motd_line(const char *line)
 {
 	XFREE(MTYPE_HOST, host.motd);
 	host.motd = XSTRDUP(MTYPE_HOST, line);
 }
 
+/*
+ * banner_motd_file（DEFUN）——“banner motd file FILE”，banner motd 取自指定文件。
+ * 失败时依据 cmd_banner_motd_file 的返回码给出不同提示。
+ */
 DEFUN (banner_motd_file,
        banner_motd_file_cmd,
        "banner motd file FILE",
@@ -2307,6 +2742,10 @@ DEFUN (banner_motd_file,
 	return cmd;
 }
 
+/*
+ * banner_motd_line（DEFUN）——“banner motd line LINE...”，banner motd 取自一行输入文本。
+ * 用 argv_find 定位 LINE 起的位置再拼接。
+ */
 DEFUN (banner_motd_line,
        banner_motd_line_cmd,
        "banner motd line LINE...",
@@ -2327,6 +2766,9 @@ DEFUN (banner_motd_line,
 	return CMD_SUCCESS;
 }
 
+/*
+ * banner_motd_default（DEFUN）——“banner motd default”，把 banner motd 设为内置默认串。
+ */
 DEFUN (banner_motd_default,
        banner_motd_default_cmd,
        "banner motd default",
@@ -2338,6 +2780,9 @@ DEFUN (banner_motd_default,
 	return CMD_SUCCESS;
 }
 
+/*
+ * no_banner_motd（DEFUN）——“no banner motd”，清除 banner motd（文本与文件都清）。
+ */
 DEFUN (no_banner_motd,
        no_banner_motd_cmd,
        "no banner motd",
@@ -2352,6 +2797,11 @@ DEFUN (no_banner_motd,
 	return CMD_SUCCESS;
 }
 
+/*
+ * cmd_find_cmds —— 遍历所有节点与命令，用 POSIX 正则匹配命令串并打印命中项。
+ * 先 regcomp 编译 argv 传来的模式；编译失败时按错误码给出对应提示。匹配成功时
+ * 打印所属节点名与命令文本。恒返回 CMD_SUCCESS。
+ */
 int cmd_find_cmds(struct vty *vty, struct cmd_token **argv, int argc)
 {
 	const struct cmd_node *node;
@@ -2431,6 +2881,9 @@ done:
 	return CMD_SUCCESS;
 }
 
+/*
+ * find（DEFUN）——“find REGEX...”，按正则查找匹配的 CLI 命令（转调 cmd_find_cmds）。
+ */
 DEFUN(find,
       find_cmd,
       "find REGEX...",
@@ -2441,6 +2894,10 @@ DEFUN(find,
 }
 
 #if defined(DEV_BUILD) && defined(HAVE_SCRIPTING)
+/*
+ * script（DEFUN）—— 测试命令（仅 DEV_BUILD 且启用脚本时编译）：加载并调用 Lua 脚本
+ * 中的函数，演示 frrscript 的用法（构造前缀参数、调用、打印返回结果）。
+ */
 DEFUN(script, script_cmd, "script SCRIPT FUNCTION",
       "Test command - execute a function in a script\n"
       "Script name (same as filename in /etc/frr/scripts/)\n"
@@ -2469,6 +2926,9 @@ DEFUN(script, script_cmd, "script SCRIPT FUNCTION",
 }
 #endif
 
+/*
+ * host_config_set —— 设置 host.config（当前 daemon 要读写的配置文件名），由 vty.c 调用。
+ */
 /* Set config filename.  Called from vty.c */
 void host_config_set(const char *filename)
 {
@@ -2476,17 +2936,29 @@ void host_config_set(const char *filename)
 	host.config = XSTRDUP(MTYPE_HOST, filename);
 }
 
+/*
+ * host_config_get —— 返回 host.config（当前配置文件名），未设置时为 NULL。
+ */
 const char *host_config_get(void)
 {
 	return host.config;
 }
 
+/*
+ * cmd_show_lib_debugs —— 汇总输出 lib 目录内各模块的调试开关状态
+ * （route-map 调试与 debug 状态），供 “show debugging” 一类命令使用。
+ */
 void cmd_show_lib_debugs(struct vty *vty)
 {
 	route_map_show_debug(vty);
 	debug_status_write(vty);
 }
 
+/*
+ * install_default —— 为某节点安装“每个节点都该有”的基础命令：
+ * exit / quit / end / help / list / show cli graph / find / write / show running-config /
+ * autocomplete，并叠加 nb_cli_install_default 提供的 YANG 相关默认命令。
+ */
 void install_default(enum node_type node)
 {
 	_install_element(node, &config_exit_cmd);
@@ -2505,6 +2977,14 @@ void install_default(enum node_type node)
 	nb_cli_install_default(node);
 }
 
+/*
+ * cmd_init —— 初始化整个命令接口：安装基础节点与命令。
+ * terminal 取值：0 表示 vtysh / 无日志无配置控制；1 表示普通守护进程；-1 表示
+ *   watchfrr（无日志但有最简配置控制）。
+ * 步骤：uname 取系统信息填入 host、注册管道钩子、建 varhandlers、建 cmdvec、
+ *   设置 host 默认值、安装 view / enable / auth / config 等顶层节点及其命令，
+ *   最后在 DEV_BUILD 下初始化语法沙箱。
+ */
 /* Initialize command interface. Install basic nodes and commands.
  *
  * terminal = 0 -- vtysh / no logging, no config control
@@ -2627,6 +3107,10 @@ void cmd_init(int terminal)
 #endif
 }
 
+/*
+ * cmd_terminate —— 反初始化：注销命令钩子，释放每个节点的命令图 / 向量 / 哈希，
+ * 释放 cmdvec 与 host 各字段，删除变量处理器链表，并收尾 qobj。
+ */
 void cmd_terminate(void)
 {
 	struct cmd_node *cmd_node;

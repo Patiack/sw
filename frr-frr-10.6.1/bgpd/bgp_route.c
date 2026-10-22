@@ -3,6 +3,43 @@
  * Copyright (C) 1996, 97, 98, 99 Kunihiro Ishiguro
  * Copyright (C) 2016 Job Snijders <job@instituut.net>
  */
+/* ============================================================================
+ * 【文件导读】bgp_route.c —— bgpd 的“路由信息库中枢”：路由入向落地、最佳路径
+ *                    选择、向 zebra 下发、聚合与 show 命令全在这里
+ * ============================================================================
+ * 职责与定位：
+ *   这是 bgpd 体量最大、最核心的文件（约 1.8 万行）。它承上启下：
+ *   上接 bgp_packet.c 解析出的 UPDATE/UPDATE-withdraw（即 NLRI + 属性），
+ *   下接 bgp_zebra.c（把选出的最优路由装进内核 FIB）与 bgp_updgrp.c
+ *   （把路由重新编码后通告给邻居）。所有“路由怎么进表、怎么选、怎么出表”
+ *   的逻辑都汇聚于此。
+ *
+ * 三条核心数据流：
+ *   1) 入向（收路由）：bgp_update()/bgp_withdraw() 把一条 NLRI 落到某个前缀节点
+ *      (bgp_dest) 的 bgp_path_info 链表上，然后 bgp_process*() 把该 dest 排入
+ *      meta_queue 的“延迟处理队列”。
+ *   2) 决策（选路）：主事件循环稍后从队列取出 dest，调用 bgp_process_main_one()
+ *      → bgp_best_selection()（内部用 bgp_path_info_cmp() 逐条比较）选出
+ *      最优路径与多路径(ECMP)集合。
+ *   3) 出向（下/发）：比较新旧最优路径，变化则经 bgp_zebra_announce()/
+ *      bgp_zebra_withdraw() 下发给 zebra，并通过 subgroup_process_announce_selected()
+ *      触发对邻居的更新通告。
+ *
+ * 关键函数清单（建议阅读顺序）：
+ *   1) bgp_path_info_cmp       —— 最佳路径比较器，RFC4271 §9.1.2.2 的落地（最长最绕）
+ *   2) bgp_best_selection      —— 对一个前缀的所有路径排序、选出 best + multipath
+ *   3) bgp_process_main_one    —— 处理队列的单节点主逻辑（新旧路径 diff → 下发/通告）
+ *   4) bgp_update / bgp_withdraw —— 入向根入口，把 UPDATE 写进 RIB（含大量属性校验）
+ *   5) bgp_rib_remove / bgp_rib_withdraw —— 从 RIB 摘除一条路径
+ *   6) bgp_aggregate_*         —— aggregate-address 聚合（路由汇总、suppress/additional-path）
+ *   7) bgp_show_table / route_vty_out* — show ip bgp 系列的遍历与打印
+ *   8) bgp_route_init / bgp_route_finish —— 本文件注册的命令与初始化/清理
+ *
+ * 建议阅读顺序：先看顶层骨架 bgp_route_init（了解命令注册），再顺着
+ * bgp_update→bgp_process→bgp_process_main_one→bgp_best_selection→bgp_path_info_cmp
+ * 这条主链精读；随后看 bgp_zebra_* 下发与 bgp_aggregate_* 聚合；最后扫 show 命令。
+ * ============================================================================
+ */
 
 #include <zebra.h>
 #include <math.h>
@@ -84,6 +121,13 @@
 
 #include "bgpd/bgp_route_clippy.c"
 
+/* ========== 0. 文件级辅助设施与基础工具 ========== */
+
+/* 判断两条属性记录里的“下一跳”是否等价。
+ * 注意坑点：先看双方的下一跳地址族（v4 还是 v6）是否一致，不一致直接判不同；
+ * 因为 v4<->v6 的“转场”（RFC5549 之类）在 BGP 语义里被视为更换了下一跳，
+ * 不能简单按字节比较。参数 afi 是当前地址族（用于推导实际的下一跳地址族）。
+ * 返回值：true 表示下一跳相同。 */
 static bool bgp_attr_nexthop_same(const struct attr *attr1, const struct attr *attr2, afi_t afi)
 {
 	afi_t nh_afi1 = BGP_ATTR_NH_AFI(afi, attr1);
@@ -99,20 +143,24 @@ static bool bgp_attr_nexthop_same(const struct attr *attr1, const struct attr *a
 	return IPV4_ADDR_SAME(&attr1->nexthop, &attr2->nexthop);
 }
 
+/* 本文件用到的内存类型(mtype)声明。 */
 DEFINE_MTYPE_STATIC(BGPD, BGP_EOIU_MARKER_INFO, "BGP EOIU Marker info");
 DEFINE_MTYPE_STATIC(BGPD, BGP_METAQ, "BGP MetaQ");
 /* Memory for batched clearing of peers from the RIB */
 DEFINE_MTYPE(BGPD, CLEARING_BATCH, "Clearing batch");
 
+/* 钩子：BGP 路由更新时通知 SNMP 统计(其他模块可挂接)。 */
 DEFINE_HOOK(bgp_snmp_update_stats,
 	    (struct bgp_dest *rn, struct bgp_path_info *pi, bool added),
 	    (rn, pi, added));
 
+/* 钩子：RPKI 前缀校验状态变化时回调。 */
 DEFINE_HOOK(bgp_rpki_prefix_status,
 	    (struct peer *peer, struct attr *attr,
 	     const struct prefix *prefix),
 	    (peer, attr, prefix));
 
+/* 钩子：BGP 路由(路径)被安装/删除到 RIB 后回调。 */
 DEFINE_HOOK(bgp_route_update,
 	    (struct bgp *bgp, afi_t afi, safi_t safi, struct bgp_dest *bn,
 	     struct bgp_path_info *old_route, struct bgp_path_info *new_route),
@@ -147,6 +195,10 @@ static void bgp_gr_start_tier2_timer_if_required(struct bgp *bgp, afi_t afi, saf
  * Typesafe Hash Functions for bgp_path_info
  * hash key: prefix, peer, type, sub_type, addpath_rx_id
  */
+/* bgp_path_info 哈希表的比较函数（typesafe hash 用）。
+ * 哈希键 = 前缀 + peer 指针 + type + sub_type + addpath_rx_id，这五元组唯一
+ * 定位“某邻居为某前缀贡献的一条路径”。addpath_rx_id 即 RFC7911 接收侧的
+ * path-id，用于同一邻居/同一前缀下区分多条路径。返回 0 表示两条路径相等。 */
 int bgp_pi_hash_cmp(const struct bgp_path_info *p1, const struct bgp_path_info *p2)
 {
 	int ret;
@@ -175,6 +227,8 @@ int bgp_pi_hash_cmp(const struct bgp_path_info *p1, const struct bgp_path_info *
 	return 0;
 }
 
+/* bgp_path_info 哈希表的哈希函数。用 jhash 把 peer 指针、addpath_rx_id、
+ * type、sub_type 逐步混入前缀哈希值，与 bgp_pi_hash_cmp 的键保持一致。 */
 uint32_t bgp_pi_hash_hashfn(const struct bgp_path_info *pi)
 {
 	uint32_t h = 0;
@@ -189,6 +243,9 @@ uint32_t bgp_pi_hash_hashfn(const struct bgp_path_info *pi)
 	return h;
 }
 
+/* 把 bgp_path_info->flags 里的全部位标志翻译成可读字符串，写进 buf（供调试/
+ * dump 打印）。纯诊断用途，不影响转发；flag 的定义见 bgp_table.h 的
+ * BGP_PATH_* 枚举。 */
 static inline char *bgp_route_dump_path_info_flags(struct bgp_path_info *pi,
 						   char *buf, size_t len)
 {
@@ -229,11 +286,15 @@ static inline char *bgp_route_dump_path_info_flags(struct bgp_path_info *pi,
 	return buf;
 }
 
+/* 钩子：一条前缀的路径集发生变化(通告/撤销)时回调。 */
 DEFINE_HOOK(bgp_process,
 	    (struct bgp * bgp, afi_t afi, safi_t safi, struct bgp_dest *bn,
 	     struct peer *peer, bool withdraw),
 	    (bgp, afi, safi, bn, peer, withdraw));
 
+/* 判断一条路径是否被聚合路由“抑制”(suppressed)。抑制含义：该路径聚合后不再
+ * 单独作为一条路由对外通告（aggregate-address ... suppress-map / summary-only）。
+ * extra->aggr_suppressors 是“抑制它的聚合节点”链表，非空即被抑制。 */
 /** Test if path is suppressed. */
 bool bgp_path_suppressed(struct bgp_path_info *pi)
 {
@@ -243,6 +304,14 @@ bool bgp_path_suppressed(struct bgp_path_info *pi)
 	return listcount(pi->extra->aggr_suppressors) > 0;
 }
 
+/* ========== 1. RIB 路径对象与节点：创建、引用计数与标志管理 ========== */
+
+/* 在给定 (afi,safi) 表中“取得/创建”一个前缀节点 bgp_dest，返回时带引用（已 lock）。
+ * VPN/ENCAP/EVPN 这类 SAFI 是“两级”结构：外层按 Route-Distinguisher(prd) 建一层
+ * 隐藏子表，真正的前缀 p 落在这层子表里。因此这里先按 prd 取外层节点(pdest)，
+ * 若其 info 还没有子表则新建一个 bgp_table 挂上去，再在子表里取 p。
+ * 返回的 dest->pdest 指回外层 RD 节点，便于反向找到 RD。
+ * 调用方负责最终 bgp_dest_unlock_node()。 */
 struct bgp_dest *bgp_afi_node_get(struct bgp_table *table, afi_t afi,
 				  safi_t safi, const struct prefix *p,
 				  struct prefix_rd *prd)
@@ -275,6 +344,9 @@ struct bgp_dest *bgp_afi_node_get(struct bgp_table *table, afi_t afi,
 	return dest;
 }
 
+/* bgp_afi_node_get 的“只查不建”版本：在 (afi,safi) 表中查找前缀节点，
+ * 找不到返回 NULL（不会创建新节点）。VPN/ENCAP/EVPN 同样要经 RD 子表两层查找。
+ * 注意不同点：查到目的地后不额外 lock，找到就返回一次性引用。 */
 struct bgp_dest *bgp_safi_node_lookup(struct bgp_table *table, safi_t safi,
 				      const struct prefix *p,
 				      struct prefix_rd *prd)
@@ -304,6 +376,9 @@ struct bgp_dest *bgp_safi_node_lookup(struct bgp_table *table, safi_t safi,
 	return dest;
 }
 
+/* 分配一个空的 bgp_path_info_extra。extra 是路径的“附加信息”，因为大多数路径
+ * 用不到（如 damp/flowspec/vrfleak/evpn/labels），所以设计成懒分配（见
+ * bgp_path_info_extra_get），以节省内存。 */
 /* Allocate bgp_path_info_extra */
 static struct bgp_path_info_extra *bgp_path_info_extra_new(void)
 {
@@ -314,6 +389,11 @@ static struct bgp_path_info_extra *bgp_path_info_extra_new(void)
 	return new;
 }
 
+/* 释放 bgp_path_info_extra 及其内部所有子资源。这是一处 refcount/所有权极易
+ * 出错的地方：e->vrfleak->parent 指向“宿主路径”，而父路径的 net 节点又为这条
+ * 泄漏记录持有一份 lock。释放时必须小心——若 net 的 lock 归零，父路径本身可能
+ * 一并被释放（use-after-free），因此先用 bgp_path_info_lock 保住父路径再做减法
+ * （见下方带 FIXME/WARNING 的段落）。参数是二级指针，释放后置空。 */
 void bgp_path_info_extra_free(struct bgp_path_info_extra **extra)
 {
 	struct bgp_path_info_extra *e;
@@ -386,6 +466,8 @@ void bgp_path_info_extra_free(struct bgp_path_info_extra **extra)
 	XFREE(MTYPE_BGP_ROUTE_EXTRA, *extra);
 }
 
+/* 获取（必要时懒分配）bgp_path_info 的 extra 结构。若该路径属于 EVPN 地址族，
+ * 顺带确保 evpn 子结构也已分配。 */
 /* Get bgp_path_info extra information for the given bgp_path_info, lazy
  * allocated if required.
  */
@@ -400,6 +482,8 @@ struct bgp_path_info_extra *bgp_path_info_extra_get(struct bgp_path_info *pi)
 	return pi->extra;
 }
 
+/* 与 bgp_path_info_extra_get 类似，但强制确保 evpn 子结构存在。用于从 EVPN
+ * 表导入的路径（如 Type-5 IP Prefix 路由）。 */
 /* Get bgp_path_info extra along with evpn information for the given bgp_path_info.
  * This is used for EVPN imported routes like Type-5.
  */
@@ -413,6 +497,8 @@ struct bgp_path_info_extra *bgp_evpn_path_info_extra_get(struct bgp_path_info *p
 	return pi->extra;
 }
 
+/* 判断路径上的首个 MPLS 标签是否“有效”（即非隐式空标签/特殊保留值）。
+ * 用于 VPN 场景判断该路径是否携带可用的标签栈。 */
 bool bgp_path_info_has_valid_label(const struct bgp_path_info *path)
 {
 	if (!BGP_PATH_INFO_NUM_LABELS(path))
@@ -421,6 +507,8 @@ bool bgp_path_info_has_valid_label(const struct bgp_path_info *path)
 	return bgp_is_valid_label(&path->extra->labels->label[0]);
 }
 
+/* 比较一条路径携带的标签栈与外部给定的一组标签是否完全相同。仅做栈内逐项比较，
+ * 空标签栈按 NULL 处理。 */
 bool bgp_path_info_labels_same(const struct bgp_path_info *bpi,
 			       const mpls_label_t *label, uint32_t n)
 {
@@ -434,6 +522,10 @@ bool bgp_path_info_labels_same(const struct bgp_path_info *bpi,
 			       (const mpls_label_t *)label, n);
 }
 
+/* 真正释放一条路径（bgp_path_info）的所有权资源，最后 XFREE 掉自身。
+ * 释放顺序体现所有权：先反注册属性(bgp_attr_unintern)、解除与 nexthop 的关联、
+ * 释放 extra、清理 addpath tx 侧数据、peer_unlock（抵消创建时对 peer 的引用），
+ * 最后释放本结构。name 仅用于 trace 打点，定位是谁触发的释放。 */
 /* Free bgp route information. */
 void bgp_path_info_free_with_caller(const char *name,
 				    struct bgp_path_info *path)
@@ -452,12 +544,15 @@ void bgp_path_info_free_with_caller(const char *name,
 	XFREE(MTYPE_BGP_ROUTE, path);
 }
 
+/* 增加路径的引用计数并返回自身（方便链式使用）。 */
 struct bgp_path_info *bgp_path_info_lock(struct bgp_path_info *path)
 {
 	path->lock++;
 	return path;
 }
 
+/* 减少路径引用计数；归零则释放路径并返回 NULL，否则返回自身。
+ * BGP 的路径对象用这套 lock/unlock 管理生命周期，务必成对使用。 */
 struct bgp_path_info *bgp_path_info_unlock(struct bgp_path_info *path)
 {
 	assert(path && path->lock > 0);
@@ -471,6 +566,12 @@ struct bgp_path_info *bgp_path_info_unlock(struct bgp_path_info *path)
 	return path;
 }
 
+/* 判断把这条路径通告给邻居 to 时，下一跳是否需要改写（决定是否要重算/换编码）。
+ * 规则（针对 VPN 地址族的 af_flags）：
+ *   - iBGP→iBGP 且未配 nexthop-self：下一跳不变（路由反射器场景，RFC4456）；
+ *   - 目标是 iBGP 且未配 nexthop-self：下一跳不变；
+ *   - 目标配了 nexthop-unchanged：下一跳保持不变。
+ * 以上都不满足才返回 true（需要改下一跳）。 */
 bool bgp_path_info_nexthop_changed(struct bgp_path_info *pi, struct peer *to,
 				   afi_t afi)
 {
@@ -494,6 +595,11 @@ bool bgp_path_info_nexthop_changed(struct bgp_path_info *pi, struct peer *to,
 	return true;
 }
 
+/* 按条件设置/清除 dest 上的 BGP_NODE_SELECT_DEFER 标志（“延迟选路”）。
+ * 背景：GR(平滑重启)/批量导入场景下，某些前缀的路径会分多次到达，若每来一条
+ * 就重选一次会造成“抖动”和对邻居的无效通告。延迟选路把这些前缀的选路推迟到
+ * 所有相关更新到齐后再统一做。delete=true 表示这是一次删除操作。
+ * 返回值：1 表示已延迟（不再触发立即处理），0 表示不延迟。 */
 /* This function sets flag BGP_NODE_SELECT_DEFER based on condition */
 int bgp_dest_set_defer_flag(struct bgp_dest *dest, bool delete)
 {
@@ -601,6 +707,11 @@ int bgp_dest_set_defer_flag(struct bgp_dest *dest, bool delete)
 	return -1;
 }
 
+/* 把一条路径 pi 插入到 dest 的路径链表头部，并完成所有权登记。
+ * 关键动作（顺序有意义）：头插到链表 → 加入该表的全局 pi_hash（用于快速查找）
+ * → 打上 BGP_PATH_UNSORTED（提示 bestpath 需要重排序）→ lock 自身、lock 节点、
+ * peer_lock（建立引用）→ 调 bgp_dest_set_defer_flag（可能触发延迟选路）→
+ * peer 的 loc-rib 前缀计数 +1 → 触发 SNMP hook。name 仅用于 trace。 */
 void bgp_path_info_add_with_caller(const char *name, struct bgp_dest *dest,
 				   struct bgp_path_info *pi)
 {
@@ -631,6 +742,10 @@ void bgp_path_info_add_with_caller(const char *name, struct bgp_dest *dest,
 	hook_call(bgp_snmp_update_stats, dest, pi, true);
 }
 
+/* 把一条路径从 dest 的链表中真正摘除（“收割”）。仅供 bgp_process 的完成回调
+ * 使用——此时该路径已被标记删除、可从表里移除。动作：从双向链表解链、从
+ * pi_hash 删除、peer 的 loc-rib 计数 -1、触发 SNMP hook、unlock 路径自身、
+ * unlock 一次 dest 节点。返回 unlock 后的 dest（可能为 NULL）。 */
 /* Do the actual removal of info from RIB, for use by bgp_process
    completion callback *only* */
 struct bgp_dest *bgp_path_info_reap(struct bgp_dest *dest,
@@ -661,6 +776,9 @@ struct bgp_dest *bgp_path_info_reap(struct bgp_dest *dest,
 	return bgp_dest_unlock_node(dest);
 }
 
+/* bgp_path_info_reap 的变体：用于路径尚未被排序（未真正挂入有序链表，或链表
+ * 顺序不可依赖）时的收割。因此不做双向链表解链，只从 hash 删除、减计数、
+ * unlock。 */
 static struct bgp_dest *bgp_path_info_reap_unsorted(struct bgp_dest *dest,
 						    struct bgp_path_info *pi)
 {
@@ -682,6 +800,9 @@ static struct bgp_dest *bgp_path_info_reap_unsorted(struct bgp_dest *dest,
 	return bgp_dest_unlock_node(dest);
 }
 
+/* 把一条路径“标记为待删除”：置 BGP_PATH_REMOVED、清 BGP_PATH_VALID。
+ * 注意：这只是打标记，真正的摘除推迟到 bgp_process 处理时执行（bgp_path_info_reap）。
+ * 这样做是为了让“删除后又被立即重新加入”的场景可控。 */
 void bgp_path_info_mark_for_delete(struct bgp_dest *dest, struct bgp_path_info *pi)
 {
 	bgp_path_info_set_flag(dest, pi, BGP_PATH_REMOVED);
@@ -689,6 +810,9 @@ void bgp_path_info_mark_for_delete(struct bgp_dest *dest, struct bgp_path_info *
 	UNSET_FLAG(pi->flags, BGP_PATH_VALID);
 }
 
+/* 撤销 bgp_path_info_mark_for_delete 的效果（清 REMOVED、恢复 VALID）。
+ * 典型场景：一条路由刚被删除、删除尚未被处理，又很快被重新加回，
+ * 此时直接撤销删除标记即可，省去一次销毁-重建。 */
 /* undo the effects of a previous call to bgp_path_info_mark_for_delete; typically
    called when a route is deleted and then quickly re-added before the
    deletion has been processed */
@@ -699,6 +823,10 @@ void bgp_path_info_restore(struct bgp_dest *dest, struct bgp_path_info *pi)
 	SET_FLAG(pi->flags, BGP_PATH_VALID);
 }
 
+/* 根据路径当前是否符合“可计数”条件，增减 peer 的前缀计数 pcount。
+ * 可计数(BGP_PATH_COUNTABLE = VALID 且非 HISTORY)用于实现 maximum-prefix
+ * 超限保护：只对真正有效、会占用邻居前缀 quota 的路径计数。为避免重复计数，
+ * 用 BGP_PATH_COUNTED 标志记录“是否已计入”。peer_self（本地自身）不计。 */
 /* Adjust pcount as required */
 static void bgp_pcount_adjust(struct bgp_dest *dest, struct bgp_path_info *pi)
 {
@@ -730,12 +858,16 @@ static void bgp_pcount_adjust(struct bgp_dest *dest, struct bgp_path_info *pi)
 	}
 }
 
+/* 比较两条路径的属性中 label_index（MPLS 标签索引）是否不同。返回非 0 表示不同。 */
 static int bgp_label_index_differs(struct bgp_path_info *pi1,
 				   struct bgp_path_info *pi2)
 {
 	return (!(pi1->attr->label_index == pi2->attr->label_index));
 }
 
+/* 设置路径 flag，并在必要时同步前缀计数。
+ * 只有会影响“可计数性”的三个标志（VALID/HISTORY/REMOVED）才触发 pcount 调整，
+ * 其余标志纯属状态位，直接返回（early return）以免无谓开销。 */
 /* Set/unset bgp_path_info flags, adjusting any other state as needed.
  * This is here primarily to keep prefix-count in check.
  */
@@ -753,6 +885,8 @@ void bgp_path_info_set_flag(struct bgp_dest *dest, struct bgp_path_info *pi,
 	bgp_pcount_adjust(dest, pi);
 }
 
+/* bgp_path_info_set_flag 的清除版（UNSET_FLAG）。同样只对可计数性相关标志
+ * 触发 pcount 调整。 */
 void bgp_path_info_unset_flag(struct bgp_dest *dest, struct bgp_path_info *pi,
 			      uint32_t flag)
 {
@@ -767,6 +901,10 @@ void bgp_path_info_unset_flag(struct bgp_dest *dest, struct bgp_path_info *pi,
 	bgp_pcount_adjust(dest, pi);
 }
 
+/* 判断在进行 MED 比较时是否应“使用 MED 值”。两种情形之一即可：
+ *   - 属性里显式携带了 MED；
+ *   - 配置了 bestpath med missing-as-worst（缺省 MED 视为最差）。
+ * 否则不参与 MED 比较（即 MED 缺失且未配 missing-as-worst 时不做该项裁决）。 */
 static bool use_bgp_med_value(struct attr *attr, struct bgp *bgp)
 {
 	if (attr->flag & ATTR_FLAG_BIT(BGP_ATTR_MULTI_EXIT_DISC) ||
@@ -776,6 +914,8 @@ static bool use_bgp_med_value(struct attr *attr, struct bgp *bgp)
 	return false;
 }
 
+/* 取 MED 值用于比较。若属性无 MED 且配置了 bestpath missing-as-worst，
+ * 返回 BGP_MED_MAX（视为最差）；否则返回 0（等于未设，默认偏好最小 MED）。 */
 /* Get MED value.  If MED value is missing and "bgp bestpath
    missing-as-worst" is specified, treat it as the worst value. */
 uint32_t bgp_med_value(struct attr *attr, struct bgp *bgp)
@@ -790,6 +930,9 @@ uint32_t bgp_med_value(struct attr *attr, struct bgp *bgp)
 	}
 }
 
+/* 把一条路径格式化成可读串（用于日志），形如 "path <邻居地址>"；若带 RFC7911
+ * 接收侧 path-id 则附上 " (addpath rxid N)"。若是跨 VRF 导入的路径
+ * (BGP_ROUTE_IMPORTED)，则用其“最终来源路径”的 peer 来显示。pi 为 NULL 时输出 "NONE"。 */
 void bgp_path_info_path_with_addpath_rx_str(struct bgp_path_info *pi, char *buf,
 					    size_t buf_len)
 {
@@ -814,6 +957,9 @@ void bgp_path_info_path_with_addpath_rx_str(struct bgp_path_info *pi, char *buf,
 }
 
 
+/* 跨 VRF 导入(import)可能形成“导入链”：A 从 B 导入、B 又从 C 导入……
+ * 本函数沿 vrfleak->parent 指针一路回溯到最源头的那条路径(ultimate)。
+ * 非导入路径直接返回自身。用于取得真实来源 peer 等信息。 */
 /*
  * Get the ultimate path info.
  */
@@ -833,6 +979,13 @@ struct bgp_path_info *bgp_get_imported_bpi_ultimate(struct bgp_path_info *info)
 	return bpi_ultimate;
 }
 
+/* ========== 2. 最佳路径比较（comparator）：bgp_path_info_cmp ========== */
+
+/* 当一条路径是重分发(redistribute)来的、另一条可安装时，比较二者的管理距离
+ * (administrative distance)。距离更小者胜。这样做的目的是：无论路由到达的
+ * 先后顺序如何，BGP 与 zebra 对“本地路由 vs 其它路由谁被安装并对外通告”的判断
+ * 都保持确定且一致（避免因时序不同产生分歧）。
+ * 返回值：1 = new 更优；0 = exist 更优；-1 = 距离相等（无法据此裁决）。 */
 /*
  * Compare the admin distances of two paths when one is redistributed, and
  * the other one is eligible for installation. Prefer the path with a lower
@@ -880,6 +1033,31 @@ static int bgp_path_info_cmp_distance(struct bgp *bgp, struct bgp_path_info *new
 	return -1;
 }
 
+/* 【最佳路径比较器】判断 new 是否优于 exist（RFC4271 §9.1.2.2 的落地实现）。
+ * 这是整个选路的核心，比较顺序如下（每一步胜出会把 reason 设为对应的
+ * bgp_path_selection_reason，便于 show 时说明“为什么选它”）：
+ *   1) 权重(weight)：仅本地有效，大者优；
+ *   2) 本地优先级(local-pref)：大者优；
+ *   3) 本地始发 aggregator/AS_PATH 越短越优等（as-path 之前的一串平局裁决）；
+ *   4) AS_PATH 长度：短者优（neighbor 侧 peer 优先级的细分）；
+ *   5) origin 类型：IGP < EGP < INCOMPLETE；
+ *   6) MED：同一相邻 AS 之间比较，小者优；
+ *   7) eBGP 优于 iBGP（先比 peer 类型，再比 sub-sort/联盟等）；
+ *   8) 到 NEXT_HOP 的 IGP metric：小者优；
+ *   9) 多个平局规则：router-id 小者优、cluster list 短者优、邻居地址小者优等；
+ *   最后还有 multipath 判定：若在 mpath_cfg 允许的范围内视为“等价”，置 *paths_eq=1。
+ * 参数：
+ *   bgp    —— 所属实例（取各种 bestpath 配置）；
+ *   new/exist —— 待比较的两条路径；
+ *   *paths_eq —— 出参，1 表示两条路径等价（可做 ECMP）；
+ *   mpath_cfg —— 多路径比较配置（用于判断是否落入 ECMP 等价区间）；
+ *   debug/pfx_buf —— 调试输出开关与前缀可读串；
+ *   afi/safi —— 地址族；
+ *   *reason —— 出参，记录 new 胜出/落败发生在哪一步。
+ * 返回值：1 = new 更优；0 = exist 更优；比较中出现“需外部信息/无法比较”时按
+ *         既有约定返回（见函数内注释）。
+ * 易误解点：很多“胜出”是靠 !exist 提前返回；weight/local-pref 为最高优先级，
+ * 会直接跳过后续所有规则。 */
 /* Compare two bgp route entity.  If 'new' is preferable over 'exist' return 1.
  */
 int bgp_path_info_cmp(struct bgp *bgp, struct bgp_path_info *new,
@@ -969,6 +1147,9 @@ int bgp_path_info_cmp(struct bgp *bgp, struct bgp_path_info *new,
 	newattr = new->attr;
 	existattr = exist->attr;
 
+	/* 【LLGR_STALE 特殊裁决，先于常规比较】RFC9494(LLGR)：若到某邻居通告了
+	 * Long-Lived Graceful Restart 能力，则从该邻居收到的、带 LLGR_STALE 团体的
+	 * 路由应被视为“最不优先”。这里 new 带该团体则输(exist 胜)，exist 带则 new 胜。 */
 	/* A BGP speaker that has advertised the "Long-lived Graceful Restart
 	 * Capability" to a neighbor MUST perform the following upon receiving
 	 * a route from that neighbor with the "LLGR_STALE" community, or upon
@@ -1000,6 +1181,10 @@ int bgp_path_info_cmp(struct bgp *bgp, struct bgp_path_info *new,
 
 	new_p = bgp_dest_get_prefix(new->net);
 
+	/* 【EVPN MAC/IP 路由的专用裁决，RFC7432 §15.2 及 MAC 移动性扩展】
+	 * EVPN 不能只按“本地优先”判断，要看 MAC 移动性序列号(MAC Mobility seq)。
+	 * 依次比较：sticky 标志 > 相同 ES 时本地路径优先 > MM 序列号大者优先 >
+	 * 序列号相同则非 proxy 优先 > 再平局则 IP 小者优先。 */
 	/* For EVPN routes, we cannot just go by local vs remote, we have to
 	 * look at the MAC mobility sequence number, if present.
 	 */
@@ -1153,6 +1338,8 @@ int bgp_path_info_cmp(struct bgp *bgp, struct bgp_path_info *new,
 		}
 	}
 
+	/* 【第 0 步：管理距离(cmp_distance)】当一方是本地重分发
+	 * (BGP_ROUTE_REDISTRIBUTE)、另一方可直接安装时，先比管理距离。 */
 	/* 0. Admin distance check when one path is locally redistributed, and
 	 *    the other path is eligible for installation.
 	 */
@@ -1170,6 +1357,8 @@ int bgp_path_info_cmp(struct bgp *bgp, struct bgp_path_info *new,
 		}
 	}
 
+	/* 【第 1 步：权重(weight)】本地概念，不随报文传递，数值大者优。
+	 * 这是全局最高优先级规则，一旦分出高低即返回。 */
 	/* 1. Weight check. */
 	new_weight = newattr->weight;
 	exist_weight = existattr->weight;
@@ -1192,6 +1381,8 @@ int bgp_path_info_cmp(struct bgp *bgp, struct bgp_path_info *new,
 		return 0;
 	}
 
+	/* 【第 2 步：本地优先级(local-pref)】数值大者优。双方缺省用
+	 * bgp->default_local_pref 补齐（缺属性时等价于默认值）。 */
 	/* 2. Local preference check. */
 	new_pref = exist_pref = bgp->default_local_pref;
 
@@ -1229,6 +1420,8 @@ int bgp_path_info_cmp(struct bgp *bgp, struct bgp_path_info *new,
 	 * This extra step MUST only be invoked during the best path selection
 	 * process of VPN-IP routes.
 	 */
+	/* 【ACCEPT_OWN 插入步，RFC7611】紧随 local-pref 之后。VPN-IP 路由比较中，
+	 * 带 ACCEPT_OWN 团体的路由优先于不带者（用于某些跨域 VPN 与自身路由冲突场景）。 */
 	if (safi == SAFI_MPLS_VPN &&
 	    (CHECK_FLAG(new->peer->af_flags[afi][safi], PEER_FLAG_ACCEPT_OWN) ||
 	     CHECK_FLAG(exist->peer->af_flags[afi][safi],
@@ -1263,6 +1456,9 @@ int bgp_path_info_cmp(struct bgp *bgp, struct bgp_path_info *new,
 		}
 	}
 
+	/* 【第 3 步：本地路由优先】sub_type 非 NORMAL 也非 IMPORTED 的（即
+	 * STATIC/AGGREGATE/REDISTRIBUTE 这类本地产生的路径）优先于从邻居学来的普通路径。
+	 * new_origin = “它是本地产生的路径”。 */
 	/* 3. Local route check. We prefer:
 	 *  - BGP_ROUTE_STATIC
 	 *  - BGP_ROUTE_AGGREGATE
@@ -1288,6 +1484,8 @@ int bgp_path_info_cmp(struct bgp *bgp, struct bgp_path_info *new,
 		return 0;
 	}
 
+	/* 【第 3.5 步：AIGP(Metric TLV) 裁决，RFC7311】仅在双方都带 AIGP 且开启了
+	 * bestpath compare-aigp 时生效：累计 AIGP 度量小者优。 */
 	/* 3.5. Tie-breaker - AIGP (Metric TLV) attribute */
 	if (bgp_attr_exists(newattr, BGP_ATTR_AIGP) && bgp_attr_exists(existattr, BGP_ATTR_AIGP) &&
 	    CHECK_FLAG(bgp->flags, BGP_FLAG_COMPARE_AIGP)) {
@@ -1342,6 +1540,10 @@ int bgp_path_info_cmp(struct bgp *bgp, struct bgp_path_info *new,
 	new = bgp_get_imported_bpi_ultimate(new);
 	exist = bgp_get_imported_bpi_ultimate(exist);
 
+	/* 【第 4 步：AS_PATH 长度】短者优。开启 bestpath as-path confed 时，
+	 * 长度要把 Confederation 段也计入（hops + confeds）。关闭 aspath-ignore
+	 * 时才比较。注意：此处起对“可修改属性”到底取本源(ultimate)还是导入后
+	 * 的属性，由 use-imported-attributes 决定（见上方 1513 行附近的切换）。 */
 	/* 4. AS path length check. */
 	if (!CHECK_FLAG(bgp->flags, BGP_FLAG_ASPATH_IGNORE)) {
 		int exist_hops = aspath_count_hops(exist_path_for_modifiable_attr->attr->aspath);
@@ -1401,6 +1603,7 @@ int bgp_path_info_cmp(struct bgp *bgp, struct bgp_path_info *new,
 		}
 	}
 
+	/* 【第 5 步：ORIGIN 类型】数值小者优，即 IGP(0) < EGP(1) < INCOMPLETE(2)。 */
 	/* 5. Origin check. */
 	if (new_path_for_modifiable_attr->attr->origin <
 	    exist_path_for_modifiable_attr->attr->origin) {
@@ -1424,6 +1627,9 @@ int bgp_path_info_cmp(struct bgp *bgp, struct bgp_path_info *new,
 		return 0;
 	}
 
+	/* 【第 6 步：MED 比较】前提是“来自同一相邻 AS”——通过 aspath_cmp_left 判断
+	 * 左侧(最左/来源) AS 相同；联盟场景比较左侧 confed AS；纯 iBGP(internal_as_route)
+	 * 也允许比；或强制 always-compare-med。满足前提才比 MED，小者优。 */
 	/* 6. MED check. */
 	internal_as_route = (aspath_count_hops(new_path_for_modifiable_attr->attr->aspath) == 0 &&
 			     aspath_count_hops(exist_path_for_modifiable_attr->attr->aspath) == 0);
@@ -1475,6 +1681,9 @@ int bgp_path_info_cmp(struct bgp *bgp, struct bgp_path_info *new,
 	} else
 		peer_new = new->peer;
 
+	/* 【第 7 步：邻居类型】eBGP 优于 iBGP/联盟内部/EBGP-OAD。若配了
+	 * peertype multipath-relax 则不立即返回，而是记下 peer_sort_ret 继续比较，
+	 * 使不同 peer 类型也可能构成 ECMP。 */
 	/* 7. Peer type check. */
 	new_sort = peer_new->sort;
 	exist_sort = peer_exist->sort;
@@ -1511,6 +1720,8 @@ int bgp_path_info_cmp(struct bgp *bgp, struct bgp_path_info *new,
 		peer_sort_ret = 0;
 	}
 
+	/* 【第 8 步：到 NEXT_HOP 的 IGP 度量】extra->igpmetric，来自 NHT(下一跳跟踪)，
+	 * 由 zebra 提供，小者优。这里只记录 igp_metric_ret，稍后与其它裁决一起综合。 */
 	/* 8. IGP metric check. */
 	newm = existm = 0;
 
@@ -1535,6 +1746,9 @@ int bgp_path_info_cmp(struct bgp *bgp, struct bgp_path_info *new,
 		igp_metric_ret = 0;
 	}
 
+	/* 【第 9 步：CLUSTER_LIST 长度】当 IGP 度量相等、且双方都是 iBGP 时，
+	 * 用 CLUSTER_LIST 长度近似代表 IGP 跳数：短者优（路由反射器场景，RFC4456）。
+	 * 受 mpath_cfg->same_clusterlen 控制（影响 ECMP 判定）。 */
 	/* 9. Same IGP metric. Compare the cluster list length as
 	   representative of IGP hops metric. Rewrite the metric value
 	   pair (newm, existm) with the cluster list length. Prefer the
@@ -1566,6 +1780,8 @@ int bgp_path_info_cmp(struct bgp *bgp, struct bgp_path_info *new,
 		}
 	}
 
+	/* 【第 10 步：联盟(confederation)类型】eBGP 联盟成员(confed-external)
+	 * 优于联盟内部 iBGP(confed-internal)。仅在配置了联盟时生效。 */
 	/* 10. confed-external vs. confed-internal */
 	if (CHECK_FLAG(bgp->config, BGP_CONFIG_CONFEDERATION)) {
 		if (new_sort == BGP_PEER_CONFED
@@ -1595,6 +1811,13 @@ int bgp_path_info_cmp(struct bgp *bgp, struct bgp_path_info *new,
 		}
 	}
 
+	/* 【第 11 步：多路径(ECMP)等价判定】前面所有比较（含 IGP 度量）都相等时，
+	 * 判断两条路径是否“等价”以构成 multipath：*paths_eq=1。判据取决于配置：
+	 *   - 带有效标签与否必须一致，否则不能 ECMP；
+	 *   - bestpath as-path multipath-relax：放松 AS_PATH 精确匹配，视为等价；
+	 *   - iBGP：AS_PATH 完全相同才等价；
+	 *   - eBGP：远端子 AS 相同即等价。
+	 * 等价的路径都会进入 multipath 数组，交由内核做负载分担。 */
 	/* 11. Maximum path check. */
 	if (newm == existm) {
 		/* If one path has a label but the other does not, do not treat
@@ -1688,6 +1911,9 @@ int bgp_path_info_cmp(struct bgp *bgp, struct bgp_path_info *new,
 	if (peer_sort_ret >= 0)
 		return peer_sort_ret;
 
+	/* 【第 12 步：优先“更老”的路径】双方都是 eBGP 外部路径时，已处于 SELECTED
+	 * 状态的（即已是最优的）优先，避免新到的等价路径频繁抢位造成路由翻动(flap)。
+	 * 开启 bestpath compare-routerid 时跳过本步。 */
 	/* 12. If both paths are external, prefer the path that was received
 	   first (the oldest one).  This step minimizes route-flap, since a
 	   newer path won't displace an older one, even if it was the
@@ -1713,6 +1939,9 @@ int bgp_path_info_cmp(struct bgp *bgp, struct bgp_path_info *new,
 		}
 	}
 
+	/* 【第 13 步：Router-ID 比较】取 ORIGINATOR_ID（若存在，路由反射器场景）或
+	 * peer 的 remote_id，数值小者优。注释提醒：若路径为 stale，其 peer router-id
+	 * 可能为 0 导致误判，故优先用 originator-id。 */
 	/* 13. Router-ID comparison. */
 	/* If one of the paths is "stale", the corresponding peer router-id will
 	 * be 0 and would always win over the other path. If originator id is
@@ -1745,6 +1974,7 @@ int bgp_path_info_cmp(struct bgp *bgp, struct bgp_path_info *new,
 		return 0;
 	}
 
+	/* 【第 14 步：CLUSTER_LIST 长度比较】长度短者优（iBGP 反射场景）。 */
 	/* 14. Cluster length comparison. */
 	new_cluster = BGP_CLUSTER_LIST_LENGTH(new->attr);
 	exist_cluster = BGP_CLUSTER_LIST_LENGTH(exist->attr);
@@ -1769,6 +1999,9 @@ int bgp_path_info_cmp(struct bgp *bgp, struct bgp_path_info *new,
 		return 0;
 	}
 
+	/* 【第 15 步：邻居地址比较，最终平局裁决】stale 路径因 peer 信息可能不可靠，
+	 * 先判 stale（非 stale 胜）。本地配置的路径无 su_remote，按约定返回。最后按
+	 * 邻居对端地址 sockunion_cmp 比较，地址小者优。走到函数末尾仍无区别则返回 1。 */
 	/* 15. Neighbor address comparison. */
 	/* Do this only if neither path is "stale" as stale paths do not have
 	 * valid peer information (as the connection may or may not be up).
@@ -1830,6 +2063,8 @@ int bgp_path_info_cmp(struct bgp *bgp, struct bgp_path_info *new,
 }
 
 
+/* EVPN 专用比较器：包一层 bgp_path_info_cmp，固定 afi/safi = L2VPN/EVPN，
+ * 且不传 multipath 配置(NULL)，用于 EVPN 表的路径排序。 */
 int bgp_evpn_path_info_cmp(struct bgp *bgp, struct bgp_path_info *new,
 			   struct bgp_path_info *exist, int *paths_eq,
 			   bool debug)
@@ -1845,6 +2080,9 @@ int bgp_evpn_path_info_cmp(struct bgp *bgp, struct bgp_path_info *new,
 				 pfx_buf, AFI_L2VPN, SAFI_EVPN, &reason);
 }
 
+/* bgp_path_info_cmp 的“另一种返回约定”包装：返回 -1 表示 new 更优、1 表示 exist
+ * 更优、0 表示二者等价（可做 multipath）。用于需要 cmp 风格返回值（而非 0/1 布尔）
+ * 的调用点。 */
 /* Compare two bgp route entity.  Return -1 if new is preferred, 1 if exist
  * is preferred, or 0 if they are the same (usually will only occur if
  * multipath is enabled
@@ -1872,6 +2110,12 @@ int bgp_path_info_cmp_compatible(struct bgp *bgp, struct bgp_path_info *new,
 	return ret;
 }
 
+/* ========== 3. 入向/出向策略过滤与属性修饰 ========== */
+
+/* 入向过滤(输入策略)：对该邻居、该地址族的入方向过滤链依次应用
+ * distribute-list(access-list) → prefix-list → filter-list(AS 路径列表)，
+ * 任一命中 DENY 即拒绝该前缀。返回 FILTER_PERMIT 或 FILTER_DENY。
+ * 调用时机：bgp_update 收到 NLRI 后、写 RIB 前。 */
 static enum filter_type bgp_input_filter(struct peer *peer,
 					 const struct prefix *p,
 					 struct attr *attr, afi_t afi,
@@ -1930,6 +2174,9 @@ done:
 #undef FILTER_EXIST_WARN
 }
 
+/* 出向过滤(输出策略)：与 bgp_input_filter 对称，作用在向该邻居通告方向，
+ * 依次应用 distribute-list → prefix-list → filter-list。返回 PERMIT/DENY。
+ * 调用时机：subgroup_announce_check 组包前判断该前缀是否可发给本邻居。 */
 static enum filter_type bgp_output_filter(struct peer *peer,
 					  const struct prefix *p,
 					  struct attr *attr, afi_t afi,
@@ -1988,6 +2235,9 @@ done:
 #undef FILTER_EXIST_WARN
 }
 
+/* 团体属性“出向抑制”检查：若路由带 NO_ADVERTISE 则绝不外发；带 NO_EXPORT 则不
+ * 发给 eBGP（含联盟外）；带 NO_EXPORT_SUBCONFED 则不发给 eBGP 与联盟内成员。
+ * 返回 true 表示“不要发给这个 peer”。RFC1997 定义的 WELL-KNOWN 团体语义。 */
 /* If community attribute includes no_export then return 1. */
 static bool bgp_community_filter(struct peer *peer, struct attr *attr)
 {
@@ -2012,6 +2262,9 @@ static bool bgp_community_filter(struct peer *peer, struct attr *attr)
 	return false;
 }
 
+/* 路由反射环路检查（RFC4456）：若属性里的 CLUSTER_LIST 已包含本机的 cluster-id
+ * （未配时用 router-id 代替），说明该路由已经过本反射器一圈，会造成环路，返回 true
+ * 表示“不要收/不要发”。 */
 /* Route reflection loop check.  */
 static bool bgp_cluster_filter(struct peer *peer, struct attr *attr)
 {
@@ -2030,6 +2283,13 @@ static bool bgp_cluster_filter(struct peer *peer, struct attr *attr)
 	return false;
 }
 
+/* Only-to-Customer (OTC) 属性入向处理（RFC9234 §5）。按本机在该邻居上扮演的
+ * 角色(role)决定：
+ *   - 若报文已带 OTC：本机是 provider/RS-server 时收到即拒（说明对方违规）；
+ *     本机是 peer 且 OTC 值 != 对端 AS 时也拒；否则放行。**返回值 true = 拒绝**。
+ *   - 若未带 OTC：当本机是 customer/peer/RS-client 时，给属性补上 OTC=对端 AS
+ *     （RFC 要求 “only to customer” 方向需打标）。
+ * 返回 true 表示这条路由应被丢弃(filter)。 */
 static bool bgp_otc_filter(struct peer *peer, struct attr *attr)
 {
 	if (bgp_attr_exists(attr, BGP_ATTR_OTC)) {
@@ -2049,6 +2309,11 @@ static bool bgp_otc_filter(struct peer *peer, struct attr *attr)
 	return false;
 }
 
+/* OTC 属性的出向(egress)处理（RFC9234 §5）。以本机在该邻居上的角色判断：
+ *   - 报文已带 OTC：本机是 customer/RS-client/peer 时拒发（不该把 OTC 传给这些
+ *     方向）；否则放行。
+ *   - 未带 OTC：本机是 provider/peer/RS-server 时，补上 OTC=本机 AS 再发。
+ * 返回 true 表示“不要发给该邻居”。 */
 static bool bgp_otc_egress(struct peer *peer, struct attr *attr)
 {
 	if (bgp_attr_exists(attr, BGP_ATTR_OTC)) {
@@ -2067,11 +2332,19 @@ static bool bgp_otc_egress(struct peer *peer, struct attr *attr)
 	return false;
 }
 
+/* 角色(role)功能是否适用于该地址族：仅 IPv4/IPv6 单播。用于决定是否执行
+ * OTC/角色相关处理。 */
 static bool bgp_check_role_applicability(afi_t afi, safi_t safi)
 {
 	return ((afi == AFI_IP || afi == AFI_IP6) && safi == SAFI_UNICAST);
 }
 
+/* 入向属性修改：应用该邻居的入方向 route-map（默认取 ROUTE_MAP_IN_NAME），
+ * 可改写 weight/attributes。返回 RMAP_PERMIT 或 RMAP_DENY。
+ * 实现细节：为让 route-map 的 match/set 能访问到统一上下文，临时构造一个
+ * 栈上的 rmap_path(bgp_path_info) 与 extra，把 attr/peer/net/labels 挂上去，
+ * 再调用 route_map_apply。rmap_type 置 PEER_RMAP_TYPE_IN 以区分方向。
+ * 调用时机：bgp_update 里，属性解析后、写 RIB 前。 */
 static int bgp_input_modifier(struct peer *peer, const struct prefix *p,
 			      struct attr *attr, afi_t afi, safi_t safi,
 			      const char *rmap_name, mpls_label_t *label,
@@ -2127,6 +2400,9 @@ static int bgp_input_modifier(struct peer *peer, const struct prefix *p,
 	return RMAP_PERMIT;
 }
 
+/* 出向属性修改：应用该邻居的出方向 route-map 改写属性，返回 RMAP_PERMIT/DENY。
+ * rmap_name 为空直接放行（表示“按现状展示”）；指定了名字却找不到 map 视为
+ * 隐式 deny（配置错误保护）。rmap_type 临时置 PEER_RMAP_TYPE_OUT。 */
 static int bgp_output_modifier(struct peer *peer, const struct prefix *p,
 			       struct attr *attr, afi_t afi, safi_t safi,
 			       const char *rmap_name)
@@ -2181,6 +2457,13 @@ static int bgp_output_modifier(struct peer *peer, const struct prefix *p,
 	return RMAP_PERMIT;
 }
 
+/* eBGP 的 remove-private-AS（RFC6996）：向 eBGP 邻居发路由时，若本邻居配了该
+ * 功能，把 AS_PATH 里的私有 AS（64512-65534 / 4200000000-4294967294）删掉或
+ * 替换成本机 AS。分两档：
+ *   - *_ALL：作用于整个 AS_PATH 中所有私有 AS；
+ *   - 无 ALL：仅当整条 AS_PATH 全是私有 AS 时才处理。
+ * 另有 _REPLACE 变体：删除改成“替换为对端 AS/本机 AS”，避免前缀被丢弃。
+ * 注意：即便删除也要 walk 整个 AS_PATH 以保留所有等于对端 AS 的实例，防成环。 */
 /* If this is an EBGP peer with remove-private-AS */
 static void bgp_peer_remove_private_as(struct bgp *bgp, afi_t afi, safi_t safi,
 				       struct peer *peer, struct attr *attr)
@@ -2235,6 +2518,10 @@ static void bgp_peer_remove_private_as(struct bgp *bgp, afi_t afi, safi_t safi,
 	}
 }
 
+/* eBGP 的 as-override：若本邻居配了 as-override，把 AS_PATH 中等于“对端 AS”的
+ * 实例全部替换成本机 AS。典型用于 MPLS L3VPN 汇聚场景，让 PE-CE 间 AS 环检测
+ * 不误伤（RFC 无需专门条款，常见实现）。注意引用计数：仅在共享(引用中)的 aspath
+ * 上先 dup 再改，避免误改他人共享对象。 */
 /* If this is an EBGP peer with as-override */
 static void bgp_peer_as_override(struct bgp *bgp, afi_t afi, safi_t safi,
 				 struct peer *peer, struct attr *attr)
@@ -2255,6 +2542,9 @@ static void bgp_peer_as_override(struct bgp *bgp, afi_t afi, safi_t safi,
 	}
 }
 
+/* 给属性追加 LLGR_STALE 团体（RFC9494）。先把团体表转成字符串形式 "llgr-stale"，
+ * 与已有团体合并去重排序后再设回；若原本无团体则直接复制该团体。
+ * 注意引用计数：合并前对 old 做 dup，避免改动共享对象。 */
 void bgp_attr_add_llgr_community(struct attr *attr)
 {
 	struct community *old;
@@ -2284,6 +2574,8 @@ void bgp_attr_add_llgr_community(struct attr *attr)
 	bgp_attr_set_community(attr, new);
 }
 
+/* 给属性追加 GSHUT(Graceful Shutdown) 团体（RFC8326）。做法与
+ * bgp_attr_add_llgr_community 相同：合并去重后设回。 */
 void bgp_attr_add_gshut_community(struct attr *attr)
 {
 	struct community *old;
@@ -2318,6 +2610,9 @@ void bgp_attr_add_gshut_community(struct attr *attr)
 }
 
 
+/* 通知“条件通告(conditional advertisement)”扫描进程：把该子组 peer 的
+ * advmap_table_change 标记置位，促使扫描器重新评估 advertise-map 条件。
+ * 无 advertise-map 配置或非配置节点则直接返回。 */
 /* Notify BGP Conditional advertisement scanner process. */
 void bgp_notify_conditional_adv_scanner(struct update_subgroup *subgrp)
 {
@@ -2336,6 +2631,8 @@ void bgp_notify_conditional_adv_scanner(struct update_subgroup *subgrp)
 }
 
 
+/* 按地址族把属性里的下一跳字段清零（重置）。用于需要重新计算下一跳前先清空，
+ * 避免残留旧值。family 取 AF_INET/AF_INET6/AF_EVPN，分别清 v4/v6/EVPN 的下一跳。 */
 void subgroup_announce_reset_nhop(uint8_t family, struct attr *attr)
 {
 	if (family == AF_INET) {
@@ -2348,6 +2645,23 @@ void subgroup_announce_reset_nhop(uint8_t family, struct attr *attr)
 		memset(&attr->mp_nexthop_global_in, 0, BGP_ATTR_NHLEN_IPV4);
 }
 
+/* ========== 4. 出向通告检查与属性加工：subgroup_announce_check ========== */
+
+/* 【出向“这条路由能否发给本子组”总检查 + 出向属性加工】。update-group 在把
+ * 一条路径重新编码发给某个子组前调用：若允许通告，则把最终要发送的属性填充到
+ * attr（必要时按 peer 改写 nexthop/AS_PATH/local-pref 等），返回 true；否则返回
+ * false 表示过滤掉不发。
+ * 参数：dest 前缀节点、pi 该路径、subgrp 目标更新子组（代表一组属性相同的 peer）、
+ *       p 前缀、attr 出参（最终发送属性）、post_attr 出参（用于附加后处理）。
+ * 主要关卡（顺序即函数内顺序）：
+ *   - 出向最大前缀数(max-prefix out)超限 → 不发；
+ *   - 路径本身必须 VALID 且非 HISTORY/REMOVED；非 bestpath 需有 addpath 需求；
+ *   - 被聚合抑制(suppressed)且无 unsuppress-map → 不发；
+ *   - labeled-unicast/VPN 标签有效性校验；
+ *   - 不回发给来源(onlypeer)；
+ *   - 配置了 default-originate 时不从表里再发缺省路由；
+ *   - 之后进入“透明(transparent)”/下一跳改写/AS_PATH 处理/route-map 等大段逻辑。
+ * 这是理解 BGP 出向行为最关键的函数，建议对照 show ip bgp neighbors ... advertised。 */
 bool subgroup_announce_check(struct bgp_dest *dest, struct bgp_path_info *pi,
 			     struct update_subgroup *subgrp,
 			     const struct prefix *p, struct attr *attr,
@@ -2556,6 +2870,8 @@ bool subgroup_announce_check(struct bgp_dest *dest, struct bgp_path_info *pi,
 	}
 
 	/* ORF prefix-list filter check */
+	/* ORF(Outbound Route Filtering，RFC5291)：若对端用 ORF 下发了“不希望收到”
+	 * 的前缀列表，则按对端维护的 orf_plist 过滤，命中 DENY 即不发。 */
 	if (CHECK_FLAG(peer->af_cap[afi][safi], PEER_CAP_ORF_PREFIX_RM_ADV) &&
 	    CHECK_FLAG(peer->af_cap[afi][safi], PEER_CAP_ORF_PREFIX_SM_RCV))
 		if (peer->orf_plist[afi][safi]) {
@@ -2574,6 +2890,9 @@ bool subgroup_announce_check(struct bgp_dest *dest, struct bgp_path_info *pi,
 			}
 		}
 
+	/* 【RFC8212 route-leak 防护】eBGP 会话必须显式配置出向策略，否则默认不发。
+	 * 若配了 ebgp-requires-policy 且该 peer 无出向策略，则告警并按“不发送”处理
+	 * （默认拒绝安全模型）。告警做了 15 分钟限频。 */
 	/* RFC 8212 to prevent route leaks.
 	 * This specification intends to improve this situation by requiring the
 	 * explicit configuration of both BGP Import and Export Policies for any
@@ -2595,6 +2914,7 @@ bool subgroup_announce_check(struct bgp_dest *dest, struct bgp_path_info *pi,
 			return false;
 		}
 
+	/* 【出向过滤链检查】distribute/prefix/filter-list，命中 DENY 不发。 */
 	/* Output filter check. */
 	if (bgp_output_filter(peer, p, piattr, afi, safi) == FILTER_DENY) {
 		if (bgp_debug_update(NULL, p, subgrp->update_group, 0))
@@ -2606,6 +2926,7 @@ bool subgroup_announce_check(struct bgp_dest *dest, struct bgp_path_info *pi,
 		return false;
 	}
 
+	/* 【AS_PATH 环检测】若对端 AS 已在本路径 AS_PATH 中，则不能发（会成环）。 */
 	/* AS path loop check. */
 	if (CHECK_FLAG(peer->flags, PEER_FLAG_AS_LOOP_DETECTION) &&
 	    aspath_loop_check(piattr->aspath, peer->as)) {
@@ -2639,6 +2960,12 @@ bool subgroup_announce_check(struct bgp_dest *dest, struct bgp_path_info *pi,
 	else
 		ibgp_to_ibgp = 0;
 
+	/* 【iBGP 反射规则，RFC4456】iBGP→iBGP 时：
+	 *   - 来自 client 的路由：反射给所有非 client（以及其它 client）；
+	 *     若配了 no client-to-client reflection 则不再反射给其它 client；
+	 *   - 来自非 client 的路由：只反射给其它 client（否则会形成非反射器的
+	 *     iBGP 全互联需求）。
+	 * samepeer_safe 用于合成/导入的 VPN 路由，跳过这些限制。 */
 	/* IBGP reflection check. */
 	if (ibgp_to_ibgp && !samepeer_safe) {
 		/* A route from a Client peer. */
@@ -2684,6 +3011,7 @@ bool subgroup_announce_check(struct bgp_dest *dest, struct bgp_path_info *pi,
 		attr->local_pref = bgp->default_local_pref;
 	}
 
+	/* 反射路由时补 ORIGINATOR_ID=来源 peer 的 router-id（RFC4456），用于防环。 */
 	/* If originator-id is not set and the route is to be reflected,
 	   set the originator id */
 	if (ibgp_to_ibgp && (!bgp_attr_exists(attr, BGP_ATTR_ORIGINATOR_ID))) {
@@ -2691,6 +3019,8 @@ bool subgroup_announce_check(struct bgp_dest *dest, struct bgp_path_info *pi,
 		bgp_attr_set(attr, BGP_ATTR_ORIGINATOR_ID);
 	}
 
+	/* 发给 eBGP 邻居时移除 MED（除非来源是自身、透明模式、或配了 med-unchanged）。
+	 * 后续 route-map 可再重新设置 MED。 */
 	/* Remove MED if its an EBGP peer - will get overwritten by route-maps
 	 */
 	if (peer->sort == BGP_PEER_EBGP && peer->sub_sort != BGP_PEER_EBGP_OAD &&
@@ -2780,6 +3110,7 @@ bool subgroup_announce_check(struct bgp_dest *dest, struct bgp_path_info *pi,
 			memset(&attr->mp_nexthop_local, 0, IPV6_MAX_BYTELEN);
 	}
 
+	/* OTC 出向处理（RFC9234）：按角色决定补 OTC 或不发。 */
 	if (bgp_check_role_applicability(afi, safi) &&
 	    bgp_otc_egress(peer, attr))
 		return false;
@@ -2810,6 +3141,10 @@ bool subgroup_announce_check(struct bgp_dest *dest, struct bgp_path_info *pi,
 			return false;
 	}
 
+	/* 【应用出向 route-map 或 unsuppress-map】被聚合抑制的路径用 unsuppress-map
+	 * （可能放行），否则用 out route-map。注意：路由器反射场景下默认不允许改写
+	 * 被反射的 iBGP 路由属性，故把 attr 复制到 dummy_attr 上让 map 改副本
+	 * （除非配了 bgp rr allow-outbound-policy）。 */
 	/* Route map & unsuppress-map apply. */
 	if (!post_attr &&
 	    (ROUTE_MAP_OUT_NAME(filter) || bgp_path_suppressed(pi))) {
@@ -2936,10 +3271,13 @@ bool subgroup_announce_check(struct bgp_dest *dest, struct bgp_path_info *pi,
 		}
 	}
 
+	/* AS 0 处理（RFC7607）：AS_PATH 中不允许出现 AS 0，含则不发。 */
 	/* Codification of AS 0 Processing */
 	if (aspath_check_as_zero(attr->aspath))
 		return false;
 
+	/* 平滑关闭(Graceful Shutdown, RFC8326)：本机或该 peer 处于 gshut 时，
+	 * 对 iBGP/联盟/OAD 降低 local-pref，对 eBGP 追加 GSHUT 团体。 */
 	if ((bgp_in_graceful_shutdown(bgp)) ||
 	    (CHECK_FLAG(peer->flags, PEER_FLAG_GRACEFUL_SHUTDOWN))) {
 		if (peer->sort == BGP_PEER_IBGP ||
@@ -2952,6 +3290,8 @@ bool subgroup_announce_check(struct bgp_dest *dest, struct bgp_path_info *pi,
 		}
 	}
 
+	/* LLGR(RFC9494)：带 LLGR_STALE 团体的路由，不应发给任何未与我们对等协商
+	 * Long-Lived-GR 能力的邻居。 */
 	/* A BGP speaker that has advertised the "Long-lived Graceful Restart
 	 * Capability" to a neighbor MUST perform the following upon receiving
 	 * a route from that neighbor with the "LLGR_STALE" community, or upon
@@ -2985,6 +3325,10 @@ bool subgroup_announce_check(struct bgp_dest *dest, struct bgp_path_info *pi,
 	 * example,
 	 * it is configured as 'peer-address'.
 	 */
+	/* 【下一跳处理】若 route-map 未改下一跳、非透明、且未配 nexthop-unchanged，
+	 * 则可把下一跳“重置为自身”：配置了 nexthop-self/force-nexthop-self 时清零让
+	 * 发送时填本机地址；发给 eBGP 且子组内无人与本机同网段时也可清零；
+	 * 泄漏的 vpn-vrf 路由(BGP_PATH_ANNC_NH_SELF)同样清零。nh_reset 记录是否发生。 */
 	if (!bgp_rmap_nhop_changed(attr->rmap_change_flags) && !transparent &&
 	    !CHECK_FLAG(peer->af_flags[afi][safi], PEER_FLAG_NEXTHOP_UNCHANGED)) {
 		/* We can reset the nexthop, if setting (or forcing) it to
@@ -3078,6 +3422,8 @@ bool subgroup_announce_check(struct bgp_dest *dest, struct bgp_path_info *pi,
 	 *   defined as non-transitive in [RFC8097], can be advertised to
 	 *   peers in the same OAD.
 	 */
+	/* iBGP（或 eBGP-OAD）发送 Origin Validation State(OVS) 扩展团体（RFC8097）：
+	 * 把该前缀的 RPKI 校验状态通过 hook 取出并编码进扩展团体。 */
 	if ((peer->sort == BGP_PEER_IBGP ||
 	     peer->sub_sort == BGP_PEER_EBGP_OAD) &&
 	    peergroup_af_flag_check(peer, afi, safi,
@@ -3100,6 +3446,8 @@ bool subgroup_announce_check(struct bgp_dest *dest, struct bgp_path_info *pi,
 	 * the most sense. However, don't modify if the link-bandwidth has
 	 * been explicitly set by user policy.
 	 */
+	/* 当下一跳被改成自身、且所有 multipath 都启用了链路带宽时，通告累计带宽
+	 * （除非用户 route-map 已显式设置过 link-bandwidth）。 */
 	if (nh_reset && bgp_path_info_mpath_chkwtd(bgp, pi->net) == BGP_WECMP_BEHAVIOR_LINK_BW &&
 	    (cum_bw = bgp_path_info_mpath_cumbw(pi->net)) != 0 &&
 	    !CHECK_FLAG(attr->rmap_change_flags, BATTR_RMAP_LINK_BW_SET)) {
@@ -3127,6 +3475,8 @@ bool subgroup_announce_check(struct bgp_dest *dest, struct bgp_path_info *pi,
 	 * EBGP. Note in route reflection the nexthop is usually unmodified
 	 * and the AIGP should not be adjusted in that case.
 	 */
+	/* 下一跳改为自身或改成 peer-address 时，需按本机到源的 AIGP 累计值调整
+	 * AIGP 属性（RFC7311）；路由反射（下一跳通常不变）时不调整。 */
 	if (bgp_attr_exists(attr, BGP_ATTR_AIGP) && AIGP_TRANSMIT_ALLOWED(peer)) {
 		if (nh_reset ||
 		    CHECK_FLAG(attr->rmap_change_flags, BATTR_RMAP_NEXTHOP_PEER_ADDRESS)) {
@@ -3149,6 +3499,9 @@ bool subgroup_announce_check(struct bgp_dest *dest, struct bgp_path_info *pi,
 	 * defined as non-transitive in [RFC8097], can be advertised to
 	 * peers in the same OAD.
 	 */
+	/* eBGP→eBGP 转发普通路径时，剥离“非传递”扩展团体（如 link-bandwidth、
+	 * 部分 OVS），它们不应跨越 AS 边界（除非同属一个 OAD）。RFC 规定非传递
+	 * 扩展团体不得外传。 */
 	if (from->sort == BGP_PEER_EBGP && from->sub_sort != BGP_PEER_EBGP_OAD &&
 	    peer->sort == BGP_PEER_EBGP && peer->sub_sort != BGP_PEER_EBGP_OAD &&
 	    pi->sub_type == BGP_ROUTE_NORMAL) {
@@ -3192,6 +3545,9 @@ bool subgroup_announce_check(struct bgp_dest *dest, struct bgp_path_info *pi,
 	return true;
 }
 
+/* 路由选择延迟定时器到期回调。GR(平滑重启)期间会把部分前缀的选路推迟，本定时器
+ * 到期即释放计时器资源并调用 bgp_do_deferred_path_selection 对被推迟的路径统一
+ * 执行一次选路。参数是 afi_safi_info（afi/safi/bgp）。 */
 static void bgp_route_select_timer_expire(struct event *event)
 {
 	struct afi_safi_info *info;
@@ -3219,6 +3575,20 @@ static void bgp_route_select_timer_expire(struct event *event)
 	bgp_do_deferred_path_selection(bgp, afi, safi);
 }
 
+/* ========== 5. 最佳路径选择与多路径：bgp_best_selection ========== */
+
+/* 【最佳路径选择主函数】对一个前缀节点 dest 的所有路径排序并选出：
+ *   - 最优路径 best(bgp_path_info_pair->old/new)；
+ *   - 与之等价的 multipath 集合（交由 bgp_mpath 处理）。
+ * 参数：bgp 实例、dest 前缀节点、mpath_cfg 多路径配置（maxpaths_ebgp/ibgp 等）、
+ *       result 出参（保存旧/新最优路径，供调用者做 diff）、afi/safi。
+ * 三种关键模式：
+ *   1) deterministic-med：先按“来源 AS 相同”分组，组内选出代表再跨组比较，
+ *      使 MED 比较结果与路由到达顺序无关（更确定）；
+ *   2) 常规：对候选路径两两用 bgp_path_info_cmp 排序，维护 new_select；
+ *   3) multipath：等价路径打上 BGP_PATH_MULTIPATH 并登记到 mpath 数组。
+ * 复杂度 O(N^2)，N 为该前缀路径数；排序后路径链表变为有序（去掉 UNSORTED）。
+ * 返回结果写入 result->old/new；caller（bgp_process_main_one）据此判断路由是否变化。 */
 void bgp_best_selection(struct bgp *bgp, struct bgp_dest *dest,
 			struct bgp_maxpaths_cfg *mpath_cfg,
 			struct bgp_path_info_pair *result, afi_t afi,
@@ -3317,6 +3687,9 @@ void bgp_best_selection(struct bgp *bgp, struct bgp_dest *dest,
 		}
 	}
 
+	/* 【分离未排序项】把链表中带 BGP_PATH_UNSORTED 的路径（新加入的）或 peer 未
+	 * 处于 Established 的路径先摘下，放入临时 unsorted_list，稍后逐条插入到正确的
+	 * 有序位置，从而避免每次新增路径都要全量重排。 */
 	/*
 	 * Let's grab the unsorted items from the list
 	 */
@@ -3506,6 +3879,9 @@ void bgp_best_selection(struct bgp *bgp, struct bgp_dest *dest,
 						 BGP_PATH_DMED_CHECK);
 			reason = dest->reason;
 			any_comparisons = true;
+				/* 逐条与已排序链表中的每条比较，找到 first 应插入的位置(其前驱
+			 * worse)。reason 记录“first 胜出/落败发生在哪一步”，最终写到
+			 * pi->reason 与 dest->reason，供 show 展示选路原因。 */
 			if (bgp_path_info_cmp(bgp, first, look_thru, &paths_eq,
 					      mpath_cfg, debug, pfx_buf, afi,
 					      safi, &reason)) {
@@ -3606,6 +3982,9 @@ void bgp_best_selection(struct bgp *bgp, struct bgp_dest *dest,
 			bgp_dest_set_bgp_path_info(dest, unsorted_holddown);
 	}
 
+	/* 【多路径(ECMP)判定】已确定最优路径后，遍历其余路径看哪些与最优“等价”
+	 * (paths_eq)，等价的打上 BGP_PATH_MULTIPATH_NEW 并计入候选数，随后由
+	 * bgp_path_info_mpath_update 统一写入 mpath 数组（受 maxpaths 上限约束）。 */
 	/* Now that we know which path is the bestpath see if any of the other
 	 * paths
 	 * qualify as multipaths
@@ -3664,11 +4043,15 @@ void bgp_best_selection(struct bgp *bgp, struct bgp_dest *dest,
 		}
 	}
 
+	/* 把候选等价路径正式登记进 mpath（做上限裁剪、挑出代表路径），并刷新聚合
+	 * 带宽等；再按 RFC7911 重新分配 addpath 的发送侧 path-id。 */
 	bgp_path_info_mpath_update(bgp, dest, new_select, old_select, num_candidates, mpath_cfg);
 	bgp_path_info_mpath_aggregate_update(new_select, old_select);
 
+	/* 为 add-path 发送侧分配/更新 path-id（RFC7911）。 */
 	bgp_addpath_update_ids(bgp, dest, afi, safi);
 
+	/* 出参：旧最优(可能为 NULL)与新最优路径，供 caller 判定是否发生路由变化。 */
 	result->old = old_select;
 	result->new = new_select;
 
@@ -3679,6 +4062,15 @@ void bgp_best_selection(struct bgp *bgp, struct bgp_dest *dest,
  * A new route/change in bestpath of an existing route. Evaluate the path
  * for advertisement to the subgroup.
  */
+/* 把选出的最优/被通告路径交给更新子组，触发向该子组所有 peer 的“宣告或撤回”。
+ * 参数：
+ *   subgrp        —— 目标更新子组；
+ *   selected      —— 要通告的路径（NULL 表示撤回）；
+ *   dest          —— 前缀节点；
+ *   afi/safi      —— 地址族；
+ *   addpath_tx_id —— RFC7911 add-path 发送侧 path-id。
+ * 内部先经 subgroup_announce_check 决定能否发、并生成最终属性，再调 bgp_adj_out_set/
+ * bgp_adj_out_unset 入队。是“变化的路由从 RIB 走到通告队列”的最后一环。 */
 void subgroup_process_announce_selected(struct update_subgroup *subgrp,
 					struct bgp_path_info *selected,
 					struct bgp_dest *dest, afi_t afi,
@@ -3765,6 +4157,8 @@ void subgroup_process_announce_selected(struct update_subgroup *subgrp,
 	}
 }
 
+/* 清除该前缀所有路径上的 IGP_CHANGED 与 ATTR_CHANGED 标志。在每次路由处理结束
+ * 时调用，表示“这些变化已被消化掉”，供下次判断是否需要再下发 zebra 使用。 */
 /*
  * Clear IGP changed flag and attribute changed flag for a route (all paths).
  * This is called at the end of route processing.
@@ -3781,6 +4175,10 @@ void bgp_zebra_clear_route_change_flags(struct bgp_dest *dest)
 	}
 }
 
+/* 判断“从 RIB 的角度看这条路由是否发生了变化”，用于决定是否需要更新 zebra。
+ * 仅在选路结果仍是最佳路径不变时调用（最佳路径变了自然要下发）。检查该路径自身
+ * 及所有 multipath 成员的 IGP_CHANGED/MULTIPATH_CHG/LINK_BW_CHG/ATTR_CHANGED
+ * 标志，任一置位即认为需要重新下发。 */
 /*
  * Has the route changed from the RIB's perspective? This is invoked only
  * if the route selection returns the same best route as earlier - to
@@ -3815,6 +4213,9 @@ bool bgp_zebra_has_route_changed(struct bgp_path_info *selected)
 	return false;
 }
 
+/* EVPN Type-5(IP Prefix)路由注入：当 IPv4/IPv6 单播路由变化且开启了
+ * “advertise ipv4/ipv6 unicast”时，把最优单播路由编码成 EVPN Type-5 通告给
+ * EVPN 对端；路由被撤销时相应撤回。可选经过 adv_cmd_rmap 过滤。 */
 static void bgp_process_evpn_route_injection(struct bgp *bgp, afi_t afi,
 					     safi_t safi, struct bgp_dest *dest,
 					     struct bgp_path_info *new_select,
@@ -3868,6 +4269,11 @@ static void bgp_process_evpn_route_injection(struct bgp *bgp, afi_t afi,
 		bgp_evpn_withdraw_type5_route(bgp, old_select, p, afi, safi, 0);
 }
 
+/* 判断某条 BGP-LU(Labeled-Unicast)路径是否应使用“空标签(null label)”。
+ * 本地产生的路径(STATIC/AGGREGATE/REDISTRIBUTE)或无有效标签的路径需要；
+ * 具体取 implicit-null(PHP) 还是 explicit-null，由 lu-ipv4/ipv6-explicit-null
+ * 配置决定（1 表示禁用 PHP 改用 explicit-null）。返回 true 表示需要，
+ * 并把选定的标签写入 *label。 */
 /*
  * Utility to determine whether a particular path_info should use
  * the IMPLICIT_NULL label. This is pretty specialized: it's only called
@@ -3903,6 +4309,10 @@ need_null_label:
 	return true;
 }
 
+/* BGP-LU 本地标签的分配/回收。由于是“每前缀一个标签”，通常不必在每次最佳路径
+ * 变化时重算；仅在以下情形才处理：标签索引变了 / sub_type 变化(在空标签与普通标签
+ * 间切换) / 原标签失效。逻辑：需要空标签则注销标签注册并直接设 implicit/explicit
+ * null；否则向 zebra 注册为该前缀请求/分配标签(bgp_register_for_label)。 */
 /* Right now, since we only deal with per-prefix labels, it is not
  * necessary to do this upon changes to best path. Exceptions:
  * - label index has changed -> recalculate resulting label
@@ -3955,6 +4365,9 @@ static void bgp_lu_handle_label_allocation(struct bgp *bgp,
 	}
 }
 
+/* 取该路径下一跳“解析后”所对应的出接口。若下一跳无效、或下一跳为内部
+ * (IFINDEX_INTERNAL) 且非 ifindex 型，则返回 NULL。用于判断接口是否启用
+ * MPLS L3VPN switching（决定要不要做 nh-label-bind）。 */
 static struct interface *
 bgp_label_get_resolved_nh_iface(const struct bgp_path_info *pi)
 {
@@ -3975,6 +4388,9 @@ bgp_label_get_resolved_nh_iface(const struct bgp_path_info *pi)
 	return if_lookup_by_index(nh->ifindex, nh->vrf_id);
 }
 
+/* MPLS-VPN 的下一跳标签绑定(nh-label-bind)处理：当出口接口启用了 L3VPN
+ * switching、且路径带有效 MPLS 标签且非导入/静态时，为该下一跳注册本地标签
+ * （用于 VPN 的局部标签交换）；否则解除绑定。 */
 static void
 bgp_mplsvpn_handle_label_allocation(struct bgp *bgp, struct bgp_dest *dest,
 				    struct bgp_path_info *new_select,
@@ -4009,6 +4425,13 @@ bgp_mplsvpn_handle_label_allocation(struct bgp *bgp, struct bgp_dest *dest,
 	}
 }
 
+/* 【单向处理核心】对“处理队列”中取出的一个前缀节点执行完整的路由处理：
+ * 选最佳路径(bgp_best_selection) → 计算标签 → 与旧最优路径对比 → 若变化则
+ * 下发 zebra(FIB) 并通知 update-group 向邻居通告；若未变化但属性/IGP/多路径
+ * 有变化则只做必要的再通告/再下发。
+ * 参数：bgp 实例、dest 前缀节点(可空，表示“初始更新结束”信号)、afi/safi。
+ * 前驱：由 bgp_process/meta_queue 调度；后继：bgp_zebra_route_install（下发）、
+ * group_announce_route（通告）。 */
 /*
  * old_select = The old best path
  * new_select = the new best path
@@ -4089,6 +4512,8 @@ void bgp_process_main_one(struct bgp *bgp, struct bgp_dest *dest, afi_t afi, saf
 		return;
 	}
 
+	/* 【第一步：选最佳路径】用本实例该 afi/safi 的多路径配置选出 old/new。
+	 * old 是之前带 BGP_PATH_SELECTED 的路径，new 是本次选出的最优。 */
 	/* Best path selection. */
 	bgp_best_selection(bgp, dest, &bgp->maxpaths[afi][safi], &old_and_new,
 			   afi, safi);
@@ -4117,6 +4542,9 @@ void bgp_process_main_one(struct bgp *bgp, struct bgp_dest *dest, afi_t afi, saf
 			__func__, dest, bgp->name_pretty, afi2str(afi),
 			safi2str(safi), old_select, new_select);
 
+	/* 【第二步：最优路径未变（快速路径）】若仍是最优且非用户 clear 触发：
+	 * 只检查“IGP/多路径/链路带宽/属性”是否变化，有变化才重新下发 zebra 或再通告，
+	 * 然后清标志并返回（避免无谓的全量处理）。 */
 	/* If best route remains the same and this is not due to user-initiated
 	 * clear, see exactly what needs to be done.
 	 */
@@ -4183,6 +4611,7 @@ void bgp_process_main_one(struct bgp *bgp, struct bgp_dest *dest, afi_t afi, saf
 	 */
 	UNSET_FLAG(dest->flags, BGP_NODE_PROCESS_CLEAR);
 
+	/* 【第三步：最优路径发生变化】递增该前缀的表版本号（zebra 增量下发的依据）。 */
 	/* bestpath has changed; bump version */
 	if (old_select || new_select) {
 		bgp_bump_version(dest);
@@ -4196,6 +4625,9 @@ void bgp_process_main_one(struct bgp *bgp, struct bgp_dest *dest, afi_t afi, saf
 				&bgp->t_rmap_def_originate_eval);
 	}
 
+	/* 【更新 SELECTED 标志】清除旧最优的 SELECTED，给新最优打上 SELECTED，
+	 * 并清掉它身上的 ATTR_CHANGED/MULTIPATH_CHG/LINK_BW_CHG。若无新最优则说明
+	 * 该前缀无可安装路由，需要清 FIB 安装挂起计数与标志。 */
 	/* TODO BMP insert rib update hook */
 	if (old_select)
 		bgp_path_info_unset_flag(dest, old_select, BGP_PATH_SELECTED);
@@ -4243,6 +4675,9 @@ void bgp_process_main_one(struct bgp *bgp, struct bgp_dest *dest, afi_t afi, saf
 	}
 #endif
 
+	/* 【第四步：下发 FIB】把新的最优路径安装到内核（zebra）；若新最优不可安装
+	 * 则撤回旧路径。GR(BGP_GR_SKIP_BP) 时走 defer 安装路径。view 实例或
+	 * BGP_OPT_NO_FIB 时不下发。 */
 	/* FIB update. */
 	if (bgp_fibupd_safi(safi) && (bgp->inst_type != BGP_INSTANCE_TYPE_VIEW)
 	    && !bgp_option_check(BGP_OPT_NO_FIB)) {
@@ -4282,6 +4717,8 @@ void bgp_process_main_one(struct bgp *bgp, struct bgp_dest *dest, afi_t afi, saf
 
 	UNSET_FLAG(dest->flags, BGP_NODE_PROCESS_SCHEDULED);
 
+	/* 【收尾】若旧最优路径已被标记删除，此时才真正摘除它（先让它在本次处理中
+	 * 用于对比/撤回，用完再 reap）。 */
 	/* Reap old select bgp_path_info, if it has been removed */
 	if (old_select && CHECK_FLAG(old_select->flags, BGP_PATH_REMOVED))
 		bgp_path_info_reap(dest, old_select);
@@ -4289,6 +4726,10 @@ void bgp_process_main_one(struct bgp *bgp, struct bgp_dest *dest, afi_t afi, saf
 	return;
 }
 
+/* GR(平滑重启)延迟处理完成：某个 (afi,safi) 的延迟选路全部做完后调用。
+ * 动作：发送被延迟的 EoR、检查是否需要启动 tier2 定时器、向 zebra 上报
+ * ROUTE_UPDATE_COMPLETE，并在所有 afi/safi 都完成后触发整体 GR 完成
+ * (bgp_update_gr_completion)。 */
 void bgp_process_gr_deferral_complete(struct bgp *bgp, afi_t afi, safi_t safi)
 {
 	bool route_sync_pending = false;
@@ -4329,6 +4770,8 @@ void bgp_process_gr_deferral_complete(struct bgp *bgp, afi_t afi, safi_t safi)
 }
 
 /* This function increments gr_route_fib_install_pending_cnt if needed based on BGP_NODE_FIB_INSTALL_PENDING flag */
+/* GR 期间 FIB 安装挂起计数 +1：表示此前缀的 FIB 安装尚未由 zebra 确认完成。
+ * 用于 GR 时“抑制 FIB”模式下等待数据面就绪，全部确认后才继续路由选择。 */
 void bgp_dest_increment_gr_fib_install_pending_count(struct bgp_dest *dest)
 {
 	struct bgp_table *table = NULL;
@@ -4355,6 +4798,10 @@ void bgp_dest_increment_gr_fib_install_pending_count(struct bgp_dest *dest)
 	}
 }
 
+/* GR 期间 FIB 安装挂起计数 -1：前缀的 FIB 安装已被确认。若计数归零且无更多延迟
+ * 路由，则触发 GR 延迟处理完成（bgp_process_gr_deferral_complete）。
+ * 仅在“抑制 FIB”模式、GR 同步挂起、且该 dest 带 BGP_NODE_FIB_INSTALL_PENDING
+ * 时才会真正递减。 */
 /* This function decrements gr_route_fib_install_pending_cnt if needed based on BGP_NODE_FIB_INSTALL_PENDING flag */
 void bgp_dest_decrement_gr_fib_install_pending_count(struct bgp_dest *dest)
 {
@@ -4401,6 +4848,9 @@ void bgp_dest_decrement_gr_fib_install_pending_count(struct bgp_dest *dest)
 	}
 }
 
+/* 若本 (afi,safi) 配有多跳(multihop)邻居、且 tier2 定时器尚未启动，则在这里启动
+ * 它。场景：所有直连邻居都已起来后才启动 tier2；若直连邻居都没起，tier1 会超时，
+ * 但有可用多跳邻居时仍需启动 tier2 GR 定时器（见函数内注释的详细说明）。 */
 /*
  * If multihop peer is configured for this AFI SAFI and if
  * tier 2 timer has not been started yet, then this function
@@ -4457,6 +4907,10 @@ static void bgp_gr_start_tier2_timer_if_required(struct bgp *bgp, afi_t afi, saf
 	}
 }
 
+/* 启动 GR “路由选择定时器”以处理剩余被延迟的路由。构造一个 afi_safi_info
+ * 作为事件参数，延时 BGP_ROUTE_SELECT_DELAY 后触发 bgp_route_select_timer_expire。
+ * 之所以延时而非就地处理：当待处理路由超过 BGP_MAX_BEST_ROUTE_SELECT 时避免长时间
+ * 占用主线程。 */
 /*
  * Starts GR route select timer to process remaining routes
  */
@@ -4478,6 +4932,9 @@ static inline void bgp_gr_start_route_select_timer(struct bgp *bgp, afi_t afi, s
 			BGP_ROUTE_SELECT_DELAY, &bgp->gr_info[afi][safi].t_route_select);
 }
 
+/* 为所有非默认 VRF 的 IPv4/IPv6 单播表触发被延迟的最佳路径计算（通过启动
+ * route-select 定时器）。用于 EVPN 默认实例延迟计算完成后，带动各租户 VRF 也做
+ * 延迟选路；期间会置 gr_route_sync_pending 并给 zebra 报 UPDATE_PENDING。 */
 /*
  * Trigger deferred bestpath calculation for IPv4 and IPv6
  * unicast tables in non-default VRFs by starting the route-select
@@ -4558,6 +5015,13 @@ static inline void bgp_evpn_handle_deferred_bestpath_for_vrfs(void)
 	}
 }
 
+/* 对带 BGP_NODE_SELECT_DEFER 标志的路由执行“被延迟的选路”。这是 GR/批量导入场景
+ * 的收口函数：逐表遍历，对每个仍挂起延迟的前缀运行 bgp_deferred_path_selection，
+ * 受 BGP_MAX_BEST_ROUTE_SELECT 限制分批；若还有剩余则重启 route-select 定时器，
+ * 全部完成则发 EoR 并走 deferral_complete。
+ * 调用点见上方 NOTE（默认 VRF 收到 EoR 时 / 配置读入后 peer_unshut_after_cfg /
+ * 有剩余路由或 EVPN 非默认 VRF 时经 bgp_gr_start_route_select_timer）。
+ * 分派：EVPN(L2VPN/EVPN) 走 RD 表与 VNI 处理；IPv4/IPv6 单播按 VRF 走对应表。 */
 /*
  * Process the routes with the flag BGP_NODE_SELECT_DEFER set
  *
@@ -4701,6 +5165,15 @@ void bgp_do_deferred_path_selection(struct bgp *bgp, afi_t afi, safi_t safi)
 	}
 }
 
+/* ========== 6. 路由处理队列 meta_queue 与调度 ========== */
+
+/* meta_queue 是 bgpd 的“延迟处理队列”：入向更新不立即选路/下发，而是把受影响的
+ * 前缀节点 dest 排入 meta_queue，稍后由主事件循环的工作队列(work_queue)统一处理。
+ * 分三个子队列(优先级从高到低)：EARLY_ROUTE(本地产生的路由)、OTHER_ROUTE(邻居
+ * 学来的路由)、EOIU_MARKER(End-of-Initial-Update 标记)。这样一个前缀被多次更新
+ * 只处理一次，且能控制处理节奏(避免刷屏/饥饿)。 */
+
+/* 把 meta_queue 子队列索引翻译成可读字符串，仅用于调试打印。 */
 static const char *subqueue2str(enum meta_queue_indexes index)
 {
 	switch (index) {
@@ -4715,6 +5188,8 @@ static const char *subqueue2str(enum meta_queue_indexes index)
 	return "Unknown";
 }
 
+/* 从 EARLY_ROUTE 子队列取出一个 dest 并处理（bgp_process_main_one），随后释放
+ * 处理期间持有的 dest/table 引用。注释提醒：处理过程中可能新增 dest。 */
 /*
  * Process a node from the Early route subqueue.
  */
@@ -4732,6 +5207,8 @@ static void process_subq_early_route(struct bgp_dest *dest)
 	bgp_table_unlock(table);
 }
 
+/* 从 OTHER_ROUTE 子队列取出一个 dest 并处理。与 EARLY_ROUTE 版本逻辑相同，
+ * 只是来源队列不同（这些是邻居学来的路由）。 */
 /*
  * Process a node from the other subqueue.
  */
@@ -4749,6 +5226,9 @@ static void process_subq_other_route(struct bgp_dest *dest)
 	bgp_table_unlock(table);
 }
 
+/* 处理 EOIU(End-Of-Initial-Update)标记：以 dest=NULL 调用 bgp_process_main_one，
+ * 触发“初始更新结束”的收口动作（恢复 zebra/peer 更新、启动路由广播）。随后释放
+ * 标记信息与临时节点。 */
 /*
  * Process a node from the eoiu marker subqueue.
  */
@@ -4772,6 +5252,8 @@ static void process_eoiu_marker(struct bgp_dest *dest)
 	XFREE(MTYPE_BGP_NODE, dest);
 }
 
+/* 从指定子队列摘取一个节点并分派给对应的处理函数。返回 1 表示处理了一个节点，
+ * 0 表示子队列为空。这是 work_queue 回调里的“每次取一个”的粒度。 */
 /*
  * Examine the specified subqueue; process one entry and return 1 if
  * there is a node, return 0 otherwise.
@@ -4800,6 +5282,10 @@ static unsigned int process_subq(struct bgp_dest_queue *subq, enum meta_queue_in
 	return 1;
 }
 
+/* meta_queue 的 work_queue 回调：每次被调度处理一个节点。按子队列索引从小到大
+ * (EARLY_ROUTE 优先)找到第一个非空子队列取一个处理。权衡：若当前有大量 peer 连接
+ * 待处理(>10)则让出主线程(WQ_QUEUE_BLOCKED)以免饿死收包，但每 10 次也会强行处理
+ * 一次以保证进度。返回 WQ_REQUEUE 表示队列仍有内容需继续，WQ_SUCCESS 表示清空。 */
 /* Dispatch the meta queue by picking and processing the next node from
  * a non-empty sub-queue with lowest priority. wq is equal to bgp->process_queue and
  * data is pointed to the meta queue structure.
@@ -4835,6 +5321,7 @@ static wq_item_status meta_queue_process(struct work_queue *dummy, void *data)
 	return mq->size ? WQ_REQUEUE : WQ_SUCCESS;
 }
 
+/* 把一个 dest 追加到 EARLY_ROUTE 子队列尾部（本地产生路由，优先级最高）。 */
 static int early_route_meta_queue_add(struct meta_queue *mq, void *data)
 {
 	uint8_t qindex = META_QUEUE_EARLY_ROUTE;
@@ -4850,6 +5337,7 @@ static int early_route_meta_queue_add(struct meta_queue *mq, void *data)
 	return 0;
 }
 
+/* 把一个 dest 追加到 OTHER_ROUTE 子队列尾部（邻居学来的路由）。 */
 static int other_route_meta_queue_add(struct meta_queue *mq, void *data)
 {
 	uint8_t qindex = META_QUEUE_OTHER_ROUTE;
@@ -4865,6 +5353,7 @@ static int other_route_meta_queue_add(struct meta_queue *mq, void *data)
 	return 0;
 }
 
+/* 把一个 EOIU 标记节点追加到 EOIU_MARKER 子队列尾部。 */
 static int eoiu_marker_meta_queue_add(struct meta_queue *mq, void *data)
 {
 	uint8_t qindex = META_QUEUE_EOIU_MARKER;
@@ -4879,6 +5368,8 @@ static int eoiu_marker_meta_queue_add(struct meta_queue *mq, void *data)
 	return 0;
 }
 
+/* 入队通用封装：确保 process_queue(work_queue) 存在且已挂上 meta_queue 本体，
+ * 然后调用具体子队列的 add 函数。首次入队时把 bgp->mq 加入 work_queue 才会被调度。 */
 static int mq_add_handler(struct bgp *bgp, void *data,
 			  int (*mq_add_func)(struct meta_queue *mq, void *data))
 {
@@ -4893,6 +5384,7 @@ static int mq_add_handler(struct bgp *bgp, void *data,
 	return mq_add_func(bgp->mq, data);
 }
 
+/* 对外入口：把一个 dest 作为“本地产生路由(early)”排入处理队列。 */
 int early_route_process(struct bgp *bgp, struct bgp_dest *dest)
 {
 	if (!dest) {
@@ -4903,6 +5395,7 @@ int early_route_process(struct bgp *bgp, struct bgp_dest *dest)
 	return mq_add_handler(bgp, dest, early_route_meta_queue_add);
 }
 
+/* 对外入口：把一个 dest 作为“邻居学来的路由(other)”排入处理队列。 */
 int other_route_process(struct bgp *bgp, struct bgp_dest *dest)
 {
 	if (!dest) {
@@ -4913,6 +5406,7 @@ int other_route_process(struct bgp *bgp, struct bgp_dest *dest)
 	return mq_add_handler(bgp, dest, other_route_meta_queue_add);
 }
 
+/* 对外入口：把一个 EOIU 标记节点排入处理队列。 */
 int eoiu_marker_process(struct bgp *bgp, struct bgp_dest *dest)
 {
 	if (!dest) {
@@ -4923,6 +5417,7 @@ int eoiu_marker_process(struct bgp *bgp, struct bgp_dest *dest)
 	return mq_add_handler(bgp, dest, eoiu_marker_meta_queue_add);
 }
 
+/* 创建一个 meta_queue：为 MQ_SIZE 个子队列各分配队列头并初始化。 */
 /* Create new meta queue.
    A destructor function doesn't seem to be necessary here.
  */
@@ -4942,6 +5437,7 @@ static struct meta_queue *meta_queue_new(void)
 	return new;
 }
 
+/* 清空并释放 EARLY_ROUTE 子队列里的所有 dest（解锁它们持有的 table 引用）。 */
 /* Clean up the early meta-queue list */
 static void early_meta_queue_free(struct meta_queue *mq, struct bgp_dest_queue *l)
 {
@@ -4960,6 +5456,7 @@ static void early_meta_queue_free(struct meta_queue *mq, struct bgp_dest_queue *
 	}
 }
 
+/* 清空并释放 OTHER_ROUTE 子队列里的所有 dest。 */
 /* Clean up the other meta-queue list */
 static void other_meta_queue_free(struct meta_queue *mq, struct bgp_dest_queue *l)
 {
@@ -4978,6 +5475,7 @@ static void other_meta_queue_free(struct meta_queue *mq, struct bgp_dest_queue *
 	}
 }
 
+/* 清空并释放 EOIU_MARKER 子队列里的所有标记节点（含其 eoiu 信息与临时节点内存）。 */
 /* Clean up the eoiu marker meta-queue list */
 static void eoiu_marker_queue_free(struct meta_queue *mq, struct bgp_dest_queue *l)
 {
@@ -4993,6 +5491,7 @@ static void eoiu_marker_queue_free(struct meta_queue *mq, struct bgp_dest_queue 
 	}
 }
 
+/* 释放整个 meta_queue：按子队列类型分别清理内容，再释放各子队列头与本体。 */
 void bgp_meta_queue_free(struct meta_queue *mq)
 {
 	enum meta_queue_indexes i;
@@ -5016,6 +5515,9 @@ void bgp_meta_queue_free(struct meta_queue *mq)
 	XFREE(MTYPE_BGP_METAQ, mq);
 }
 
+/* 初始化某实例的路由处理队列：创建 work_queue(process_queue) 并配置其调度参数
+ * （workfunc=meta_queue_process、hold=50ms、yield=50ms），再创建 meta_queue 本体。
+ * hold/yield 决定每次批量处理的节奏，避免长时间独占主线程。 */
 void bgp_process_queue_init(struct bgp *bgp)
 {
 	if (!bgp->process_queue) {
@@ -5034,6 +5536,11 @@ void bgp_process_queue_init(struct bgp *bgp)
 	bgp->mq = meta_queue_new();
 }
 
+/* 把一个 dest 排入处理队列的内部实现。参数 pi 若非空，会先把该路径移到链表头并
+ * 打上 BGP_PATH_UNSORTED（保证本次处理能感知到这次变化）。若 dest 已经被调度
+ * (BGP_NODE_PROCESS_SCHEDULED) 则直接返回，避免重复入队（同一前缀合批处理）。
+ * early_process 决定进入 EARLY_ROUTE 还是 OTHER_ROUTE 子队列。
+ * 调用时机：bgp_update/bgp_withdraw 等改动 RIB 之后。 */
 static void bgp_process_internal(struct bgp *bgp, struct bgp_dest *dest,
 				 struct bgp_path_info *pi, afi_t afi,
 				 safi_t safi, bool early_process)
@@ -5103,12 +5610,16 @@ void bgp_process(struct bgp *bgp, struct bgp_dest *dest,
 	bgp_process_internal(bgp, dest, pi, afi, safi, false);
 }
 
+/* 以“本地产生路由(early)”优先级排入处理队列。见 bgp_process_internal。 */
 void bgp_process_early(struct bgp *bgp, struct bgp_dest *dest,
 		       struct bgp_path_info *pi, afi_t afi, safi_t safi)
 {
 	bgp_process_internal(bgp, dest, pi, afi, safi, true);
 }
 
+/* 向处理队列压入一个 EOIU(End-Of-Initial-Update)标记。因为 meta_queue 期望所有
+ * 元素都是 bgp_dest*，这里构造一个“哑元”dest 承载 eoiu_info，处理时以 dest=NULL
+ * 走 bgp_process_main_one 的“初始更新结束”分支。 */
 void bgp_add_eoiu_mark(struct bgp *bgp)
 {
 	/*
@@ -5125,6 +5636,7 @@ void bgp_add_eoiu_mark(struct bgp *bgp)
 	eoiu_marker_process(bgp, dummy_dest);
 }
 
+/* maximum-prefix 超限后“重启定时器”到期回调：清除邻居并重连，给出恢复机会。 */
 static void bgp_maximum_prefix_restart_timer(struct event *event)
 {
 	struct peer_connection *connection = EVENT_ARG(event);
@@ -5139,6 +5651,9 @@ static void bgp_maximum_prefix_restart_timer(struct event *event)
 		zlog_debug("%s: %s peer_clear failed", __func__, peer->host);
 }
 
+/* 统计“被过滤掉的路由数”。遍历该邻居的 adj_in（收到的原始入项），对每条重新跑
+ * 入向过滤链与入向 route-map，被 DENY 的计入。用于 maximum-prefix force 模式下把
+ * 被过滤的也算进限额（防止通过过滤绕过保护）。 */
 static uint32_t bgp_filtered_routes_count(struct peer *peer, afi_t afi,
 					  safi_t safi)
 {
@@ -5178,6 +5693,13 @@ static uint32_t bgp_filtered_routes_count(struct peer *peer, afi_t afi,
 	return count;
 }
 
+/* 检查邻居是否超过 maximum-prefix 上限。超过则：
+ *   - 记录日志、置 PREFIX_LIMIT 标志；
+ *   - 若配了 warning-only 只告警不动作；
+ *   - 否则发送 Cease/Maximum-Prefix-Exceed NOTIFY 断开连接（携带 AFI/SAFI 与限额），
+ *     动态邻居直接关闭，静态邻居可选启动 restart 定时器稍后重连。
+ * pcount 在 force 模式下包含被过滤的路由数。返回值：true 表示“已超限并采取了
+ * 断连动作”，false 表示未超（或仅达到 threshold 告警）。 */
 bool bgp_maximum_prefix_overflow(struct peer *peer, afi_t afi, safi_t safi,
 				 int always)
 {
@@ -5272,6 +5794,10 @@ bool bgp_maximum_prefix_overflow(struct peer *peer, afi_t afi, safi_t safi,
 	return false;
 }
 
+/* 无条件地把一条路由从 RIB 移除（不考虑 damping），例如会话断开场景。
+ * 动作：聚合计数递减；给路径打删除标记(BGP_PATH_REMOVED)并清 VALID；若被移除的是
+ * 当前最优则需清除该前缀的延迟选路标志并调整 GR 延迟计数；最后触发 hook 并调用
+ * bgp_process 排入处理队列（真正摘除延后到处理时）。 */
 /* Unconditionally remove the route from the RIB, without taking
  * damping into consideration (eg, because the session went down)
  */
@@ -5308,6 +5834,9 @@ void bgp_rib_remove(struct bgp_dest *dest, struct bgp_path_info *pi,
 	bgp_process(peer->bgp, dest, pi, afi, safi);
 }
 
+/* 撤回路由的通用入口（bgp_withdraw 内部调用）。相比 bgp_rib_remove，它先处理
+ * dampening（震荡抑制）：eBGP 来源若被抑制，则保留路径作历史参考、不做移除；
+ * 再做 VNC/EVPN 的 un-import/un-export 处理，最后调用 bgp_rib_remove 从 RIB 摘除。 */
 static void bgp_rib_withdraw(const struct prefix *p, struct bgp_dest *dest, struct bgp_path_info *pi,
 			     struct peer *peer, afi_t afi, safi_t safi, struct prefix_rd *prd)
 {
@@ -5359,6 +5888,10 @@ static void bgp_rib_withdraw(const struct prefix *p, struct bgp_dest *dest, stru
 	bgp_rib_remove(dest, pi, peer, afi, safi);
 }
 
+/* 分配并初始化一条新的 bgp_path_info（一条路径）。
+ * 参数：type(ZEBRA_ROUTE_BGP 等)、sub_type(BGP_ROUTE_NORMAL/STATIC/...)、instance、
+ *       peer(来源邻居，NULL 表示本地)、attr(已 intern 的属性)、dest(所属前缀节点)。
+ * 注意：uptime 在此刻取当前单调时间；peer/attr 的引用计数由调用方负责增补。 */
 struct bgp_path_info *info_make(int type, int sub_type, unsigned short instance,
 				struct peer *peer, struct attr *attr,
 				struct bgp_dest *dest)
@@ -5377,6 +5910,13 @@ struct bgp_path_info *info_make(int type, int sub_type, unsigned short instance,
 	return new;
 }
 
+/* 检查收到的路由下一跳是否是“火星地址(martian，非法/不可用)”。返回 true 表示
+ * 下一跳非法，该路由应被丢弃。规则：
+ *   - 配了 bgp allow-martian-nexthop 一律放行；
+ *   - 本地静态(bgp static)路由或非 unicast/multicast/EVPN 不检查；
+ *   - NEXT_HOP 为 0.0.0.0/非单播/指向自身(bgp_nexthop_self) 视为非法；
+ *   - MP_NEXTHOP 按长度分支校验（未指定/回环/组播/自身等）。
+ * 只有当路由同时编码了 nexthop 与 mp_nexthop 时才要求“至少一个有效”。 */
 /* Check if received nexthop is valid or not. */
 bool bgp_update_martian_nexthop(struct bgp *bgp, afi_t afi, safi_t safi,
 				uint8_t type, uint8_t stype, struct attr *attr,
@@ -5454,6 +5994,8 @@ bool bgp_update_martian_nexthop(struct bgp *bgp, afi_t afi, safi_t safi,
 	return nh_invalid;
 }
 
+/* 给属性追加 no-export 团体（RFC1997）。做法与 llgr/gshut 版本一致：
+ * 合并去重后设回。 */
 static void bgp_attr_add_no_export_community(struct attr *attr)
 {
 	struct community *old;
@@ -5483,6 +6025,9 @@ static void bgp_attr_add_no_export_community(struct attr *attr)
 	bgp_attr_set_community(attr, new);
 }
 
+/* ACCEPT_OWN 处理（RFC7611）：仅用于 MPLS-VPN。若某 VPN 路由带 ACCEPT_OWN 团体，
+ * 且其 Route-Target 指向本机某个 VRF，则把它当作“已导入(IMPORTED)”处理
+ * （*sub_type 回填 BGP_ROUTE_IMPORTED）。返回 true 表示是 accept-own 路由。 */
 static bool bgp_accept_own(struct peer *peer, afi_t afi, safi_t safi,
 			   struct attr *attr, const struct prefix *prefix,
 			   int *sub_type)
@@ -5537,6 +6082,12 @@ static bool bgp_accept_own(struct peer *peer, afi_t afi, safi_t safi,
 	return false;
 }
 
+/* 更新一条路径的有效性标志：
+ *   - 通过下一跳可达性检查(bgp_find_or_add_nexthop / NHT)且（VPN 场景）封装类型匹配
+ *     则打 BGP_PATH_VALID，否则清除；
+ *   - accept-own 路由在有效时同时打 BGP_PATH_ACCEPT_OWN。
+ * 是“路径能否参与选路/安装”的关键闸门：NHT 未解析(unresolved)的路径不可用。
+ * （详细条件见原英文注释。） */
 /* update path flags: accept own, and valid flag.
  * - accept_own flag is marked if valid flag is marked
  * - valid flag is marked:
@@ -5639,6 +6190,23 @@ void bgp_update_check_valid_flags(struct bgp *bgp, struct peer *peer, struct bgp
 	}
 }
 
+/* ============================================================================
+ * 【入向 UPDATE 落地总入口 bgp_update】
+ * 由 bgp_packet.c 解析出一条 NLRI + 属性后调用，把这条路径写进 RIB。
+ * 参数：peer 来源邻居、p 前缀、addpath_id(RFC7911 接收侧 path-id)、
+ *       attr 已解析属性、afi/safi、type/sub_type(路径来源分类)、
+ *       prd(RD，VPN 用)、label/num_labels(标签栈)、soft_reconfig(是否软重配触发)、
+ *       evpn(EVPN 附加信息)。
+ * 主要流程（函数内顺序）：
+ *   1) BGP-LU safi 归一为 UNICAST；
+ *   2) 取/建前缀节点 dest，必要时把入项记录到 Adj-RIB-In(soft-reconfig)；
+ *   3) 用 pi_hash 查找是否已有同一 (prefix,peer,type,sub_type,addpath) 的旧路径；
+ *   4) 一串校验：AS 环(local-as/confed)/入向过滤与 route-map/无导出等，不通过则
+ *      goto filtered 丢弃；
+ *   5) 属性 intern、比较新旧属性是否相同(same_attr)；
+ *   6) 命中旧路径则更新或撤销并重建，未命中则新建 info_make 挂入；
+ *   7) NHT 可达性检查更新 VALID 标志、聚合计数增减、最后 bgp_process 排入处理队列。
+ * ============================================================================ */
 void bgp_update(struct peer *peer, const struct prefix *p, uint32_t addpath_id,
 		struct attr *attr, afi_t afi, safi_t safi, int type,
 		int sub_type, struct prefix_rd *prd, mpls_label_t *label,
@@ -5675,6 +6243,8 @@ void bgp_update(struct peer *peer, const struct prefix *p, uint32_t addpath_id,
 	int same_attr = 0;
 	const struct prefix *bgp_nht_param_prefix;
 
+	/* BGP-LU(带标签单播)在 RIB 中与普通 unicast 同表存储，故把 safi 归一到 UNICAST，
+	 * 但保留 orig_safi 用于 peer 侧的 af_flags 判断。 */
 	/* Special case for BGP-LU - map LU safi to ordinary unicast safi */
 	if (orig_safi == SAFI_LABELED_UNICAST)
 		safi = SAFI_UNICAST;
@@ -5690,6 +6260,8 @@ void bgp_update(struct peer *peer, const struct prefix *p, uint32_t addpath_id,
 			bgp_labels.label[i] = label[i];
 	}
 
+	/* soft-reconfig：开启后需把原始入向 UPDATE 记录进 Adj-RIB-In(adj_in)，
+	 * 以便 Route Refresh 时无需邻居重发即可用记录重新跑入向策略。 */
 	/* When peer's soft reconfiguration enabled.  Record input packet in
 	   Adj-RIBs-In.  */
 	if (!soft_reconfig && CHECK_FLAG(peer->af_flags[afi][orig_safi], PEER_FLAG_SOFT_RECONFIG) &&
@@ -5708,6 +6280,8 @@ void bgp_update(struct peer *peer, const struct prefix *p, uint32_t addpath_id,
 		bgp_adj_in_set(dest, peer, attr, addpath_id, &bgp_labels);
 	}
 
+	/* 用 (prefix, peer, type, sub_type, addpath_rx_id) 五元组在 pi_hash 中查找该
+	 * 路由此前是否已存在（同一邻居对同一前缀的同一 path-id 只应有一条路径）。 */
 	/* Check previously received route using pi_hash */
 	struct bgp_path_info pi_lookup = { .net = dest,
 					   .peer = peer,
@@ -5717,6 +6291,8 @@ void bgp_update(struct peer *peer, const struct prefix *p, uint32_t addpath_id,
 
 	pi = bgp_pi_hash_find(&rib_table->pi_hash, &pi_lookup);
 
+	/* local-as（peer 配置的“伪本地 AS”）环路检查：若 AS_PATH 中出现的次数超过
+	 * 允许的循环次数则丢弃（allowas-in 可放宽）。 */
 	/* AS path local-as loop check. */
 	if (peer->change_local_as) {
 		int32_t aspath_loop_count = 0;
@@ -5762,6 +6338,8 @@ void bgp_update(struct peer *peer, const struct prefix *p, uint32_t addpath_id,
 	 */
 	if (!CHECK_FLAG(peer->af_flags[afi][safi], PEER_FLAG_ALLOWAS_IN_ORIGIN) ||
 	    (aspath_get_last_as(attr->aspath) != bgp->as)) {
+			/* 本 AS 环路检查（RFC4271）：AS_PATH 中出现本机 AS 即视为环路丢弃，
+		 * allowas-in 可放宽阈值。 */
 		/* AS path loop check. */
 		if (aspath_loop_check(attr->aspath, bgp->as) >
 		    peer->allowas_in[afi][safi]) {
@@ -5770,6 +6348,7 @@ void bgp_update(struct peer *peer, const struct prefix *p, uint32_t addpath_id,
 			goto filtered;
 		}
 
+		/* 联邦(confederation)场景还须检查 AS_CONFED_SEQUENCE 中的联邦 ID。 */
 		/* If we're a CONFED we need to loop check the CONFED ID too */
 		if (CHECK_FLAG(bgp->config, BGP_CONFIG_CONFEDERATION)) {
 			if (aspath_loop_check_confed(attr->aspath, bgp->confed_id) >
@@ -5781,6 +6360,8 @@ void bgp_update(struct peer *peer, const struct prefix *p, uint32_t addpath_id,
 		}
 	}
 
+	/* 路由反射器的 originator-id 环路检查：若 ORIGINATOR_ID 就是本机 router-id，
+	 * 通常说明路由被反射回了源，丢弃；但若启用 ACCEPT_OWN 且 RT 匹配则可接受。 */
 	/* Route reflector originator ID check. If ACCEPT_OWN mechanism is
 	 * enabled, then take care of that too.
 	 */
@@ -5797,6 +6378,7 @@ void bgp_update(struct peer *peer, const struct prefix *p, uint32_t addpath_id,
 		}
 	}
 
+	/* 路由反射器 cluster-list 环路检查：若 CLUSTER_LIST 中含本机 cluster-id 则丢弃。 */
 	/* Route reflector cluster ID check.  */
 	if (bgp_cluster_filter(peer, attr)) {
 		peer->stat_pfx_cluster_loop++;
@@ -5804,6 +6386,8 @@ void bgp_update(struct peer *peer, const struct prefix *p, uint32_t addpath_id,
 		goto filtered;
 	}
 
+	/* RFC8212 防路由泄漏：若配置了 ebgp-requires-policy，则 eBGP 会话必须显式
+	 * 配置入向策略，否则一律丢弃该 AFI/SAFI 的路由（并要求出向策略）。 */
 	/* RFC 8212 to prevent route leaks.
 	 * This specification intends to improve this situation by requiring the
 	 * explicit configuration of both BGP Import and Export Policies for any
@@ -5834,6 +6418,7 @@ void bgp_update(struct peer *peer, const struct prefix *p, uint32_t addpath_id,
 		}
 	}
 
+	/* 入向过滤：distribute-list / prefix-list 等按前缀过滤，DENY 则丢弃。 */
 	/* Apply incoming filter.  */
 	if (bgp_input_filter(peer, p, attr, afi, orig_safi) == FILTER_DENY) {
 		peer->stat_pfx_filter++;
@@ -5892,6 +6477,9 @@ void bgp_update(struct peer *peer, const struct prefix *p, uint32_t addpath_id,
 		p_evpn = NULL;
 	}
 
+	/* 入向 route-map 修饰：可 set 属性（local-pref/med/community...）或 deny。
+	 * 注意 new_attr 可能含 route-map 新分配的内存，intern 前出错路径必须
+	 * bgp_attr_flush 释放，否则泄漏。 */
 	/* Apply incoming route-map.
 	 * NB: new_attr may now contain newly allocated values from route-map
 	 * "set"
@@ -5914,6 +6502,8 @@ void bgp_update(struct peer *peer, const struct prefix *p, uint32_t addpath_id,
 						false);
 	}
 
+	/* RFC7999 黑洞社区：收到带 BLACKHOLE 社区的路由，自动追加 NO_EXPORT 社区，
+	 * 防止该黑洞前缀被通告出本 AS。 */
 	/* rfc7999:
 	 * A BGP speaker receiving an announcement tagged with the
 	 * BLACKHOLE community SHOULD add the NO_ADVERTISE or
@@ -5928,6 +6518,8 @@ void bgp_update(struct peer *peer, const struct prefix *p, uint32_t addpath_id,
 			      COMMUNITY_BLACKHOLE))
 		bgp_attr_add_no_export_community(&new_attr);
 
+	/* RFC8326 优雅关闭：从 eBGP 收到 GSHUT 社区则压低 local-pref；若本机配置了
+	 * graceful-shutdown，则给所有 eBGP 入向路由追加 GSHUT 社区。 */
 	if (peer->sort == BGP_PEER_EBGP) {
 		/* If we receive the graceful-shutdown community from an eBGP
 		 * peer we must lower local-preference */
@@ -5945,6 +6537,7 @@ void bgp_update(struct peer *peer, const struct prefix *p, uint32_t addpath_id,
 			bgp_attr_add_gshut_community(&new_attr);
 	}
 
+	/* 火星/自身下一跳检查：非法或指向自身的下一跳一律丢弃。 */
 	/* next hop check.  */
 	if (!CHECK_FLAG(peer->flags, PEER_FLAG_IS_RFAPI_HD) &&
 	    bgp_update_martian_nexthop(bgp, afi, safi, type, sub_type,
@@ -5962,6 +6555,8 @@ void bgp_update(struct peer *peer, const struct prefix *p, uint32_t addpath_id,
 		goto filtered;
 	}
 
+	/* RFC9234 角色/OTC：若该 AFI/SAFI 适用 role 校验，检查 Only-To-Customer 属性的
+	 * 一致性，不一致则丢弃。 */
 	if (bgp_check_role_applicability(afi, safi) &&
 	    bgp_otc_filter(peer, &new_attr)) {
 		reason = "failing otc validation";
@@ -5969,6 +6564,8 @@ void bgp_update(struct peer *peer, const struct prefix *p, uint32_t addpath_id,
 		goto filtered;
 	}
 
+	/* SoO(Site of Origin)：为本邻居配置了 soo 时，给所有入向路由打上该扩展社区，
+	 * 出向时若与对端配置的 SoO 相同则在 subgroup_announce_check 中过滤（防环）。 */
 	/* If neighbor soo is configured, tag all incoming routes with
 	 * this SoO tag and then filter out advertisements in
 	 * subgroup_announce_check() if it matches the configured SoO
@@ -5993,6 +6590,8 @@ void bgp_update(struct peer *peer, const struct prefix *p, uint32_t addpath_id,
 		bgp_attr_set_ecommunity(&new_attr, new_ecomm);
 	}
 
+	/* 属性 intern 去重：同一份属性在全局 attrhash 中只保留一份，节省内存。
+	 * attr_intern_reuse 让 intern 时尽量复用刚解析出的原始属性内存。 */
 	/* Link the derived 'new_attr' with the NLRI-scoped parsed attr
 	 * so bgp_attr_intern() can reuse as required
 	 */
@@ -6002,6 +6601,9 @@ void bgp_update(struct peer *peer, const struct prefix *p, uint32_t addpath_id,
 	/* Use new evpn overlay pointer */
 	evpn = bgp_attr_get_evpn_overlay(attr_new);
 
+	/* 【关键分支：隐式撤销】若该前缀此前已有本邻居的路径(pi 非空)，本次 UPDATE
+	 * 视为“先撤旧再装新”。若新属性与旧完全相同(same_attr)且标签也相同，则视为
+	 * 重复报文直接返回；否则继续，用新属性替换 pi->attr（隐式撤销）。 */
 	/* If the update is implicit withdraw. */
 	if (pi) {
 		pi->uptime = monotime(NULL);
@@ -6009,6 +6611,7 @@ void bgp_update(struct peer *peer, const struct prefix *p, uint32_t addpath_id,
 
 		hook_call(bgp_process, bgp, afi, safi, dest, peer, true);
 
+		/* 属性与标签均未变且路径未被标记删除 → 重复通告，仅清 STALE 后返回。 */
 		/* Same attribute comes in. */
 		if (!CHECK_FLAG(pi->flags, BGP_PATH_REMOVED) && same_attr &&
 		    (!bgp_labels.num_labels ||
@@ -6114,6 +6717,7 @@ void bgp_update(struct peer *peer, const struct prefix *p, uint32_t addpath_id,
 			bgp_dest_set_defer_flag(dest, false);
 		}
 
+		/* 属性已变化：打上 ATTR_CHANGED 标志，后续向对端只发增量差异。 */
 		/* The attribute is changed. */
 		bgp_path_info_set_flag(dest, pi, BGP_PATH_ATTR_CHANGED);
 
@@ -6208,6 +6812,8 @@ void bgp_update(struct peer *peer, const struct prefix *p, uint32_t addpath_id,
 			}
 		}
 
+		/* 用新属性替换旧属性：先 unintern 旧属性(释放引用)，再指向 intern 后的
+		 * 新属性。 */
 		/* Update to new attribute.  */
 		bgp_attr_unintern_clear_reuse(attr, &pi->attr);
 		pi->attr = attr_new;
@@ -6445,6 +7051,7 @@ void bgp_update(struct peer *peer, const struct prefix *p, uint32_t addpath_id,
 		evpn_overlay_free(p_evpn);
 	return;
 
+		/* 把更新排入处理队列，稍后由 bgp_process 异步做最佳路径选择/下发。 */
 /* This BGP update is filtered.  Log the reason then update BGP
    entry.  */
 filtered:
@@ -6514,6 +7121,13 @@ filtered:
 	return;
 }
 
+/* ============================================================================
+ * 【入向 UPDATE 撤销入口 bgp_withdraw】
+ * 处理邻居发来的路由撤销：定位前缀节点，soft-reconfig 下先清 adj_in 记录；
+ * 再在 dest 的路径链表里按 (peer,type,sub_type,addpath) 找到对应 pi，
+ * 未处于 HISTORY(damping 历史) 状态则调用 bgp_rib_withdraw 真正撤销，
+ * 并做 VPN 泄漏(vpn_leak_*) 的同步撤销。
+ * ============================================================================ */
 void bgp_withdraw(struct peer *peer, const struct prefix *p,
 		  uint32_t addpath_id, afi_t afi, safi_t safi, int type,
 		  int sub_type, struct prefix_rd *prd, mpls_label_t *label,
@@ -6566,6 +7180,7 @@ void bgp_withdraw(struct peer *peer, const struct prefix *p,
 			return;
 		}
 
+	/* 在本前缀的路径链表中按五元组精确定位被撤销的那条路径。 */
 	/* Lookup withdrawn route. */
 	assert(dest);
 	for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next)
@@ -6583,6 +7198,7 @@ void bgp_withdraw(struct peer *peer, const struct prefix *p,
 			   pfx_buf);
 	}
 
+	/* 从 RIB 撤销该路由（HISTORY=被 damping 抑制的历史路径，不重复撤）。 */
 	/* Withdraw specified route from routing table. */
 	if (pi && !CHECK_FLAG(pi->flags, BGP_PATH_HISTORY)) {
 		bgp_rib_withdraw(p, dest, pi, peer, afi, safi, prd);
@@ -6605,6 +7221,8 @@ void bgp_withdraw(struct peer *peer, const struct prefix *p,
 	return;
 }
 
+/* 触发/撤销向某邻居通告默认路由：只是转调到 update-subgroup 层的
+ * subgroup_default_originate()，真正的打包与发送在 bgp_updgrp_packet.c。 */
 void bgp_default_originate(struct peer *peer, afi_t afi, safi_t safi,
 			   bool withdraw)
 {
@@ -6614,6 +7232,7 @@ void bgp_default_originate(struct peer *peer, afi_t afi, safi_t safi,
 }
 
 
+/* 取消某 peer_af 上已排定的“延迟通告路由”定时器（若有）。 */
 /*
  * bgp_stop_announce_route_timer
  */
@@ -6625,6 +7244,8 @@ void bgp_stop_announce_route_timer(struct peer_af *paf)
 	event_cancel(&paf->t_announce_route);
 }
 
+/* 通告路由定时器到期回调：确认会话已建立且该 AFI/SAFI 已协商后，真正触发
+ * peer_af_announce_route()，并通知条件通告(Conditional Advertisement)扫描。 */
 /*
  * bgp_announce_route_timer_expired
  *
@@ -6651,6 +7272,9 @@ static void bgp_announce_route_timer_expired(struct event *t)
 	peer->advmap_config_change[paf->afi][paf->safi] = true;
 }
 
+/* 触发向某邻居通告其全部（指定 AFI/SAFI 的）路由。并不立即遍历，而是设置一个
+ * 延迟定时器把通告“错峰”合并处理：单 peer 子组用较短延迟，多 peer 用较长延迟，
+ * 避免在 vty 上下文里做重活。force=true 时置 FORCE_UPDATES 强制重发。 */
 /*
  * bgp_announce_route
  *
@@ -6695,6 +7319,9 @@ void bgp_announce_route(struct peer *peer, afi_t afi, safi_t safi, bool force)
 			     &paf->t_announce_route);
 }
 
+/* 向某邻居重新通告所有 AFI/SAFI 的路由。仅在需要为该邻居单独刷新路由（策略变化
+ * 或收到 Route Refresh 请求）时调用；此操作会把该 peer 从原有 update-subgroup
+ * 中拆出并放入新的子组重新计算。 */
 /*
  * Announce routes from all AF tables to a peer.
  *
@@ -6713,6 +7340,8 @@ void bgp_announce_route_all(struct peer *peer)
 		bgp_announce_route(peer, afi, safi, false);
 }
 
+/* 遍历整张表，为“有 adj_in 记录（即曾收到过该 peer 的入向报文）”的前缀节点
+ * 打/清 BGP_NODE_SOFT_RECONFIG 标志，标记出软重配需要重算的节点。 */
 /* Flag or unflag bgp_dest to determine whether it should be treated by
  * bgp_soft_reconfig_table_task.
  * Flag if flag is true. Unflag if flag is false.
@@ -6737,6 +7366,8 @@ static void bgp_soft_reconfig_table_flag(struct bgp_table *table, bool flag)
 	}
 }
 
+/* 软重配单点更新：对某个前缀节点，用 adj_in 中保存的原始属性重新调用 bgp_update()
+ * （soft_reconfig=1），相当于把当初收到的报文再“重放”一遍以套用新的入向策略。 */
 static void bgp_soft_reconfig_table_update(struct peer *peer,
 					   struct bgp_dest *dest,
 					   struct bgp_adj_in *ain, afi_t afi,
@@ -6762,6 +7393,7 @@ static void bgp_soft_reconfig_table_update(struct peer *peer,
 		   label_pnt, num_labels, 1, bre);
 }
 
+/* 遍历（或由调用者指定的）表，对该 peer 的所有 adj_in 记录逐个执行软重配更新。 */
 static void bgp_soft_reconfig_table(struct peer *peer, afi_t afi, safi_t safi,
 				    struct bgp_table *table,
 				    struct prefix_rd *prd)
@@ -6782,6 +7414,9 @@ static void bgp_soft_reconfig_table(struct peer *peer, afi_t afi, safi_t safi,
 		}
 }
 
+/* 软重配后台任务：每次只处理 SOFT_RECONFIG_TASK_MAX_PREFIX 个节点就重新排一次事件，
+ * 把整表软重配拆成多次执行，避免长时间占用主线程导致 vtysh 卡顿。全部处理完后
+ * 清理状态并触发路由通告。 */
 /* Do soft reconfig table per bgp table.
  * Walk on SOFT_RECONFIG_TASK_MAX_PREFIX bgp_dest,
  * when BGP_NODE_SOFT_RECONFIG is set,
@@ -6854,6 +7489,9 @@ static void bgp_soft_reconfig_table_task(struct event *event)
 }
 
 
+/* 取消软重配任务：按 bgp 实例/表/peer 三级过滤。table 与 peer 均为 NULL 时取消该
+ * 实例下所有表任务；仅 table 非空时只取消该表；仅 peer 非空时从各表任务里移除该
+ * peer。（详见原英文注释中的组合语义。） */
 /* Cancel soft_reconfig_table task matching bgp instance, bgp_table
  * and peer.
  * - bgp cannot be NULL
@@ -6898,6 +7536,12 @@ void bgp_soft_reconfig_table_task_cancel(const struct bgp *bgp,
 	}
 }
 
+/* 触发某邻居的“入向软重配”：
+ *  - 普通表(unicast 等)：把 peer 加入 table->soft_reconfig_peers，打标并调度
+ *    bgp_soft_reconfig_table_task 后台分批重算；同时取消已排的延迟通告，避免
+ *    通告跑在软重配之前。
+ *  - VPN/EVPN/ENCAP 等表：直接同步遍历逐个 adj_in 重放。
+ * 入向未开启 soft-reconfig 时返回 false。 */
 /*
  * Returns false if the peer is not configured for soft reconfig in
  */
@@ -6985,6 +7629,10 @@ struct bgp_clear_node_queue {
 	struct bgp_dest *dest;
 };
 
+/* 清路由工作队列的处理项：针对一个 dest，删除其属于 peer 的所有路径。
+ * GR/增强刷新(ENHANCED_REFRESH)期间把路径标 STALE 保留（等定时器到期再由
+ * bgp_clear_stale_route 清），否则做 EVPN 反导入/VPN 泄漏撤销并 bgp_rib_remove。
+ * 注意 AddPath 下同一 peer 对同一前缀可能有多条路径，故需遍历整个链表。 */
 static wq_item_status bgp_clear_route_node(struct work_queue *wq, void *data)
 {
 	struct bgp_clear_node_queue *cnq = data;
@@ -7047,6 +7695,7 @@ static wq_item_status bgp_clear_route_node(struct work_queue *wq, void *data)
 	return WQ_SUCCESS;
 }
 
+/* 工作队列删除项回调：释放项内存，并解开在入队时对 dest/table 加的两把锁。 */
 static void bgp_clear_node_queue_del(struct work_queue *wq, void *data)
 {
 	struct bgp_clear_node_queue *cnq = data;
@@ -7058,6 +7707,8 @@ static void bgp_clear_node_queue_del(struct work_queue *wq, void *data)
 	XFREE(MTYPE_BGP_CLEAR_NODE_QUEUE, cnq);
 }
 
+/* 整个 clear 队列完成回调：给 FSM 发 Clearing_Completed 事件（会话方可由
+ * Clearing 态转出），并解除 bgp_clear_route 时对 peer 的锁。 */
 static void bgp_clear_node_complete(struct work_queue *wq)
 {
 	struct peer *peer = wq->spec.data;
@@ -7068,6 +7719,7 @@ static void bgp_clear_node_complete(struct work_queue *wq)
 	peer_unlock(peer); /* bgp_clear_route */
 }
 
+/* 初始化某 peer 的 clear 工作队列（绑定处理/del/完成回调，hold=10ms 节流）。 */
 static void bgp_clear_node_queue_init(struct peer *peer)
 {
 	char wname[sizeof("clear xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:xxxx")];
@@ -7087,6 +7739,9 @@ static void bgp_clear_node_queue_init(struct peer *peer)
 	peer->clear_node_queue->spec.data = peer;
 }
 
+/* 清理一张表里属于某 peer 的路由：逐节点删除其 adj_in 记录与 path_info。
+ * force(无 process_queue，如启动期)时直接 reap 同步删除；否则把非空节点加入
+ * peer->clear_node_queue 由工作队列异步处理（每个节点只入队一次）。 */
 static void bgp_clear_route_table(struct peer *peer, afi_t afi, safi_t safi,
 				  struct bgp_table *table)
 {
@@ -7178,6 +7833,10 @@ static void bgp_clear_route_table(struct peer *peer, afi_t afi, safi_t safi,
 	return;
 }
 
+/* 清除某邻居在某 AFI/SAFI 的全部路由（会话 Down/重配等触发）。
+ * 会话在 FSM 中停留 Clearing 态直到收到 Clearing_Completed，防止 peer 快速震荡
+ * 导致“新会话路由已装、旧清理还在跑”的竞态与资源耗尽。VPN/EVPN/ENCAP 需先下探
+ * 到内层(RD)表逐个清理。 */
 void bgp_clear_route(struct peer *peer, afi_t afi, safi_t safi)
 {
 	struct bgp_dest *dest;
@@ -7223,6 +7882,8 @@ void bgp_clear_route(struct peer *peer, afi_t afi, safi_t safi)
 		peer_unlock(peer);
 }
 
+/* 批量清理处理中清除单条路径：逻辑同 bgp_clear_route_node，GR/增强刷新期置
+ * STALE 保留，否则做 EVPN 反导入、VPN 泄漏撤销并 bgp_rib_remove。 */
 /*
  * Clear one path-info during clearing processing
  */
@@ -7273,6 +7934,9 @@ static void clearing_clear_one_pi(struct bgp_table *table, struct bgp_dest *dest
 	}
 }
 
+/* 记录“中断/续跑”上下文：批量清理可能分多次执行，VPN 场景还有外层(RD)与内层
+ * 两级遍历，故分别保存外层(inner_p=false 存 last_*)与内层(inner_p=true)的 afi/
+ * safi/前缀，供下次续跑定位。 */
 /*
  * Helper to capture interrupt/resume context info for clearing processing. We
  * may be iterating at two levels, so we may need to capture two levels of context
@@ -7301,6 +7965,9 @@ static void set_clearing_resume_info(struct bgp_clearing_info *cinfo,
 	}
 }
 
+/* 定位遍历起点：可能从头开始，也可能依据 cinfo 里保存的 resume 信息从上次“下一
+ * 个”前缀继续。VPN safi 有外层(RD)/内层两级表，需区分处理（换到新 RD 时内层
+ * resume 失效，重置从该 RD 内层表头开始）。 */
 /*
  * Helper to establish position in a table, possibly using "resume" info stored
  * during an iteration. Special logic helps navigate the outer/inner tables used
@@ -7385,6 +8052,8 @@ static struct bgp_dest *clearing_dest_helper(struct bgp_table *table,
 	return dest;
 }
 
+/* 启动或续跑“清邻居”的 RIB 遍历：一次处理若干前缀(clear_batch_rib_helper)，
+ * 未做完则重新排事件继续，做完则清理上下文。 */
 /*
  * Callback to begin or resume the rib-walk for peer clearing, with info carried in
  * a clearing context.
@@ -7405,6 +8074,8 @@ static void clear_dests_callback(struct event *event)
 	}
 }
 
+/* 分批遍历单张表做“清邻居”处理：限制一次检查的 dest 数量，达到上限即返回，
+ * 并把最后处理到的 dest 信息存入 cinfo 以便下次续跑。 */
 /*
  * Walk a single table for batch peer clearing processing. Limit the number of dests
  * examined, and return when reaching the limit. Capture "last" info about the
@@ -7504,6 +8175,9 @@ static int walk_batch_table_helper(struct bgp_clearing_info *cinfo,
 	return ret;
 }
 
+/* 批量清路由的 RIB 遍历器：遍历所有 AFI/SAFI 表（VPN/EVPN 需两级遍历），找出
+ * 受本批 peer 影响的目标前缀并异步处理。遍历被限额打断时返回非 0，并在 cinfo 中
+ * 保存续跑位置。 */
 /*
  * RIB-walking helper for batch clearing work: walk all tables, identify
  * dests that are affected by the peers in the batch, enqueue the dests for
@@ -7637,6 +8311,8 @@ static int clear_batch_rib_helper(struct bgp_clearing_info *cinfo)
 	return ret;
 }
 
+/* 批量“清路由”的总入口：遍历 RIB 找出需要用本批 peer 清理的前缀；若一次性做不
+ * 完，则记录 cinfo 并排事件稍后续跑，真正的清理异步进行。 */
 /*
  * Identify prefixes that need to be cleared for a batch of peers in 'cinfo'.
  * The actual clearing processing will be done async...
@@ -7669,6 +8345,8 @@ void bgp_clear_route_batch(struct bgp_clearing_info *cinfo)
 	}
 }
 
+/* 清除某邻居所有 AFI/SAFI 的路由：优先尝试把它合并进“批量清路由”(多个相邻 peer
+ * 一起清，减少 RIB 遍历次数)；无法合批则逐 AFI/SAFI 走 bgp_clear_route。 */
 void bgp_clear_route_all(struct peer *peer)
 {
 	afi_t afi;
@@ -7691,6 +8369,8 @@ void bgp_clear_route_all(struct peer *peer)
 #endif
 }
 
+/* 只清除某邻居在某 AFI/SAFI 的 adj_in(入向记录)，不动 RIB 中的路径（用于策略
+ * 变更后需要重放但保留已选路由的场景）。 */
 void bgp_clear_adj_in(struct peer *peer, afi_t afi, safi_t safi)
 {
 	struct bgp_table *table;
@@ -7719,6 +8399,9 @@ void bgp_clear_adj_in(struct peer *peer, afi_t afi, safi_t safi)
 	}
 }
 
+/* 清除某邻居遗留的 STALE 路由（GR/LLGR 定时器到期后调用）。LLGR 等待期间带
+ * NO_LLGR 社区的路径被保留；其余 STALE 路径按 RFC4271 正常撤除，并对 EVPN 做反
+ * 导入、对 VRF 泄漏路由做撤销。 */
 /* If any of the routes from the peer have been marked with the NO_LLGR
  * community, either as sent by the peer, or as the result of a configured
  * policy, they MUST NOT be retained, but MUST be removed as per the normal
@@ -7816,6 +8499,8 @@ void bgp_clear_stale_route(struct peer *peer, afi_t afi, safi_t safi)
 	}
 }
 
+/* 把某邻居在某 AFI/SAFI 的所有路径标记为 STALE（用于增强刷新/GR 启动时先标陈旧，
+ * 待收到刷新数据或定时器到期再决定去留）。 */
 void bgp_set_stale_route(struct peer *peer, afi_t afi, safi_t safi)
 {
 	struct bgp_dest *dest, *ndest;
@@ -7890,6 +8575,9 @@ void bgp_set_stale_route(struct peer *peer, afi_t afi, safi_t safi)
 	}
 }
 
+/* 判断某邻居某方向是否“存在策略配置”。iBGP/联邦/OAD 天然视为有策略；eBGP 则需
+ * 显式配了 route-map/prefix-list/filter-list/distribute-list 等之一。RFC8212 用
+ * 它来决定 eBGP 会话无策略时是否拒绝收发。 */
 bool bgp_outbound_policy_exists(struct peer *peer, struct bgp_filter *filter)
 {
 	if (peer->sort == BGP_PEER_CONFED || peer->sort == BGP_PEER_IBGP ||
@@ -7904,6 +8592,7 @@ bool bgp_outbound_policy_exists(struct peer *peer, struct bgp_filter *filter)
 	return false;
 }
 
+/* 同 bgp_outbound_policy_exists，但检查“入向”策略是否存在。 */
 bool bgp_inbound_policy_exists(struct peer *peer, struct bgp_filter *filter)
 {
 	if (peer->sort == BGP_PEER_CONFED || peer->sort == BGP_PEER_IBGP ||
@@ -7918,6 +8607,8 @@ bool bgp_inbound_policy_exists(struct peer *peer, struct bgp_filter *filter)
 	return false;
 }
 
+/* 清空一张表：注销 SRv6 单播路由、做 EVPN 反导入/反导出、把仍在 FIB 中的已选路径
+ * 从 zebra 撤回，然后逐个 reap 释放路径。 */
 static void bgp_cleanup_table(struct bgp *bgp, struct bgp_table *table, afi_t afi, safi_t safi)
 {
 	struct bgp_dest *dest;
@@ -7956,6 +8647,8 @@ static void bgp_cleanup_table(struct bgp *bgp, struct bgp_table *table, afi_t af
 	}
 }
 
+/* 清空本实例所有路由（bgpd 退出/实例删除时调用）：遍历所有 AFI/SAFI 清表，
+ * VPN/ENCAP/EVPN 需先清内层(RD)表并释放表结构。 */
 /* Delete all kernel routes. */
 void bgp_cleanup_routes(struct bgp *bgp)
 {
@@ -7990,6 +8683,9 @@ void bgp_cleanup_routes(struct bgp *bgp)
 	}
 }
 
+/* AddPath(RFC7911) 接收方向是否启用：需本端对该 AFI/SAFI 通告了“接收能力”
+ * (AF_RX_ADV) 且对端通告了“发送能力”(AF_TX_RCV)。启用后每个 NLRI 前多 4 字节
+ * path-id。 */
 bool bgp_addpath_encode_rx(struct peer *peer, afi_t afi, safi_t safi)
 {
 	return (CHECK_FLAG(peer->af_cap[afi][safi], PEER_CAP_ADDPATH_AF_RX_ADV)
@@ -7997,6 +8693,9 @@ bool bgp_addpath_encode_rx(struct peer *peer, afi_t afi, safi_t safi)
 			      PEER_CAP_ADDPATH_AF_TX_RCV));
 }
 
+/* 解析 IP NLRI 流（UPDATE 报文里的前缀列表）。attr 非空=通告，attr 为 NULL=撤销。
+ * 逐个前缀做语法检查（RFC4271 §6.3）：AddPath 时先读 path-id、校验前缀长度与是否
+ * 溢出、跳过组播/链路本地地址，然后分别调用 bgp_update / bgp_withdraw 落地。 */
 /* Parse NLRI stream.  Withdraw NLRI is recognized by NULL attr
    value. */
 int bgp_nlri_parse_ip(struct peer *peer, struct attr *attr,
@@ -8153,6 +8852,9 @@ int bgp_nlri_parse_ip(struct peer *peer, struct attr *attr,
 	return BGP_NLRI_PARSE_OK;
 }
 
+/* 下一跳可达性检查：unicast/LU 下若开启 import-check 则通过 NHT 判断下一跳是否
+ * 可达来设置/清除 BGP_PATH_VALID；未开启 import-check 时直接置 VALID 并解除 NHT
+ * 登记（避免无谓占用 NHT 资源）。 */
 static void bgp_nexthop_reachability_check(afi_t afi, safi_t safi,
 					   struct bgp_path_info *bpi,
 					   const struct prefix *p,
@@ -8191,6 +8893,8 @@ static void bgp_nexthop_reachability_check(afi_t afi, safi_t safi,
 	}
 }
 
+/* ========== 7. 静态路由(network 命令)与聚合 ========== */
+
 static struct bgp_static *bgp_static_new(void)
 {
 	return XCALLOC(MTYPE_BGP_STATIC, sizeof(struct bgp_static));
@@ -8207,6 +8911,10 @@ static void bgp_static_free(struct bgp_static *bgp_static)
 	XFREE(MTYPE_BGP_STATIC, bgp_static);
 }
 
+/* 把一条 network 静态路由（bgp_static 配置）落地成 RIB 中的一条自我生成路径：
+ * 组装属性(origin=IGP、下一跳、MED、可选 atomic-aggregate/label-index/EVPN 网关等)，
+ * 应用 network 的 route-map，然后复用已有(BGP_ROUTE_STATIC)路径更新或新建成
+ * BGP_ROUTE_STATIC 路径并 bgp_process。peer_self 是“本机对自己”的伪邻居。 */
 void bgp_static_update(struct bgp *bgp, const struct prefix *p,
 		       struct bgp_static *bgp_static, afi_t afi, safi_t safi)
 {
@@ -8310,6 +9018,7 @@ void bgp_static_update(struct bgp *bgp, const struct prefix *p,
 		}
 	}
 
+	/* 应用 network 关联的 route-map：deny 则该前缀不下发（并撤销已有的静态路由）。 */
 	/* Apply route-map. */
 	if (bgp_static->rmap.name) {
 		struct attr attr_tmp = attr;
@@ -8347,6 +9056,7 @@ void bgp_static_update(struct bgp *bgp, const struct prefix *p,
 		attr_new = bgp_attr_intern(&attr);
 	}
 
+	/* 查找本前缀是否已有同一条静态路径(peer_self + STATIC 子类型)，用于原地更新。 */
 	for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next)
 		if (pi->peer == bgp->peer_self && pi->type == ZEBRA_ROUTE_BGP
 		    && pi->sub_type == BGP_ROUTE_STATIC)
@@ -8499,6 +9209,8 @@ void bgp_static_update(struct bgp *bgp, const struct prefix *p,
 	aspath_unintern(&attr.aspath);
 }
 
+/* 撤销一条 network 静态路由：找到对应的 BGP_ROUTE_STATIC 自我路径，标记
+ * BGP_PATH_UNSORTED 后走 bgp_rib_remove（含 VPN 泄漏/EVPN 反导出的撤除）。 */
 void bgp_static_withdraw(struct bgp *bgp, const struct prefix *p, afi_t afi,
 			 safi_t safi, struct prefix_rd *prd)
 {
@@ -8548,6 +9260,10 @@ void bgp_static_withdraw(struct bgp *bgp, const struct prefix *p, afi_t afi,
 	bgp_dest_unlock_node(dest);
 }
 
+/* network 命令的配置处理(vty)：解析前缀/RD/标签/EVPN 参数，维护 static_routes
+ * 表里的 bgp_static 配置对象，并调用 bgp_static_update/withdraw 同步到 RIB。
+ * negate=true 表示 no network（删除配置与路由）。未运行 zebra 时静态路由也应被
+ * 直接视为可用。 */
 /* Configure static BGP network.  When user don't run zebra, static
    route should be installed as valid.  */
 int bgp_static_set(struct vty *vty, bool negate, const char *ip_str,
@@ -8783,6 +9499,8 @@ int bgp_static_set(struct vty *vty, bool negate, const char *ip_str,
 	return CMD_SUCCESS;
 }
 
+/* 重新把 static_routes 表里所有已配置的 network 路由装入 RIB（如重启后或需要
+ * 强制重算时），期间置 FORCE_STATIC_PROCESS 强制更新即使属性相同。 */
 void bgp_static_add(struct bgp *bgp)
 {
 	afi_t afi;
@@ -8822,6 +9540,8 @@ void bgp_static_add(struct bgp *bgp)
 	UNSET_FLAG(bgp->flags, BGP_FLAG_FORCE_STATIC_PROCESS);
 }
 
+/* 删除本实例所有 network 静态路由（bgp_delete 时调用）：撤销 RIB 中的对应路径并
+ * 释放 bgp_static 配置对象。 */
 /* Called from bgp_delete().  Delete all static routes from the BGP
    instance. */
 void bgp_static_delete(struct bgp *bgp)
@@ -8882,6 +9602,8 @@ void bgp_static_delete(struct bgp *bgp)
 		}
 }
 
+/* import-check 开关变化后重跑所有静态路由（下一跳可达性判定需重算），用
+ * FORCE_STATIC_PROCESS 强制即便属性未变也重新处理。 */
 void bgp_static_redo_import_check(struct bgp *bgp)
 {
 	afi_t afi;
@@ -8923,6 +9645,8 @@ void bgp_static_redo_import_check(struct bgp *bgp)
 	UNSET_FLAG(bgp->flags, BGP_FLAG_FORCE_STATIC_PROCESS);
 }
 
+/* 清除某 AFI/SAFI 下由本机产生(peer_self)的静态路由(STATIC)与重分发路由
+ * (REDISTRIBUTE)：减聚合计数、解 NHT、标记删除并排处理。实例关停中则跳过。 */
 static void bgp_purge_af_static_redist_routes(struct bgp *bgp, afi_t afi,
 					      safi_t safi)
 {
@@ -8958,6 +9682,7 @@ static void bgp_purge_af_static_redist_routes(struct bgp *bgp, afi_t afi,
 	}
 }
 
+/* 清除本实例所有 network 与重分发路由（实例 down 时调用）。 */
 /*
  * Purge all networks and redistributed routes from routing table.
  * Invoked upon the instance going down.
@@ -8971,6 +9696,7 @@ void bgp_purge_static_redist_routes(struct bgp *bgp)
 		bgp_purge_af_static_redist_routes(bgp, afi, safi);
 }
 
+/* 配置 table-map（BGP 表下发到 RIB/FIB 前的过滤 route-map）；设置后重刷整表。 */
 static int bgp_table_map_set(struct vty *vty, afi_t afi, safi_t safi,
 			     const char *rmap_name)
 {
@@ -8996,6 +9722,7 @@ static int bgp_table_map_set(struct vty *vty, afi_t afi, safi_t safi,
 	return CMD_SUCCESS;
 }
 
+/* 取消 table-map 并重刷整表使其生效移除。 */
 static int bgp_table_map_unset(struct vty *vty, afi_t afi, safi_t safi,
 			       const char *rmap_name)
 {
@@ -9013,6 +9740,7 @@ static int bgp_table_map_unset(struct vty *vty, afi_t afi, safi_t safi,
 	return CMD_SUCCESS;
 }
 
+/* 把 table-map 配置写出到 running-config。 */
 void bgp_config_write_table_map(struct vty *vty, struct bgp *bgp, afi_t afi,
 				safi_t safi)
 {
@@ -9022,6 +9750,7 @@ void bgp_config_write_table_map(struct vty *vty, struct bgp *bgp, afi_t afi,
 	}
 }
 
+/* table-map <NAME>：配置 network 注入 v4 单播表时使用的 route-map(可改属性)。 */
 DEFUN (bgp_table_map,
        bgp_table_map_cmd,
        "table-map WORD",
@@ -9032,6 +9761,7 @@ DEFUN (bgp_table_map,
 	return bgp_table_map_set(vty, bgp_node_afi(vty), bgp_node_safi(vty),
 				 argv[idx_word]->arg);
 }
+/* no table-map：取消 network 的 table-map。 */
 DEFUN (no_bgp_table_map,
        no_bgp_table_map_cmd,
        "no table-map WORD",
@@ -9044,6 +9774,7 @@ DEFUN (no_bgp_table_map,
 				   argv[idx_word]->arg);
 }
 
+/* network A.B.C.D/M [route-map NAME]：从本地 RIB 引入 IPv4 前缀作为 BGP 静态路由。 */
 DEFPY(bgp_network,
 	bgp_network_cmd,
 	"[no] network \
@@ -9085,6 +9816,7 @@ DEFPY(bgp_network,
 			      0, NULL, NULL, NULL, NULL);
 }
 
+/* ipv6 network X:X::X:X/M [route-map NAME]：从本地 RIB 引入 IPv6 前缀作为 BGP 静态路由。 */
 DEFPY(ipv6_bgp_network,
 	ipv6_bgp_network_cmd,
 	"[no] network X:X::X:X/M$prefix \
@@ -9104,11 +9836,14 @@ DEFPY(ipv6_bgp_network,
 			      0, NULL, NULL, NULL, NULL);
 }
 
+/* ========== 8. 路由聚合(aggregate-address) ========== */
+
 static struct bgp_aggregate *bgp_aggregate_new(void)
 {
 	return XCALLOC(MTYPE_BGP_AGGREGATE, sizeof(struct bgp_aggregate));
 }
 
+/* 释放一个聚合配置对象（含 suppress-map 与 route-map 的引用计数递减）。 */
 void bgp_aggregate_free(struct bgp_aggregate *aggregate)
 {
 	XFREE(MTYPE_ROUTE_MAP_NAME, aggregate->suppress_map_name);
@@ -9118,6 +9853,7 @@ void bgp_aggregate_free(struct bgp_aggregate *aggregate)
 	XFREE(MTYPE_BGP_AGGREGATE, aggregate);
 }
 
+/* 对某条路径应用聚合的 suppress-map，返回是否命中(需被抑制)。 */
 /**
  * Helper function to avoid repeated code: prepare variables for a
  * `route_map_apply` call.
@@ -9152,6 +9888,7 @@ static bool aggr_suppress_map_test(struct bgp *bgp,
 	return rmr == RMAP_PERMITMATCH;
 }
 
+/* 判断该路径是否已被此聚合抑制（在 pi->extra->aggr_suppressors 列表中）。 */
 /** Test whether the aggregation has suppressed this path or not. */
 static bool aggr_suppress_exists(struct bgp_aggregate *aggregate,
 				 struct bgp_path_info *pi)
@@ -9162,6 +9899,8 @@ static bool aggr_suppress_exists(struct bgp_aggregate *aggregate,
 	return listnode_lookup(pi->extra->aggr_suppressors, aggregate) != NULL;
 }
 
+/* 抑制该路径并保留引用：把 aggregate 加入 pi->extra->aggr_suppressors；首次抑制
+ * 时打 ATTR_CHANGED 返回 true（需要重新处理），否则返回 false。 */
 /**
  * Suppress this path and keep the reference.
  *
@@ -9197,6 +9936,8 @@ static bool aggr_suppress_path(struct bgp_aggregate *aggregate,
 	return false;
 }
 
+/* 解除该路径的抑制：从 aggr_suppressors 移除 aggregate；变为不再被任何聚合抑制
+ * 时打 ATTR_CHANGED 返回 true。 */
 /**
  * Unsuppress this path and remove the reference.
  *
@@ -9225,6 +9966,8 @@ static bool aggr_unsuppress_path(struct bgp_aggregate *aggregate,
 	return false;
 }
 
+/* 安装/更新/卸载聚合路由：count>0 且属性有变化时把聚合路径(BGP_ROUTE_AGGREGATE)
+ * 装进 RIB，count==0 时卸载；match_med 下 MED 不一致则整体不装（uninstall_aggregate_route）。 */
 static void bgp_aggregate_install(
 	struct bgp *bgp, afi_t afi, safi_t safi, const struct prefix *p,
 	uint8_t origin, struct aspath *aspath, struct community *community,
@@ -9335,6 +10078,8 @@ static void bgp_aggregate_install(
 	bgp_dest_unlock_node(dest);
 }
 
+/* 增量比较某路径 MED 是否与已有基准一致：首条设为基准，后续不等则标记
+ * med_mismatched。返回“是否仍一致”。 */
 /**
  * Check if the current path has different MED than other known paths.
  *
@@ -9359,6 +10104,7 @@ static bool bgp_aggregate_med_match(struct bgp_aggregate *aggregate,
 	return !aggregate->med_mismatched;
 }
 
+/* 全量测试聚合前缀下所有更具体路由的 MED 是否一致（用于聚合重算入口）。 */
 /**
  * Initializes and tests all routes in the aggregate address path for MED
  * values.
@@ -9402,6 +10148,8 @@ static bool bgp_aggregate_test_all_med(struct bgp_aggregate *aggregate,
 	return med_matched;
 }
 
+/* 切换本聚合对更具体路由的抑制状态：suppress=true 抑制（summary-only 或命中
+ * suppress-map），false 则解除抑制并重新装入；MED 由不匹配变匹配时会用到。 */
 /**
  * Toggles the route suppression status for this aggregate address
  * configuration.
@@ -9464,6 +10212,9 @@ void bgp_aggregate_toggle_suppressed(struct bgp_aggregate *aggregate,
 	bgp_dest_unlock_node(top);
 }
 
+/* 聚合的“增量”MED 测试：初次聚合完成后，仅对新来的一条路径做 MED 校验，并在
+ * 需要时把(因 MED 不匹配而)抑制的路由重新装回。注意不可在 bgp_aggregate_route
+ * 内调用（那里走全量测试）。 */
 /**
  * Aggregate address MED matching incremental test: this function is called
  * when the initial aggregation occurred and we are only testing a single
@@ -9505,6 +10256,11 @@ static void bgp_aggregate_med_update(struct bgp_aggregate *aggregate,
 	bgp_aggregate_toggle_suppressed(aggregate, bgp, p, afi, safi, false);
 }
 
+/* 聚合路由主逻辑：从聚合前缀下的所有更具体路由汇总出聚合属性——ORIGIN 取值规则
+ * (任一 INCOMPLETE→INCOMPLETE，任一 EGP→EGP，否则 IGP，RFC4271 §9.2.2.2)、
+ * MED 一致性、summary-only/suppress-map 决定是否抑制更具体路由、AS_PATH 取最长/
+ * community 合并等，最后调用 bgp_aggregate_install 装表。
+ * 每当更具体路由增删时由 bgp_aggregate_increment/decrement 触发。 */
 /* Update an aggregate as routes are added/removed from the BGP table */
 bool bgp_aggregate_route(struct bgp *bgp, const struct prefix *p, afi_t afi,
 			 safi_t safi, struct bgp_aggregate *aggregate)
@@ -9739,6 +10495,8 @@ bool bgp_aggregate_route(struct bgp *bgp, const struct prefix *p, afi_t afi,
 	return true;
 }
 
+/* 删除聚合配置时调用：遍历其下所有更具体路由，解除本聚合的抑制、递减 origin/
+ * count 计数，并从 as-set 聚合哈希中移除该路径贡献的 AS_PATH/community。 */
 void bgp_aggregate_delete(struct bgp *bgp, const struct prefix *p, afi_t afi,
 			  safi_t safi, struct bgp_aggregate *aggregate)
 {
@@ -9842,6 +10600,8 @@ void bgp_aggregate_delete(struct bgp *bgp, const struct prefix *p, afi_t afi,
 	bgp_dest_unlock_node(top);
 }
 
+/* 增量地把一条新出现的路径并入聚合：更新 count/origin 计数、as-set 哈希，并重装
+ * 聚合属性（对应 bgp_aggregate_increment）。 */
 static void bgp_add_route_to_aggregate(struct bgp *bgp,
 				       const struct prefix *aggr_p,
 				       struct bgp_path_info *pinew, afi_t afi,
@@ -9963,6 +10723,8 @@ static void bgp_add_route_to_aggregate(struct bgp *bgp,
 			      lcommunity, atomic_aggregate, aggregate);
 }
 
+/* 增量地把一条消失的路径从聚合中移除：与 bgp_add_route_to_aggregate 对称，更新
+ * count/origin 计数与 as-set 哈希并重装聚合。 */
 static void bgp_remove_route_from_aggregate(struct bgp *bgp, afi_t afi,
 					    safi_t safi,
 					    struct bgp_path_info *pi,
@@ -10088,6 +10850,8 @@ static void bgp_remove_route_from_aggregate(struct bgp *bgp, afi_t afi,
 			      lcommunity, atomic_aggregate, aggregate);
 }
 
+/* 路径新增时更新受其影响的聚合：从 p 沿前缀树向上找所有“更短且配了聚合”的祖先
+ * 前缀(aggregate 表)，把该路径并入每个聚合。每条路径进入 RIB 时会调用一次。 */
 void bgp_aggregate_increment(struct bgp *bgp, const struct prefix *p,
 			     struct bgp_path_info *pi, afi_t afi, safi_t safi)
 {
@@ -10129,6 +10893,8 @@ void bgp_aggregate_increment(struct bgp *bgp, const struct prefix *p,
 	bgp_dest_unlock_node(child);
 }
 
+/* 路径删除时更新受其影响的聚合：与 increment 对称，沿前缀树向上找到祖先聚合，
+ * 把该路径从每个聚合的统计中移除。 */
 void bgp_aggregate_decrement(struct bgp *bgp, const struct prefix *p,
 			     struct bgp_path_info *del, afi_t afi, safi_t safi)
 {
@@ -10196,6 +10962,7 @@ static const char *bgp_rpki_validation2str(enum rpki_states v_state)
 	return "ERROR";
 }
 
+/* no aggregate-address 的配置处理：删除聚合配置对象、卸载聚合路由并释放内存。 */
 static int bgp_aggregate_unset(struct vty *vty, const char *prefix_str,
 			       afi_t afi, safi_t safi)
 {
@@ -10237,6 +11004,7 @@ static int bgp_aggregate_unset(struct vty *vty, const char *prefix_str,
 	return CMD_SUCCESS;
 }
 
+/* 比较新参数与已有聚合配置是否完全相同（用于判定“重复配置”直接返回成功）。 */
 static bool bgp_aggregate_cmp_params(struct bgp_aggregate *aggregate, const char *rmap,
 				     uint8_t summary_only, uint8_t as_set, uint8_t origin,
 				     bool match_med, const char *suppress_map)
@@ -10258,6 +11026,8 @@ static bool bgp_aggregate_cmp_params(struct bgp_aggregate *aggregate, const char
 	return true;
 }
 
+/* aggregate-address 命令的配置处理：校验参数(summary-only 与 suppress-map 互斥、
+ * 前缀必须短于主机位)、建立/更新 bgp_aggregate 配置，并触发聚合重算与安装。 */
 static int bgp_aggregate_set(struct vty *vty, const char *prefix_str, afi_t afi,
 			     safi_t safi, const char *rmap,
 			     uint8_t summary_only, uint8_t as_set,
@@ -10374,6 +11144,8 @@ static int bgp_aggregate_set(struct vty *vty, const char *prefix_str, afi_t afi,
 	return CMD_SUCCESS;
 }
 
+/* aggregate-address A.B.C.D/M [选项]：配置 IPv4 聚合。选项含 summary-only / as-set /
+ * suppress-map / route-map / origin / matching-MED-only 等。 */
 DEFPY(aggregate_addressv4, aggregate_addressv4_cmd,
       "[no] aggregate-address <A.B.C.D/M$prefix|A.B.C.D$addr A.B.C.D$mask> [{"
       "as-set$as_set_s"
@@ -10438,6 +11210,7 @@ DEFPY(aggregate_addressv4, aggregate_addressv4_cmd,
 				 match_med != NULL, suppress_map);
 }
 
+/* 释放聚合的 as-set 汇总数据(AS_PATH/community/ecommunity/lcommunity 哈希与片段)。 */
 void bgp_free_aggregate_info(struct bgp_aggregate *aggregate)
 {
 	if (aggregate->community)
@@ -10466,6 +11239,7 @@ void bgp_free_aggregate_info(struct bgp_aggregate *aggregate)
 	bgp_aggregate_free(aggregate);
 }
 
+/* aggregate-address X:X::X:X/M [选项]：配置 IPv6 聚合(选项同 v4)。 */
 DEFPY(aggregate_addressv6, aggregate_addressv6_cmd,
       "[no] aggregate-address X:X::X:X/M$prefix [{"
       "as-set$as_set_s"
@@ -10515,6 +11289,12 @@ DEFPY(aggregate_addressv6, aggregate_addressv6_cmd,
 				 origin, match_med != NULL, suppress_map);
 }
 
+/* ========== 9. 重分发(redistribute)：从其它协议(内核/ospf/静态等)注入 BGP ========== */
+
+/* 处理一条从其它协议(重分发)注入的路由：按来源类型组装属性(下一跳、MED=metric、
+ * distance、tag、黑洞等)，套用 redistribute 的 route-map，再作为 BGP_ROUTE_REDISTRIBUTE
+ * 的自我路径装入 RIB。来源类型/实例由 type/instance 标识，redist 配置由
+ * bgp_redist_lookup 查找。 */
 /* Redistribute route treatment. */
 void bgp_redistribute_add(struct bgp *bgp, struct prefix *p,
 			  const union g_addr *nexthop, ifindex_t ifindex,
@@ -10724,6 +11504,8 @@ void bgp_redistribute_add(struct bgp *bgp, struct prefix *p,
 	aspath_unintern(&attr.aspath);
 }
 
+/* 删除一条特定重分发来源(type/instance)注入的路由：找到对应路径并撤销（含 VPN
+ * 泄漏/EVPN 反导出/聚合递减）。 */
 void bgp_redistribute_delete(struct bgp *bgp, struct prefix *p, uint8_t type,
 			     unsigned short instance)
 {
@@ -10762,6 +11544,7 @@ void bgp_redistribute_delete(struct bgp *bgp, struct prefix *p, uint8_t type,
 	}
 }
 
+/* 撤销某来源类型的所有重分发路由（如关闭 redistribute 时整类清除）。 */
 /* Withdraw specified route type's route. */
 void bgp_redistribute_withdraw(struct bgp *bgp, afi_t afi, int type,
 			       unsigned short instance)
@@ -10805,6 +11588,10 @@ void bgp_redistribute_withdraw(struct bgp *bgp, afi_t afi, int type,
 	}
 }
 
+/* ========== 10. show 命令输出：文本/JSON 格式化 ========== */
+
+/* 输出前缀本身：按 family(IPv4/IPv6/EVPN/以太网/FLOWSPEC) 分别格式化，
+ * 支持纯文本与 JSON 两种形态。 */
 /* Static function to display route. */
 static void route_vty_out_route(struct bgp_dest *dest, const struct prefix *p, struct vty *vty,
 				json_object *json, bool wide, char *rd_str)
@@ -10865,6 +11652,8 @@ enum bgp_display_type {
 	normal_list,
 };
 
+/* 把“选路胜出原因”(enum bgp_path_selection_reason)转成可读字符串，供 show 输出
+ * selectionReason（如 "weight"、"local-pref"、"as-path" ...）。 */
 const char *bgp_path_selection_reason2str(enum bgp_path_selection_reason reason)
 {
 	switch (reason) {
@@ -10926,6 +11715,10 @@ const char *bgp_path_selection_reason2str(enum bgp_path_selection_reason reason)
 	return "Invalid (internal error)";
 }
 
+/* 打印一条路径的“状态码”三列(文本)或 JSON 布尔字段：第1列 RPKI 校验(V/I/N)，
+ * 第2列路径状态(R 移除/S 陈旧/s 被抑制/星号表示有效)，第3列选路状态(h 历史/
+ * u 未排序/d 抑制/ > 最佳/= 多路径)，最后一列 i 表示 iBGP 来源。这是 show ip bgp
+ * 每行前缀前面那一串符号的来源。 */
 /* Print the short form route status for a bgp_path_info */
 static void route_vty_short_status_out(struct vty *vty,
 				       struct bgp_path_info *path,
@@ -11038,6 +11831,7 @@ static void route_vty_short_status_out(struct vty *vty,
 	vty_out(vty, " ");
 }
 
+/* 若配置了 show nexthop-hostname 且已知邻居主机名，返回之，否则 NULL。 */
 static char *bgp_nexthop_hostname(struct peer *peer,
 				  struct bgp_nexthop_cache *bnc)
 {
@@ -11047,6 +11841,9 @@ static char *bgp_nexthop_hostname(struct peer *peer,
 	return NULL;
 }
 
+/* 输出一条路径("show ip bgp" 明细行)：状态码、前缀、下一跳(含可达性/主机名)、
+ * MED、locPrf、weight、AS_PATH、Origin；JSON 模式下写入 json_path 对象。
+ * pattr 非空时用其替代 path->attr(如临时属性展示)。 */
 /* called from terminal list command */
 void route_vty_out(struct vty *vty, const struct prefix *p, struct bgp_path_info *path,
 		   int display, struct attr *pattr, safi_t safi, json_object *json_paths,
@@ -11547,6 +12344,8 @@ void route_vty_out(struct vty *vty, const struct prefix *p, struct bgp_path_info
 }
 
 /* called from terminal list command */
+/* 用“给定属性 attr”而非路径自带属性来输出一行（用于展示 route-map/策略修改后的
+ * 临时结果，或未落表的候选路由），JSON 模式写入 json_ar。 */
 void route_vty_out_tmp(struct vty *vty, struct bgp *bgp, struct bgp_dest *dest,
 		       const struct prefix *p, struct attr *attr, safi_t safi,
 		       bool use_json, json_object *json_ar, bool wide)
@@ -11691,6 +12490,7 @@ void route_vty_out_tmp(struct vty *vty, struct bgp *bgp, struct bgp_dest *dest,
 		vty_out(vty, "\n");
 }
 
+/* 输出该路径的 MPLS 标签(本地分配/收到的标签栈)，用于 VPN/标签路由的 show。 */
 void route_vty_out_tag(struct vty *vty, const struct prefix *p,
 		       struct bgp_path_info *path, int display, safi_t safi,
 		       json_object *json)
@@ -11779,6 +12579,7 @@ void route_vty_out_tag(struct vty *vty, const struct prefix *p,
 		vty_out(vty, "\n");
 }
 
+/* 输出路径的“叠加层(overlay)”信息：EVPN 网关/ESI/隧道类型等。 */
 void route_vty_out_overlay(struct vty *vty, const struct prefix *p,
 			   struct bgp_path_info *path, int display,
 			   json_object *json_paths)
@@ -11891,6 +12692,7 @@ void route_vty_out_overlay(struct vty *vty, const struct prefix *p,
 }
 
 /* dampening route */
+/* 输出路径的抖动抑制(damping)信息：抑制/重用/半衰期计时、历史记录等。 */
 static void damp_route_vty_out(struct vty *vty, const struct prefix *p,
 			       struct bgp_path_info *path, int display,
 			       afi_t afi, safi_t safi, bool use_json,
@@ -11950,6 +12752,7 @@ static void damp_route_vty_out(struct vty *vty, const struct prefix *p,
 }
 
 /* flap route */
+/* 输出路径的“抖动统计(flap)”信息：翻转次数、上次翻转时长等。 */
 static void flap_route_vty_out(struct vty *vty, const struct prefix *p,
 			       struct bgp_path_info *path, int display,
 			       afi_t afi, safi_t safi, bool use_json,
@@ -12034,6 +12837,7 @@ static void flap_route_vty_out(struct vty *vty, const struct prefix *p,
 	}
 }
 
+/* 输出“Advertised to”列表项：某前缀被通告给了哪些邻居(peer)，首项带表头。 */
 static void route_vty_out_advertised_to(struct vty *vty, struct peer *peer,
 					int *first, const char *header,
 					json_object *json_adv_to)
@@ -12086,6 +12890,7 @@ static void route_vty_out_advertised_to(struct vty *vty, struct peer *peer,
 	}
 }
 
+/* 输出该路径向外发送时使用的各 AddPath TX path-id 列表（按邻居分槽）。 */
 static void route_vty_out_tx_ids(struct vty *vty,
 				 struct bgp_addpath_info_data *d)
 {
@@ -12098,6 +12903,7 @@ static void route_vty_out_tx_ids(struct vty *vty,
 	}
 }
 
+/* 输出 EVPN 的 ES(以太网段)信息(ESI 与本地/远端 ES 状态)，用于 EVPN 明细。 */
 static void route_vty_out_detail_es_info(struct vty *vty,
 					 struct bgp_path_info *pi,
 					 struct attr *attr,
@@ -12157,6 +12963,9 @@ static void route_vty_out_detail_es_info(struct vty *vty,
 	}
 }
 
+/* 输出一条路径的完整明细(show ip bgp <prefix> 详版)：下一跳的可达性与 NHT 状态、
+ * 时间戳、各属性(AS_PATH/origin/MED/community/扩展社区/大社区/AIGP/RPKI 校验态等)、
+ * 标签、EVPN 叠加信息、通告对象等。是排障时信息最全的展示函数。 */
 void route_vty_out_detail(struct vty *vty, struct bgp *bgp, struct bgp_dest *bn,
 			  const struct prefix *p, struct bgp_path_info *path, afi_t afi,
 			  safi_t safi, enum rpki_states rpki_curr_state, json_object *json_paths,
@@ -13357,6 +14166,9 @@ static int bgp_show_community(struct vty *vty, struct bgp *bgp,
 			      const char *comstr, int exact, afi_t afi,
 			      safi_t safi, uint16_t show_flags);
 
+/* show 命令的核心表遍历器：按 show_type 决定过滤/展示方式(全部/与某前缀匹配/
+ * community/regexp 等)，逐前缀逐路径调用 route_vty_out*，维护累计计数与 JSON 表头
+ * 层级；is_last 控制 VPN 多 RD 的收尾。几乎所有 “show bgp ...” 都间接走到这里。 */
 static int bgp_show_table(struct vty *vty, struct bgp *bgp, afi_t afi, safi_t safi,
 			  struct bgp_table *table, enum bgp_show_type type,
 			  void *output_arg, const char *rd, int is_last,
@@ -13882,6 +14694,7 @@ static int bgp_show_table(struct vty *vty, struct bgp *bgp, afi_t afi, safi_t sa
 	return CMD_SUCCESS;
 }
 
+/* 从 curr 起在外层(RD)表中查找与给定 RD 匹配的节点(找不到则取下一个)。 */
 static struct bgp_dest *bgp_route_find_prd_match(struct bgp_dest *curr, struct prefix_rd *match)
 {
 	const struct prefix *curr_p = bgp_dest_get_prefix(curr);
@@ -13893,6 +14706,8 @@ static struct bgp_dest *bgp_route_find_prd_match(struct bgp_dest *curr, struct p
 	return curr;
 }
 
+/* 针对特定 RD 的 show：先在 PRD(VPN 外层)索引里定位该 RD 的内层表，再走
+ * bgp_show_table。 */
 int bgp_show_table_rd(struct vty *vty, struct bgp *bgp, afi_t afi, safi_t safi,
 		      struct bgp_table *table, struct prefix_rd *prd_match,
 		      enum bgp_show_type type, void *output_arg,
@@ -13942,6 +14757,7 @@ int bgp_show_table_rd(struct vty *vty, struct bgp *bgp, afi_t afi, safi_t safi,
 	return CMD_SUCCESS;
 }
 
+/* 通用 show 入口：处理 VPN/EVPN 的两级表结构，最终调用 bgp_show_table 输出。 */
 static int bgp_show(struct vty *vty, struct bgp *bgp, afi_t afi, safi_t safi,
 		    enum bgp_show_type type, void *output_arg,
 		    uint16_t show_flags, enum rpki_states rpki_target_state)
@@ -13987,6 +14803,7 @@ static int bgp_show(struct vty *vty, struct bgp *bgp, afi_t afi, safi_t safi,
 			      rpki_target_state);
 }
 
+/* 遍历所有 BGP 实例(default 与各 VRF)，各自输出其路由表(用于 "show bgp ... instance all")。 */
 static void bgp_show_all_instances_routes_vty(struct vty *vty, afi_t afi,
 					      safi_t safi, uint16_t show_flags)
 {
@@ -14030,6 +14847,8 @@ static void bgp_show_all_instances_routes_vty(struct vty *vty, afi_t afi,
 }
 
 /* Header of detailed BGP route information */
+/* 输出明细的“表头”部分：前缀、各来源(multipath/本地/最佳)的下一跳、metric、
+ * locPrf、weight、Origin、AS_PATH 等汇总行。 */
 void route_vty_out_detail_header(struct vty *vty, struct bgp *bgp,
 				 struct bgp_dest *dest, const struct prefix *p,
 				 const struct prefix_rd *prd, afi_t afi,
@@ -14290,6 +15109,7 @@ void route_vty_out_detail_header(struct vty *vty, struct bgp *bgp,
 	}
 }
 
+/* 输出一个前缀节点下所有(或最佳)路径的明细信息，供 "show ... <prefix>" 使用。 */
 static void bgp_show_path_info(const struct prefix_rd *pfx_rd, struct bgp_dest *bgp_node,
 			       struct vty *vty, struct bgp *bgp, afi_t afi, safi_t safi,
 			       json_object *json, enum bgp_path_type pathtype, int *display,
@@ -14355,6 +15175,8 @@ static void bgp_show_path_info(const struct prefix_rd *pfx_rd, struct bgp_dest *
 /*
  * Return rd based on safi
  */
+/* 若该 safi 用两级(VPN/EVPN)表，则把 dest 当作外层 RD 前缀转成 prefix_rd 返回，
+ * 否则返回 NULL。 */
 const struct prefix_rd *bgp_rd_from_dest(const struct bgp_dest *dest,
 					 safi_t safi)
 {
@@ -14377,6 +15199,7 @@ const struct prefix_rd *bgp_rd_from_dest(const struct bgp_dest *dest,
 }
 
 /* Display specified route of BGP table. */
+/* 在指定表中按前缀字符串查找并展示某条(或某类)路由的详情。 */
 static int bgp_show_route_in_table(struct vty *vty, struct bgp *bgp, struct bgp_table *rib,
 				   const char *ip_str, afi_t afi, safi_t safi,
 				   enum rpki_states rpki_target_state, struct prefix_rd *prd,
@@ -14532,6 +15355,7 @@ static int bgp_show_route_in_table(struct vty *vty, struct bgp *bgp, struct bgp_
 }
 
 /* Display specified route of Main RIB */
+/* "show bgp <prefix>" 的入口：选对应表(含 VPN 两级)，转调 bgp_show_route_in_table。 */
 static int bgp_show_route(struct vty *vty, struct bgp *bgp, const char *ip_str, afi_t afi,
 			  safi_t safi, struct prefix_rd *prd, int prefix_check,
 			  enum bgp_path_type pathtype, enum rpki_states rpki_target_state,
@@ -14557,6 +15381,7 @@ static int bgp_show_route(struct vty *vty, struct bgp *bgp, const char *ip_str, 
 				       show_opts);
 }
 
+/* "show bgp large-community <...>" 的处理：解析命令里的大社区值并转成 show 过滤。 */
 static int bgp_show_lcommunity(struct vty *vty, struct bgp *bgp, int argc,
 			       struct cmd_token **argv, bool exact, afi_t afi,
 			       safi_t safi, bool uj)
@@ -14604,6 +15429,7 @@ static int bgp_show_lcommunity(struct vty *vty, struct bgp *bgp, int argc,
 	return ret;
 }
 
+/* "show bgp large-community-list <NAME>" 的处理：按命名大社区列表过滤。 */
 static int bgp_show_lcommunity_list(struct vty *vty, struct bgp *bgp,
 				    const char *lcom, bool exact, afi_t afi,
 				    safi_t safi, bool uj)
@@ -14629,6 +15455,7 @@ static int bgp_show_lcommunity_list(struct vty *vty, struct bgp *bgp,
 			list, show_flags, RPKI_NOT_BEING_USED);
 }
 
+/* show bgp large-community-list <NAME>：按命名大社区列表筛选路由。 */
 DEFUN (show_ip_bgp_large_community_list,
        show_ip_bgp_large_community_list_cmd,
        "show [ip] bgp [<view|vrf> VIEWVRFNAME] ["BGP_AFI_CMD_STR" ["BGP_SAFI_WITH_LABEL_CMD_STR"]] large-community-list <(1-500)|LCOMMUNITY_LIST_NAME> [exact-match] [json]",
@@ -14669,6 +15496,7 @@ DEFUN (show_ip_bgp_large_community_list,
 	return bgp_show_lcommunity_list(vty, bgp, clist_number_or_name,
 					match_p, afi, safi, uj);
 }
+/* show bgp large-community <AA:BB:CC> [exact-match]：按大社区值筛选路由。 */
 DEFUN (show_ip_bgp_large_community,
        show_ip_bgp_large_community_cmd,
        "show [ip] bgp [<view|vrf> VIEWVRFNAME] ["BGP_AFI_CMD_STR" ["BGP_SAFI_WITH_LABEL_CMD_STR"]] large-community [<AA:BB:CC> [exact-match]] [json]",
@@ -14720,6 +15548,7 @@ static int bgp_table_stats(struct vty *vty, struct bgp *bgp, afi_t afi,
 			   safi_t safi, struct json_object *json);
 
 
+/* show bgp statistics-all：统计所有 BGP 实例的路由表内存占用。 */
 DEFUN(show_ip_bgp_statistics_all, show_ip_bgp_statistics_all_cmd,
       "show [ip] bgp [<view|vrf> VIEWVRFNAME] statistics-all [json]",
       SHOW_STR IP_STR BGP_STR BGP_INSTANCE_HELP_STR
@@ -14770,6 +15599,7 @@ DEFUN(show_ip_bgp_statistics_all, show_ip_bgp_statistics_all_cmd,
 }
 
 /* BGP route print out function without JSON */
+/* show bgp l2vpn evpn statistics：统计 EVPN 路由表内存占用。 */
 DEFUN (show_ip_bgp_l2vpn_evpn_statistics,
        show_ip_bgp_l2vpn_evpn_statistics_cmd,
        "show [ip] bgp [<view|vrf> VIEWVRFNAME] l2vpn evpn statistics [json]",
@@ -14811,6 +15641,7 @@ DEFUN (show_ip_bgp_l2vpn_evpn_statistics,
 }
 
 /* BGP route print out function without JSON */
+/* show bgp <afi> <safi> statistics：统计指定 AFI/SAFI 路由表内存占用。 */
 DEFUN(show_ip_bgp_afi_safi_statistics, show_ip_bgp_afi_safi_statistics_cmd,
       "show [ip] bgp [<view|vrf> VIEWVRFNAME] [" BGP_AFI_CMD_STR
       " [" BGP_SAFI_WITH_LABEL_CMD_STR
@@ -14847,6 +15678,7 @@ DEFUN(show_ip_bgp_afi_safi_statistics, show_ip_bgp_afi_safi_statistics_cmd,
 	return ret;
 }
 
+/* show bgp dampening [parameters|dampened-paths|flap-statistics]：展示抖动抑制配置/被抑制路由/抖动统计。 */
 DEFPY(show_ip_bgp_dampening_params, show_ip_bgp_dampening_params_cmd,
       "show [ip] bgp [<view|vrf> VIEWVRFNAME] [" BGP_AFI_CMD_STR
       " [" BGP_SAFI_WITH_LABEL_CMD_STR
@@ -14889,6 +15721,8 @@ DEFPY(show_ip_bgp_dampening_params, show_ip_bgp_dampening_params_cmd,
 }
 
 /* BGP route print out function */
+/* show bgp <afi>/<safi> [选项]：最常用的“显示 BGP 表”总命令(支持多种过滤/排序/
+ * JSON/wide/detail 选项)，最终走 bgp_show_all_instances_routes_vty 或 bgp_show。 */
 DEFPY(show_ip_bgp, show_ip_bgp_cmd,
       "show [ip] bgp [<view|vrf> VIEWVRFNAME] [" BGP_AFI_CMD_STR
       " [" BGP_SAFI_WITH_LABEL_CMD_STR
@@ -15281,6 +16115,7 @@ DEFPY(show_ip_bgp, show_ip_bgp_cmd,
 	return CMD_SUCCESS;
 }
 
+/* show bgp <prefix>：展示某具体前缀(或最长匹配)的明细。 */
 DEFUN (show_ip_bgp_route,
        show_ip_bgp_route_cmd,
        "show [ip] bgp [<view|vrf> VIEWVRFNAME] ["BGP_AFI_CMD_STR" ["BGP_SAFI_WITH_LABEL_CMD_STR"]]<A.B.C.D|A.B.C.D/M|X:X::X:X|X:X::X:X/M> [internal] [<bestpath|multipath>] [rpki <valid|invalid|notfound>] [json]",
@@ -15365,6 +16200,7 @@ DEFUN (show_ip_bgp_route,
 			      RPKI_NOT_BEING_USED, uj, show_opts);
 }
 
+/* show bgp regexp <REGEXP>：按 AS_PATH 正则筛选路由。 */
 DEFUN (show_ip_bgp_regexp,
        show_ip_bgp_regexp_cmd,
        "show [ip] bgp [<view|vrf> VIEWVRFNAME] ["BGP_AFI_CMD_STR" ["BGP_SAFI_WITH_LABEL_CMD_STR"]] regexp REGEX [json]",
@@ -15399,6 +16235,7 @@ DEFUN (show_ip_bgp_regexp,
 				 bgp_show_type_regexp, uj);
 }
 
+/* show bgp ... instance all：展示所有 BGP 实例(default + 各 VRF)的路由表。 */
 DEFPY (show_ip_bgp_instance_all,
        show_ip_bgp_instance_all_cmd,
        "show [ip] bgp <view|vrf> all ["BGP_AFI_CMD_STR" ["BGP_SAFI_WITH_LABEL_CMD_STR"]] [json$uj | wide$wide]",
@@ -15434,6 +16271,7 @@ DEFPY (show_ip_bgp_instance_all,
 	return CMD_SUCCESS;
 }
 
+/* 按 AS_PATH 正则(regexp)过滤并展示匹配的路由。 */
 static int bgp_show_regexp(struct vty *vty, struct bgp *bgp, const char *regstr,
 			   afi_t afi, safi_t safi, enum bgp_show_type type,
 			   bool use_json)
@@ -15463,6 +16301,7 @@ static int bgp_show_regexp(struct vty *vty, struct bgp *bgp, const char *regstr,
 	return rc;
 }
 
+/* 按(标准)community 值或命名 community-list 过滤并展示路由（"show bgp community ..."）。 */
 static int bgp_show_community(struct vty *vty, struct bgp *bgp,
 			      const char *comstr, int exact, afi_t afi,
 			      safi_t safi, uint16_t show_flags)
@@ -15547,6 +16386,8 @@ struct bgp_table_stats {
 	double total_space;
 };
 
+/* 统计单节点路由占用("show bgp ... statistics")：累加该 dest 各路径所占字节数，并
+ * 按“表内层级”归类到 ts 的计数桶中。 */
 static void bgp_table_stats_rn(struct bgp_dest *dest, struct bgp_dest *top,
 			       struct bgp_table_stats *ts, unsigned int space)
 {
@@ -15612,6 +16453,7 @@ static void bgp_table_stats_rn(struct bgp_dest *dest, struct bgp_dest *top,
 	}
 }
 
+/* 路由表统计的遍历事件：逐表逐前缀调用 bgp_table_stats_rn 累计内存占用统计。 */
 static void bgp_table_stats_walker(struct event *t)
 {
 	struct bgp_dest *dest, *ndest;
@@ -15659,6 +16501,7 @@ static void bgp_table_stats_walker(struct event *t)
 	}
 }
 
+/* 统计所有 BGP 实例(default + 各 VRF)在指定 AFI/SAFI 下的路由表内存占用。 */
 static void bgp_table_stats_all(struct vty *vty, afi_t afi, safi_t safi,
 				struct json_object *json_array)
 {
@@ -15669,6 +16512,7 @@ static void bgp_table_stats_all(struct vty *vty, afi_t afi, safi_t safi,
 		bgp_table_stats_single(vty, bgp, afi, safi, json_array);
 }
 
+/* 统计单个 BGP 实例在某 AFI/SAFI 的路由表内存占用(逐层汇总)。 */
 static int bgp_table_stats_single(struct vty *vty, struct bgp *bgp, afi_t afi,
 				  safi_t safi, struct json_object *json_array)
 {
@@ -15922,6 +16766,7 @@ end_table_stats:
 	return ret;
 }
 
+/* 路由表统计入口：bgp 为 NULL 时统计所有实例，否则统计单个实例。 */
 static int bgp_table_stats(struct vty *vty, struct bgp *bgp, afi_t afi,
 			   safi_t safi, struct json_object *json_array)
 {
@@ -15970,6 +16815,7 @@ struct peer_pcounts {
 	safi_t safi;
 };
 
+/* 统计某前缀节点属于目标的路径数(供 "show bgp neighbor <peer> prefix-counts")。 */
 static void bgp_peer_count_proc(struct bgp_dest *rn, struct peer_pcounts *pc)
 {
 	const struct bgp_adj_in *ain;
@@ -16019,6 +16865,7 @@ static void bgp_peer_count_proc(struct bgp_dest *rn, struct peer_pcounts *pc)
 	}
 }
 
+/* 前缀计数统计的遍历事件：逐表逐前缀调用 bgp_peer_count_proc。 */
 static void bgp_peer_count_walker(struct event *t)
 {
 	struct bgp_dest *rn, *rm;
@@ -16041,6 +16888,7 @@ static void bgp_peer_count_walker(struct event *t)
 			bgp_peer_count_proc(rn, pc);
 }
 
+/* 输出某邻居的前缀计数统计(各按来源分类的计数)。 */
 static int bgp_peer_counts(struct vty *vty, struct peer *peer, afi_t afi,
 			   safi_t safi, bool use_json)
 {
@@ -16130,6 +16978,7 @@ static int bgp_peer_counts(struct vty *vty, struct peer *peer, afi_t afi,
 	return CMD_SUCCESS;
 }
 
+/* show bgp [instance <X>] neighbors <peer> prefix-counts：展示邻居的前缀计数统计。 */
 DEFUN (show_ip_bgp_instance_neighbor_prefix_counts,
        show_ip_bgp_instance_neighbor_prefix_counts_cmd,
        "show [ip] bgp [<view|vrf> VIEWVRFNAME] ["BGP_AFI_CMD_STR" ["BGP_SAFI_CMD_STR"]] neighbors <A.B.C.D|X:X::X:X|WORD> prefix-counts [json]",
@@ -16170,6 +17019,7 @@ DEFUN (show_ip_bgp_instance_neighbor_prefix_counts,
 }
 
 #ifdef KEEP_OLD_VPN_COMMANDS
+/* show bgp vpn <afi> <safi> neighbors <peer> prefix-counts：VPN 表下邻居前缀计数。 */
 DEFUN (show_ip_bgp_vpn_neighbor_prefix_counts,
        show_ip_bgp_vpn_neighbor_prefix_counts_cmd,
        "show [ip] bgp <vpnv4|vpnv6> all neighbors <A.B.C.D|X:X::X:X|WORD> prefix-counts [json]",
@@ -16196,6 +17046,7 @@ DEFUN (show_ip_bgp_vpn_neighbor_prefix_counts,
 	return bgp_peer_counts(vty, peer, AFI_IP, SAFI_MPLS_VPN, uj);
 }
 
+/* show bgp vpn <afi> <safi> all [rd <RD>]：展示 VPN 表某前缀(可指定 RD)的详情。 */
 DEFUN (show_ip_bgp_vpn_all_route_prefix,
        show_ip_bgp_vpn_all_route_prefix_cmd,
        "show [ip] bgp <vpnv4|vpnv6> all <A.B.C.D|A.B.C.D/M> [json]",
@@ -16230,6 +17081,7 @@ DEFUN (show_ip_bgp_vpn_all_route_prefix,
 }
 #endif /* KEEP_OLD_VPN_COMMANDS */
 
+/* show bgp l2vpn evpn route <prefix>：展示 EVPN 表某前缀详情。 */
 DEFUN (show_bgp_l2vpn_evpn_route_prefix,
        show_bgp_l2vpn_evpn_route_prefix_cmd,
        "show bgp l2vpn evpn <A.B.C.D|A.B.C.D/M|X:X::X:X|X:X::X:X/M> [json]",
@@ -16262,6 +17114,7 @@ DEFUN (show_bgp_l2vpn_evpn_route_prefix,
 			      BGP_PATH_SHOW_ALL, RPKI_NOT_BEING_USED, use_json(argc, argv), 0);
 }
 
+/* 输出 "show bgp neighbor ... (received|advertised)-routes" 的表头(按需打印一次)。 */
 static void show_adj_route_header(struct vty *vty, struct peer *peer,
 				  struct bgp_table *table, int *header1,
 				  int *header2, json_object *json, bool wide,
@@ -16312,6 +17165,8 @@ static void show_adj_route_header(struct vty *vty, struct peer *peer,
 	}
 }
 
+/* Adj-RIB-In/Out 的通用输出器：遍历给定表，按 type 展示收/发路由的明细(含被过滤
+ * 的路由、route-map 处理后效果)。是 received-routes/advertised-routes 的核心。 */
 static void show_adj_route(struct vty *vty, struct peer *peer, struct bgp_table *table, afi_t afi,
 			   safi_t safi, enum bgp_show_adj_route_type type, const char *rmap_name,
 			   json_object *json, json_object *json_ar, uint16_t show_flags,
@@ -16686,6 +17541,8 @@ static void show_adj_route(struct vty *vty, struct peer *peer, struct bgp_table 
 	}
 }
 
+/* "show bgp neighbor ... received-routes/advertised-routes" 的入口：选表(含 VPN/
+ * EVPN 两级)并调用 show_adj_route。 */
 static int peer_adj_routes(struct vty *vty, struct peer *peer, afi_t afi,
 			   safi_t safi, enum bgp_show_adj_route_type type,
 			   const char *rmap_name, const struct prefix *match,
@@ -16910,6 +17767,7 @@ static int peer_adj_routes(struct vty *vty, struct peer *peer, afi_t afi,
 	return CMD_SUCCESS;
 }
 
+/* show bgp [instance <X>] neighbors <peer> bestpath-routes：只展示来自该邻居且被选为最佳的路由。 */
 DEFPY (show_ip_bgp_instance_neighbor_bestpath_route,
        show_ip_bgp_instance_neighbor_bestpath_route_cmd,
        "show [ip] bgp [<view|vrf> VIEWVRFNAME] [" BGP_AFI_CMD_STR " [" BGP_SAFI_WITH_LABEL_CMD_STR "]] neighbors <A.B.C.D|X:X::X:X|WORD> bestpath-routes [detail$detail] [json$uj | wide$wide]",
@@ -16964,6 +17822,7 @@ DEFPY (show_ip_bgp_instance_neighbor_bestpath_route,
 			       show_flags);
 }
 
+/* show bgp [instance <X>] neighbors <peer> advertised-routes：展示通告给该邻居的路由(Adj-RIB-Out)。 */
 DEFPY(show_ip_bgp_instance_neighbor_advertised_route,
       show_ip_bgp_instance_neighbor_advertised_route_cmd,
       "show [ip] bgp [<view|vrf> VIEWVRFNAME] [" BGP_AFI_CMD_STR " [" BGP_SAFI_WITH_LABEL_CMD_STR "]] [all$all] neighbors <A.B.C.D|X:X::X:X|WORD> <advertised-routes|received-routes|filtered-routes> [route-map RMAP_NAME$route_map] [<A.B.C.D/M|X:X::X:X/M>$prefix | detail$detail] [json$uj | wide$wide]",
@@ -17119,6 +17978,7 @@ DEFPY(show_ip_bgp_instance_neighbor_advertised_route,
 	return CMD_SUCCESS;
 }
 
+/* show bgp neighbors <peer> received prefix-filter：展示该邻居发送的 ORF(RFC5291) 前缀过滤器。 */
 DEFUN (show_ip_bgp_neighbor_received_prefix_filter,
        show_ip_bgp_neighbor_received_prefix_filter_cmd,
        "show [ip] bgp [<view|vrf> VIEWVRFNAME] [<ipv4|ipv6> [unicast]] neighbors <A.B.C.D|X:X::X:X|WORD> received prefix-filter [json]",
@@ -17180,6 +18040,8 @@ DEFUN (show_ip_bgp_neighbor_received_prefix_filter,
 	return CMD_SUCCESS;
 }
 
+/* "show bgp neighbor <peer> (received-routes|advertised-routes|routes)" 的核心：
+ * 按 type 决定读 Adj-RIB-In(收)/Adj-RIB-Out(发)/RIB，逐前缀输出。 */
 static int bgp_show_neighbor_route(struct vty *vty, struct peer *peer,
 				   afi_t afi, safi_t safi,
 				   enum bgp_show_type type, bool use_json)
@@ -17216,6 +18078,7 @@ static int bgp_show_neighbor_route(struct vty *vty, struct peer *peer,
  * Used for "detailed" output for cmds like show bgp <afi> <safi> (or)
  * show bgp <vrf> (or) show bgp <vrf> <afi> <safi>
  */
+/* show bgp vrf <VRF> <afi> <safi> <prefix> [detail]：展示某 VRF 下前缀的详情。 */
 DEFPY(show_ip_bgp_vrf_afi_safi_routes_detailed,
       show_ip_bgp_vrf_afi_safi_routes_detailed_cmd,
       "show [ip] bgp [<view|vrf> VIEWVRFNAME$vrf_name] ["BGP_AFI_CMD_STR" ["BGP_SAFI_WITH_LABEL_CMD_STR"]] detail [json$uj]",
@@ -17252,6 +18115,7 @@ DEFPY(show_ip_bgp_vrf_afi_safi_routes_detailed,
 			show_flags, RPKI_NOT_BEING_USED);
 }
 
+/* show bgp neighbors <peer> (routes|received-routes|advertised-routes)：展示与该邻居相关的路由。 */
 DEFUN (show_ip_bgp_neighbor_routes,
        show_ip_bgp_neighbor_routes_cmd,
        "show [ip] bgp [<view|vrf> VIEWVRFNAME] ["BGP_AFI_CMD_STR" ["BGP_SAFI_WITH_LABEL_CMD_STR"]] neighbors <A.B.C.D|X:X::X:X|WORD> <flap-statistics|dampened-routes|routes> [json]",
@@ -17315,6 +18179,7 @@ struct bgp_distance {
 	char *access_list;
 };
 
+/* show bgp <afi> vpn rd <RD> <prefix>：展示某 RD 下 VPN 前缀详情。 */
 DEFUN (show_bgp_afi_vpn_rd_route,
        show_bgp_afi_vpn_rd_route_cmd,
        "show bgp "BGP_AFI_CMD_STR" vpn rd <ASN:NN_OR_IP-ADDRESS:NN|all> <A.B.C.D/M|X:X::X:X/M> [json]",
@@ -17354,6 +18219,7 @@ DEFUN (show_bgp_afi_vpn_rd_route,
 			      BGP_PATH_SHOW_ALL, RPKI_NOT_BEING_USED, use_json(argc, argv), 0);
 }
 
+/* 新建一条 distance(按前缀/ACL 覆盖管理距离)配置对象。 */
 static struct bgp_distance *bgp_distance_new(void)
 {
 	return XCALLOC(MTYPE_BGP_DISTANCE, sizeof(struct bgp_distance));
@@ -17364,6 +18230,7 @@ static void bgp_distance_free(struct bgp_distance *bdistance)
 	XFREE(MTYPE_BGP_DISTANCE, bdistance);
 }
 
+/* 配置 distance bgp <ebgp> <ibgp> <local> 或按前缀/ACL 设管理距离。 */
 static int bgp_distance_set(struct vty *vty, const char *distance_str,
 			    const char *ip_str, const char *access_list_str)
 {
@@ -17408,6 +18275,7 @@ static int bgp_distance_set(struct vty *vty, const char *distance_str,
 	return CMD_SUCCESS;
 }
 
+/* 取消上述 distance 配置。 */
 static int bgp_distance_unset(struct vty *vty, const char *distance_str,
 			      const char *ip_str, const char *access_list_str)
 {
@@ -17454,6 +18322,7 @@ static int bgp_distance_unset(struct vty *vty, const char *distance_str,
 	return CMD_SUCCESS;
 }
 
+/* 删除所有 AFI/SAFI 下的 distance 表内容(bgp 实例删除时调用)。 */
 void bgp_address_family_distance_delete(void)
 {
 	afi_t afi = AFI_UNSPEC;
@@ -17556,6 +18425,8 @@ uint8_t bgp_distance_apply(const struct prefix *p, struct bgp_path_info *pinfo,
  * we should tell ZEBRA update the routes for a specific
  * AFI/SAFI to reflect changes in RIB.
  */
+/* distance 配置变化后，重刷受影响 AFI/SAFI 的路由到 zebra(管理距离变化会影响
+ * 是否优选/安装)。 */
 static void bgp_announce_routes_distance_update(struct bgp *bgp,
 						afi_t update_afi,
 						safi_t update_safi)
@@ -17578,6 +18449,9 @@ static void bgp_announce_routes_distance_update(struct bgp *bgp,
 	}
 }
 
+/* ========== 11. 管理距离(distance)与抖动抑制(dampening) ========== */
+
+/* distance bgp <eBGP> <iBGP> <local>：设置三类 BGP 路由的管理距离，变化时重刷下发。 */
 DEFUN (bgp_distance,
        bgp_distance_cmd,
        "distance bgp (1-255) (1-255) (1-255)",
@@ -17611,6 +18485,7 @@ DEFUN (bgp_distance,
 	return CMD_SUCCESS;
 }
 
+/* no distance <1-255> [A.B.C.D/M]：删除管理距离配置。 */
 DEFUN (no_bgp_distance,
        no_bgp_distance_cmd,
        "no distance bgp [(1-255) (1-255) (1-255)]",
@@ -17640,6 +18515,7 @@ DEFUN (no_bgp_distance,
 }
 
 
+/* distance <1-255> A.B.C.D/M：为匹配该前缀的路由设置管理距离。 */
 DEFUN (bgp_distance_source,
        bgp_distance_source_cmd,
        "distance (1-255) A.B.C.D/M",
@@ -17654,6 +18530,7 @@ DEFUN (bgp_distance_source,
 	return CMD_SUCCESS;
 }
 
+/* no distance <1-255> A.B.C.D/M：删除按前缀设置的管理距离。 */
 DEFUN (no_bgp_distance_source,
        no_bgp_distance_source_cmd,
        "no distance (1-255) A.B.C.D/M",
@@ -17669,6 +18546,7 @@ DEFUN (no_bgp_distance_source,
 	return CMD_SUCCESS;
 }
 
+/* distance <1-255> A.B.C.D/M WORD(ACL)：前缀+访问列表共同匹配时设置管理距离。 */
 DEFUN (bgp_distance_source_access_list,
        bgp_distance_source_access_list_cmd,
        "distance (1-255) A.B.C.D/M WORD",
@@ -17685,6 +18563,7 @@ DEFUN (bgp_distance_source_access_list,
 	return CMD_SUCCESS;
 }
 
+/* no distance <1-255> A.B.C.D/M WORD(ACL)：删除前缀+访问列表方式的管理距离。 */
 DEFUN (no_bgp_distance_source_access_list,
        no_bgp_distance_source_access_list_cmd,
        "no distance (1-255) A.B.C.D/M WORD",
@@ -17702,6 +18581,7 @@ DEFUN (no_bgp_distance_source_access_list,
 	return CMD_SUCCESS;
 }
 
+/* ipv6 distance <1-255> X:X::X:X/M：为匹配前缀的 IPv6 路由设置管理距离。 */
 DEFUN (ipv6_bgp_distance_source,
        ipv6_bgp_distance_source_cmd,
        "distance (1-255) X:X::X:X/M",
@@ -17713,6 +18593,7 @@ DEFUN (ipv6_bgp_distance_source,
 	return CMD_SUCCESS;
 }
 
+/* no ipv6 distance <1-255> X:X::X:X/M：删除按前缀设置的 IPv6 管理距离。 */
 DEFUN (no_ipv6_bgp_distance_source,
        no_ipv6_bgp_distance_source_cmd,
        "no distance (1-255) X:X::X:X/M",
@@ -17725,6 +18606,7 @@ DEFUN (no_ipv6_bgp_distance_source,
 	return CMD_SUCCESS;
 }
 
+/* ipv6 distance <1-255> X:X::X:X/M WORD(ACL)：前缀+访问列表方式设置 IPv6 管理距离。 */
 DEFUN (ipv6_bgp_distance_source_access_list,
        ipv6_bgp_distance_source_access_list_cmd,
        "distance (1-255) X:X::X:X/M WORD",
@@ -17737,6 +18619,7 @@ DEFUN (ipv6_bgp_distance_source_access_list,
 	return CMD_SUCCESS;
 }
 
+/* no ipv6 distance <1-255> X:X::X:X/M WORD(ACL)：删除 IPv6 前缀+访问列表管理距离。 */
 DEFUN (no_ipv6_bgp_distance_source_access_list,
        no_ipv6_bgp_distance_source_access_list_cmd,
        "no distance (1-255) X:X::X:X/M WORD",
@@ -17750,6 +18633,8 @@ DEFUN (no_ipv6_bgp_distance_source_access_list,
 	return CMD_SUCCESS;
 }
 
+/* bgp dampening：启用/设置路由抖动抑制参数(半衰期、复用阈值、抑制阈值、最大抑
+ * 制时长)。带参数时按输入，仅一个参数时最大抑制时长取 4 倍半衰期。 */
 DEFUN (bgp_damp_set,
        bgp_damp_set_cmd,
        "bgp dampening [(1-45) [(1-20000) (1-50000) (1-255)]]",
@@ -17796,6 +18681,7 @@ DEFUN (bgp_damp_set,
 			       reuse, suppress, max);
 }
 
+/* no bgp dampening：关闭路由抖动抑制(dampening)。 */
 DEFUN (bgp_damp_unset,
        bgp_damp_unset_cmd,
        "no bgp dampening [(1-45) [(1-20000) (1-50000) (1-255)]]",
@@ -17812,6 +18698,7 @@ DEFUN (bgp_damp_unset,
 }
 
 /* Display specified route of BGP table. */
+/* clear bgp ... dampening：清除(全部或按前缀)抖动抑制状态，让被抑制的路由重新可用。 */
 static int bgp_clear_damp_route(struct vty *vty, const char *view_name,
 				const char *ip_str, afi_t afi, safi_t safi,
 				struct prefix_rd *prd, int prefix_check)
@@ -17920,6 +18807,7 @@ static int bgp_clear_damp_route(struct vty *vty, const char *view_name,
 	return CMD_SUCCESS;
 }
 
+/* clear bgp dampening：清除(复位)所有被抖动抑制的路由。 */
 DEFUN (clear_ip_bgp_dampening,
        clear_ip_bgp_dampening_cmd,
        "clear ip bgp dampening",
@@ -17934,6 +18822,7 @@ DEFUN (clear_ip_bgp_dampening,
 	return CMD_SUCCESS;
 }
 
+/* clear bgp dampening A.B.C.D/M：清除指定前缀的抖动抑制。 */
 DEFUN (clear_ip_bgp_dampening_prefix,
        clear_ip_bgp_dampening_prefix_cmd,
        "clear ip bgp dampening A.B.C.D/M",
@@ -17948,6 +18837,7 @@ DEFUN (clear_ip_bgp_dampening_prefix,
 				    AFI_IP, SAFI_UNICAST, NULL, 1);
 }
 
+/* clear bgp dampening A.B.C.D：清除以该地址为前缀的抖动抑制。 */
 DEFUN (clear_ip_bgp_dampening_address,
        clear_ip_bgp_dampening_address_cmd,
        "clear ip bgp dampening A.B.C.D",
@@ -17962,6 +18852,7 @@ DEFUN (clear_ip_bgp_dampening_address,
 				    SAFI_UNICAST, NULL, 0);
 }
 
+/* clear bgp dampening A.B.C.D A.B.C.D(netmask)：按地址+掩码清除抖动抑制。 */
 DEFUN (clear_ip_bgp_dampening_address_mask,
        clear_ip_bgp_dampening_address_mask_cmd,
        "clear ip bgp dampening A.B.C.D A.B.C.D",
@@ -17988,6 +18879,7 @@ DEFUN (clear_ip_bgp_dampening_address_mask,
 				    NULL, 0);
 }
 
+/* 调试用：打印连接哈希表中一个桶项的信息。 */
 static void show_bgp_connectionhash_entry(struct hash_bucket *bucket, void *arg)
 {
 	struct vty *vty = arg;
@@ -17997,6 +18889,7 @@ static void show_bgp_connectionhash_entry(struct hash_bucket *bucket, void *arg)
 	vty_out(vty, "\tPeer: %s %pSU\n", peer->host, &peer->connection->su);
 }
 
+/* show bgp listeners：展示 bgpd 正在监听的 TCP 端口信息。 */
 DEFUN (show_bgp_listeners,
        show_bgp_listeners_cmd,
        "show bgp listeners",
@@ -18009,6 +18902,7 @@ DEFUN (show_bgp_listeners,
 	return CMD_SUCCESS;
 }
 
+/* show bgp peerhash：展示 peer 哈希桶分布(排障用，看散列是否均匀)。 */
 DEFUN (show_bgp_peerhash,
        show_bgp_peerhash_cmd,
        "show bgp peerhash",
@@ -18029,6 +18923,7 @@ DEFUN (show_bgp_peerhash,
 }
 
 /* also used for encap safi */
+/* 写出 VPN(两级表)的 network 配置(network <prefix> rd <rd> [label ...] ...)。 */
 static void bgp_config_write_network_vpn(struct vty *vty, struct bgp *bgp,
 					 afi_t afi, safi_t safi)
 {
@@ -18147,6 +19042,7 @@ static void bgp_config_write_network_evpn(struct vty *vty, struct bgp *bgp,
 
 /* Configuration of static route announcement and aggregate
    information. */
+/* 写出 network 静态路由配置到 running-config(区分普通表与 VPN/EVPN 表)。 */
 void bgp_config_write_network(struct vty *vty, struct bgp *bgp, afi_t afi,
 			      safi_t safi)
 {
@@ -18224,6 +19120,7 @@ void bgp_config_write_network(struct vty *vty, struct bgp *bgp, afi_t afi,
 	}
 }
 
+/* 写出 distance bgp 与按前缀/ACL 的 distance 配置。 */
 void bgp_config_write_distance(struct vty *vty, struct bgp *bgp, afi_t afi,
 			       safi_t safi)
 {
@@ -18254,6 +19151,10 @@ void bgp_config_write_distance(struct vty *vty, struct bgp *bgp, afi_t afi,
 	}
 }
 
+/* ========== 12. 初始化与收尾：bgp_route_init / bgp_route_finish ========== */
+
+/* bgpd 启动时调用：初始化 distance 表并注册本文件所有 vty 命令(bgp_route.c 的
+ * DEFUN/DEFPY 都在此挂到对应节点上)。 */
 /* Allocate routing table structure and install commands. */
 void bgp_route_init(void)
 {
@@ -18403,6 +19304,7 @@ void bgp_route_init(void)
 	install_element(VIEW_NODE, &show_bgp_peerhash_cmd);
 }
 
+/* bgpd 退出时调用：释放 distance 表、注销命令、清理本模块全局资源。 */
 void bgp_route_finish(void)
 {
 	afi_t afi;

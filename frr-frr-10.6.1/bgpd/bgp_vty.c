@@ -2,6 +2,66 @@
 /* BGP VTY interface.
  * Copyright (C) 1996, 97, 98, 99, 2000 Kunihiro Ishiguro
  */
+/* ============================================================================
+ * 【文件导读】bgp_vty.c —— bgpd 的命令行接口(CLI)实现：bgp_vty.h 声明的落地
+ * ============================================================================
+ * 【职责与定位】本文件是 bgpd 的 **VTY/CLI 层**，是整个 bgpd 里最大的源文件
+ *   (约 2.4 万行)。它不实现路由协议算法，而是负责“把用户的命令行翻译成对配置
+ *   结构的读写，再触发必要的重算/重建”。FRR 的 CLI 采用两段式：
+ *     1) 命令定义：源码里用 DEFUN/DEFPY/DEFUN_NOSH 宏声明命令(语法字符串 + 处理
+ *        函数)。这些宏本身不产生可运行代码，而是被 build 期的 python 脚本
+ *        (frr-* 目录下的 *.py 脚本) 扫描、生成 command.c 里的命令表结构。
+ *     2) 命令注册：运行期由 bgp_vty_init() 用 install_element(node, &cmd) 把命令
+ *        挂到对应“节点”(node)上。node 决定该命令在哪个视图里可见
+ *        (CONFIG_NODE 全局配置 / bgp_node / 各 address-family 子节点 / VTY_NODE 等)。
+ *   因此读本文件要始终带着两问：**这条命令属于哪个 node？它改了哪些字段、是否
+ *   触发了 apply？**
+ *
+ * 【核心概念 / 常见字段】
+ *   - bgp 实例：一个 bgp 结构体对应一个实例(默认实例 + 各 VRF 实例)。命令多数
+ *     通过 bgp_get_vty()/bgp_vty_find_and_parse_* 拿到当前实例。
+ *   - peer：邻居，可能是真正邻居也可能是 peer-group。peer->global / peer->group
+ *     区分“独立邻居”与“属于某个 group 的邻居”；peer_sort() 判断 iBGP/eBGP。
+ *   - address-family：AFI(ipv4/ipv6) × SAFI(unicast/multicast/vpn/labeled-unicast/
+ *     flowspec/evpn...)。每条路由相关配置都绑定到某个 afi/safi。
+ *   - “改了配置→要不要 apply”是本文件最大的坑：很多命令改完字段后**必须**调用
+ *     相应的激活/重建函数才真正生效，例如：
+ *       bgp_peer_activate()                 : 重新计算邻居需要收发的能力/UPDATE。
+ *       peer_group2peer_config_copy()       : 把 peer-group 配置下发到成员邻居。
+ *       bgp_update_graceful_restart_capability() : 重新计算 GR 能力。
+ *       bgp_zebra_send_capabilities()       : 把 GR 状态同步给 zebra。
+ *     漏掉 apply 的典型症状是“配置看着生效了，但会话/路由没变”。
+ *
+ * 【本文件在主流程中的位置】上游是用户输入(或读取配置)经 VTY 分发到本文件各
+ *   DEFUN 处理函数；本文件大量调用其它 bgpd 模块(bgp_route/bgp_fsm/bgp_updgrp/
+ *   bgp_zebra/bgp_attr...)去实际改状态。bgp_vty_init() 由 bgpd 主程序启动时调用；
+ *   bgp_config_write() 在 "write" 时把当前配置回写成命令文本。
+ *
+ * 【阅读建议 / 结构地图】(按文件从上到下)
+ *   - 顶部：一堆 FRR_CFG_DEFAULT_BOOL —— 各项配置的“按 profile/版本覆盖的默认值”。
+ *   - ~150-950：CLI 通用辅助函数(get_afi_safi_str、argv 解析、peer 查找、
+ *     bgp_vty_return 错误回显、bgp_get_vty 取实例)。
+ *   - ~1000-1400：clear 命令的实现(bgp_clear 等)与 soft-in/soft-out 软清。
+ *   - ~1400-1900：peer flag 的 set/unset 与“需要监听”判定。
+ *   - ~1900-12000：海量 DEFUN/DEFPY + 其配套 *_set_vty / *_unset_vty / *_config_vty
+ *     辅助函数，围绕 bgp 全局配置、neighbor 配置、address-family、route-map 钩子、
+ *     aggregate-address、redistribute、graceful-restart、vpn import/export 等。
+ *   - ~12000-18400：show 命令族(show bgp summary/neighbors/peer-group/
+ *     update-groups/route-leak/martian 等)的打印实现。
+ *   - ~18700-20900：config write 族(bgp_config_write*)与各 cmd_node 定义。
+ *   - ~20900-21150：命令补全(变量处理器)、配置事务(config start/end/finish)、
+ *     interface 相关命令。
+ *   - 21157 起 bgp_vty_init()：**所有 install_element 注册命令的总入口**。
+ *   - 22843 起：community/lcommunity/extcommunity-list 命令族与 community_list_vty()、
+ *     community_alias_vty()。
+ *
+ * 【易错点提示】
+ *   - DEFUN/DEFPY 宏体和 install_element 都是代码，是命令注册的“真身”，不要
+ *     把它们当成注释。
+ *   - peer-group 与成员邻居的关系：多数 neighbor 命令对 group 改完要 copy 给成员。
+ *   - 改了 afi/safi 相关字段后常需 bgp_peer_activate 或重算 ORF/能力。
+ * ============================================================================
+ */
 
 #include <zebra.h>
 
@@ -71,6 +131,31 @@
 #include "bgpd/rfapi/bgp_rfapi_cfg.h"
 #endif
 
+/* 【配置默认值档案总览】以下 FRR_CFG_DEFAULT_BOOL 定义各个布尔配置项的默认值。
+ * 匹配规则：自上而下取**首个匹配**当前运行环境(profile + 版本)的条目；最后一条
+ * 无 match 条件者即兜底默认。常见口径：
+ *   match_profile = "datacenter" : 数据中心 profile 下的值；
+ *   match_version = "< x.y"      : 兼容旧版本行为的迁移窗口。
+ * 这些只是“默认来源声明”，当用户在 CLI 里显式设置后即以用户值为准。
+ * 逐项含义：
+ *   BGP_IMPORT_CHECK              : 是否检查从 VRF/其它实例导入的路由。
+ *   BGP_SHOW_HOSTNAME             : show 邻居时是否解析/显示主机名。
+ *   BGP_SHOW_NEXTHOP_HOSTNAME     : show 下一跳时是否显示主机名。
+ *   BGP_LOG_NEIGHBOR_CHANGES      : 邻居状态变化是否打日志。
+ *   BGP_DETERMINISTIC_MED         : 是否启用确定性 MED(同 AS 路径按键稳定排序)。
+ *   BGP_EBGP_REQUIRES_POLICY      : eBGP 是否要求存在 in/out 策略才通告路由。
+ *   BGP_SUPPRESS_DUPLICATES       : 是否抑制重复的 UPDATE 通告。
+ *   BGP_GRACEFUL_NOTIFICATION     : 是否在 GR 下发送 graceful notification。
+ *   BGP_HARD_ADMIN_RESET          : admin reset 是否走硬重置(hard reset)。
+ *   BGP_SOFT_VERSION_CAPABILITY_OLD/NEW : 软版本能力(software version capability)
+ *                                   的新/旧行为开关(二选一的口径)。
+ *   BGP_LINK_LOCAL_CAPABILITY     : 是否启用 IPv6 link-local 下一跳能力。
+ *   BGP_DYNAMIC_CAPABILITY        : 是否启用动态能力(dynamic capability)。
+ *   BGP_ENFORCE_FIRST_AS          : 是否强制 AS_PATH 首 AS 检查。
+ *   BGP_RR_ALLOW_OUTBOUND_POLICY  : 路由反射器是否允许出向策略。
+ *   BGP_COMPARE_AIGP              : 选路时是否比较 AIGP 属性。
+ * 默认值本身参与“用户未配置时该用哪个行为”，改这里会改变**所有未显式配置**的
+ * 部署的默认行为，务必谨慎。 */
 FRR_CFG_DEFAULT_BOOL(BGP_IMPORT_CHECK,
 	{
 		.val_bool = false,
@@ -137,6 +222,14 @@ FRR_CFG_DEFAULT_BOOL(BGP_COMPARE_AIGP,
 	{ .val_bool = false },
 );
 
+/* 【扩展钩子声明】DEFINE_HOOK 定义一组“可被其它模块(如 SNMP、静态分析)挂接”的
+ * 回调点。本文件只负责**声明钩子**(空实现)，真正的 handler 在别处 register。
+ *   bgp_inst_config_write          : 写每个 bgp 实例配置时的扩展点。
+ *   bgp_snmp_update_last_changed   : 配置最后一次变更时通知 SNMP。
+ *   bgp_snmp_init_stats            : 初始化 SNMP 统计。
+ *   bgp_snmp_traps_config_write    : 写 SNMP trap 配置。
+ *   bgp_route_distinguisher_update : RD(Route Distinguisher)变更时通知。
+ * 阅读时有调用点(bgpd.c / bgp_snmp.c)时再回看这里。 */
 DEFINE_HOOK(bgp_inst_config_write,
 		(struct bgp *bgp, struct vty *vty),
 		(bgp, vty));
@@ -146,9 +239,15 @@ DEFINE_HOOK(bgp_snmp_traps_config_write, (struct vty * vty), (vty));
 DEFINE_HOOK(bgp_route_distinguisher_update, (struct bgp *bgp, afi_t afi, bool preconfig),
 	    (bgp, afi, preconfig));
 
+/* 【辅助声明】listen_range_exists 前向声明(实现在文件后半部 ~4889 附近)：
+ * 判断某 listen range 是否已存在(exact 表示要求精确匹配)。 */
 static struct peer_group *listen_range_exists(struct bgp *bgp,
 					      struct prefix *range, int exact);
 
+/* 【枚举】show_type —— 供 show bgp neighbors 系列区分“显示谁”。
+ *   show_all / show_peer       : 全部/IPv4+IPv6 邻居、单个邻居(不区分 AF)。
+ *   show_ipv4_all/_peer / show_ipv6_all/_peer : 进一步限定只显示某 AF 的邻居。
+ * 该枚举传给 bgp_show_neighbor() 决定遍历范围与打印分支。 */
 /* Show BGP peer's information. */
 enum show_type {
 	show_all,
@@ -159,6 +258,11 @@ enum show_type {
 	show_ipv6_peer
 };
 
+/* 【函数】bgp_node_type —— 把 (AFI, SAFI) 映射到 CLI **命令节点**(node)。
+ * 用途：命令注册(install_element)与按 afi/safi 找节点时，需要知道该 AF 对应的
+ * 配置视图节点。例如 AFI_IP+SAFI_UNICAST → BGP_IPV4_NODE(即 "address-family
+ * ipv4 unicast" 视图)。未覆盖的组合按注释里标注的“not expected”回退到 IPv4 节点。
+ * 注意 AFI_L2VPN 直接对应 BGP_EVPN_NODE。 */
 static enum node_type bgp_node_type(afi_t afi, safi_t safi)
 {
 	switch (afi) {
@@ -214,6 +318,8 @@ static enum node_type bgp_node_type(afi_t afi, safi_t safi)
 	return BGP_IPV4_NODE;
 }
 
+/* 【函数】get_afi_safi_vty_str —— (AFI,SAFI) → **人类可读**文本(如 "IPv4 Unicast")，
+ * 用于普通文本输出。未知组合返回 "Unknown"。 */
 static const char *get_afi_safi_vty_str(afi_t afi, safi_t safi)
 {
 	if (afi == AFI_IP) {
@@ -256,6 +362,9 @@ static const char *get_afi_safi_vty_str(afi_t afi, safi_t safi)
  * to use this function, please ensure you
  * are doing this within json output
  */
+/* 【函数】get_afi_safi_json_str —— (AFI,SAFI) → JSON 输出用的**驼峰键名**
+ * (如 "ipv4Unicast"/"l2VpnEvpn")。与 get_afi_safi_vty_str 用途不同：此函数返回
+ * 的字符串会出现在 JSON 里，因此刻意保持驼峰，**只可在 json 输出路径使用**。 */
 static const char *get_afi_safi_json_str(afi_t afi, safi_t safi)
 {
 	if (afi == AFI_IP) {
@@ -292,6 +401,17 @@ static const char *get_afi_safi_json_str(afi_t afi, safi_t safi)
 	return "Unknown";
 }
 
+/* 【函数】bgp_srv6_sids_unset —— 清空某 bgp 实例上所有的 SRv6 SID 相关状态。
+ * SRv6(Segment Routing over IPv6)在 bgpd 中用于：BGP-LU 的 SRv6 单播 SID、以及
+ * VPN 的 per-VRF / toVPN SID(END.DT4/DT6/DT46 等行为)。
+ * 做三件事(按代码顺序)：
+ *   1) 若本实例是 default 实例：撤销并释放 srv6 unicast(IPv4/IPv6)的 SID 与 locator。
+ *   2) 遍历所有 VRF 实例，对仍需保留 locator 的跳过；对其余先 vpn_leak_prechange()
+ *      (撤销前把泄漏的 VPN 路由收干净)，保证后续释放 SID 时不会有悬空引用。
+ *   3) 清空本实例的 locator_chunks / functions 列表，并对各 VRF 释放
+ *      vpn_policy[AFI_IP/IP6].tovpn_sid、per-vrf tovpn_sid 及其 locator。
+ * 关键点：释放 SID 前必须先向 zebra 释放(bgp_zebra_release_srv6_sid)，否则 SID
+ * 池会泄漏；locator 释放顺序也要先释放依赖它的 SID。 */
 static void bgp_srv6_sids_unset(struct bgp *bgp)
 {
 	struct listnode *node, *nnode;
@@ -409,6 +529,9 @@ static void bgp_srv6_sids_unset(struct bgp *bgp)
 	}
 }
 
+/* 【函数】bgp_srv6_locator_unset —— 注销本实例的 SRv6 locator：先清 SID(func/sid)、
+ * 清 locator 名、释放 locator 对象，最后 vpn_leak_postchange_all() 让路由重算。
+ * 返回 0 表示成功。 */
 /* unset srv6 locator */
 static int bgp_srv6_locator_unset(struct bgp *bgp)
 {
@@ -427,6 +550,9 @@ static int bgp_srv6_locator_unset(struct bgp *bgp)
 	return 0;
 }
 
+/* 【函数】bgp_node_afi / bgp_node_safi —— 根据“当前所在 CLI 节点”反推出 afi/safi。
+ * 用户在某个 address-family 视图(如 BGP_IPV6M_NODE)里输入命令时，命令处理函数
+ * 常用它们拿到“我现在配置的是哪个地址族”。默认节点视为 IPv4 Unicast。 */
 /* Utility function to get address family from current node.  */
 afi_t bgp_node_afi(struct vty *vty)
 {
@@ -449,6 +575,8 @@ afi_t bgp_node_afi(struct vty *vty)
 	return afi;
 }
 
+/* 【函数】bgp_node_safi —— 见上，从当前节点反推 SAFI。VPN/EVPN/LU/FlowSpec/Multicast
+ * 节点各自映射到对应 SAFI；其余(含 IPv4 Unicast)默认按 SAFI_UNICAST。 */
 /* Utility function to get subsequent address family from current
    node.  */
 safi_t bgp_node_safi(struct vty *vty)
@@ -481,6 +609,8 @@ safi_t bgp_node_safi(struct vty *vty)
 	return safi;
 }
 
+/* 【函数】bgp_vty_afi_from_str —— 字符串("ipv4"/"ipv6"/"l2vpn") → afi_t。
+ * 无法识别返回 AFI_MAX。 */
 /**
  * Converts an AFI in string form to afi_t
  *
@@ -502,6 +632,9 @@ afi_t bgp_vty_afi_from_str(const char *afi_str)
 	return afi;
 }
 
+/* 【函数】argv_find_and_parse_afi —— 在命令参数 argv 里查找 AFI 令牌并解析。
+ * 命中则把 *index 置为其位置(供后续 argv_find_and_parse_safi 从其后继续找)、
+ * 写 *afi，返回 1；未命中返回 0。afi 可传 NULL(只定位不取值)。 */
 int argv_find_and_parse_afi(struct cmd_token **argv, int argc, int *index,
 			    afi_t *afi)
 {
@@ -522,6 +655,8 @@ int argv_find_and_parse_afi(struct cmd_token **argv, int argc, int *index,
 	return ret;
 }
 
+/* 【函数】bgp_vty_safi_from_str —— 字符串 → safi_t，支持 unicast/multicast/vpn/
+ * labeled-unicast/evpn/flowspec；无法识别返回 SAFI_MAX。 */
 /* supports <unicast|multicast|vpn|labeled-unicast> */
 safi_t bgp_vty_safi_from_str(const char *safi_str)
 {
@@ -541,6 +676,8 @@ safi_t bgp_vty_safi_from_str(const char *safi_str)
 	return safi;
 }
 
+/* 【函数】argv_find_and_parse_safi —— 同 argv_find_and_parse_afi，但解析 SAFI 令牌。
+ * 通常在 argv_find_and_parse_afi 之后调用，从 index 起继续搜索。 */
 int argv_find_and_parse_safi(struct cmd_token **argv, int argc, int *index,
 			     safi_t *safi)
 {
@@ -573,6 +710,9 @@ int argv_find_and_parse_safi(struct cmd_token **argv, int argc, int *index,
 	return ret;
 }
 
+/* 【函数】get_bgp_default_af_flag —— (AFI,SAFI) → "default address-family" 的
+ * 字符串名(如 "ipv4-unicast"/"l2vpn-evpn")，用于打印 default-afi 相关配置。
+ * 非法/未定义组合统一返回 "unknown-afi/safi"；函数末尾用 assert 兜底(理论上到不了)。 */
 /*
  * Convert an afi_t/safi_t pair to matching BGP_DEFAULT_AF* flag.
  *
@@ -655,6 +795,14 @@ static const char *get_bgp_default_af_flag(afi_t afi, safi_t safi)
 	return "DEV ESCAPE";
 }
 
+/* 【函数】bgp_get_vty —— 取/建 bgp 实例的 CLI 入口，包裹核心 bgp_get()。
+ * 参数：bgp 出参实例指针；as 出参 AS 号(可能被规范化)；name 实例/VRF 名；
+ *       inst_type 实例类型(default / VRF / view)；as_pretty/asnotation 用于
+ *       按用户输入格式回显 AS(如 asdot)。
+ * 关键点：当 bgp_get 返回 BGP_CREATED(新建)时，这里会把“未配置项”的默认值逐项
+ * 落到新实例上——即把顶部那批 DFLT_* 默认档案转成实际的 BGP_FLAG_* 标志位，并设
+ * 默认定时器(keepalive/holdtime/connect-retry/delayopen)。返回 BGP_SUCCESS 或错误码。
+ * 这是“新建实例时默认值从哪来”的答案，也是改默认值档案后真正生效的地方。 */
 int bgp_get_vty(struct bgp **bgp, as_t *as, const char *name,
 		enum bgp_instance_type inst_type, const char *as_pretty,
 		enum asnotation_mode asnotation)
@@ -704,6 +852,13 @@ int bgp_get_vty(struct bgp **bgp, as_t *as, const char *name,
 	return ret;
 }
 
+/* 【函数】bgp_vty_find_and_parse_afi_safi_bgp —— show 命令的“万能参数解析器”。
+ * 针对形如 "show [ip] bgp [<view|vrf> NAME] [<ipv4|ipv6> [<safi>]] ..." 的命令，
+ * 依次解析出 vrf/bgp 实例、AFI、SAFI，并作为出参返回；返回最后命中的 token 位置
+ * (>=1) 或 0(失败)。设计要点：调用方需**预先**给 afi/safi/bgp 设好“本命令的默认
+ * 值”，本函数只在命令里真的出现了对应 token 时才覆盖——这样同一条 show 命令可
+ * 适配不同参数组合。VRF 名 "all" 表示所有实例(*bgp=NULL)；"vrf default" 归一为
+ * 默认实例。解析失败时按 use_json 决定用 JSON warning 还是文本报错。 */
 /*
  * bgp_vty_find_and_parse_afi_safi_bgp
  *
@@ -808,6 +963,11 @@ int bgp_vty_find_and_parse_afi_safi_bgp(struct vty *vty,
 	return *idx;
 }
 
+/* 【函数】peer_address_self_check —— 判断给定邻居地址 su 是否其实属于**本机**(self)。
+ * 做法：先看该地址是否落在本机某接口上(if_lookup_by_ipv4/6_exact)；
+ * 若是本地接口地址，再检查本实例的监听套接字里是否有与之匹配的本地地址，或是否
+ * 监听了 0.0.0.0/::(全体地址)——命中则判定为“自我”，返回 true。
+ * 用途：配置邻居前拒绝把本机地址配成邻居(避免自连)。 */
 static bool peer_address_self_check(struct bgp *bgp, union sockunion *su)
 {
 	struct interface *ifp = NULL;
@@ -843,6 +1003,12 @@ static bool peer_address_self_check(struct bgp *bgp, union sockunion *su)
 	return false;
 }
 
+/* 【函数】peer_lookup_vty —— 按字符串(IP/接口名/主机名)在当前 bgp 上下文里查邻居。
+ * 先在 VTY 上下文取当前 bgp(VTY_GET_CONTEXT)；用 str2sockunion 尝试按 IP 查(命中
+ * 的若是 dynamic neighbor 则拒绝)，否则退化为按接口名(peer_lookup_by_conf_if)或
+ * 主机名(peer_lookup_by_hostname)查找。查找失败会顺带回显错误提示。**仅用于配置**，
+ * 因此对动态邻居(dynamic neighbor)一律拒绝。
+ * 注意：需先配置 remote-as 或 peer-group，否则 peer_lookup 查不到(会提示先配)。 */
 /* Utility function for looking up peer from VTY.  */
 /* This is used only for configuration, so disallow if attempted on
  * a dynamic neighbor.
@@ -890,6 +1056,11 @@ static struct peer *peer_lookup_vty(struct vty *vty, const char *ip_str)
 /* This is used only for configuration, so disallow if attempted on
  * a dynamic neighbor.
  */
+/* 【函数】peer_and_group_lookup_vty —— 按字符串先当**邻居**、查不到再当 **peer-group**
+ * 查(与 peer_lookup_vty 的区别是它会尝试 group)。参数 peer_str 是 IP/接口名/主机名
+ * 或 group 名。这是大量 neighbor 命令的统一入口：因为同一命令既可作用于具体邻居
+ * 也可作用于 peer-group。返回 peer 或 peer_group(都包装成 struct peer 返回)。
+ * 注意：对动态邻居同样拒绝(仅用于配置)。 */
 struct peer *peer_and_group_lookup_vty(struct vty *vty, const char *peer_str)
 {
 	struct bgp *bgp = VTY_GET_CONTEXT(bgp);
@@ -937,6 +1108,12 @@ struct peer *peer_and_group_lookup_vty(struct vty *vty, const char *peer_str)
 	return NULL;
 }
 
+/* 【函数】bgp_vty_return —— 把内部的 bgp_create_error_code(以及以 BGP_ERR_ 开头的
+ * 各类错误码)翻译成面向用户的 vty 错误文本。约定：无错误的码(SUCCESS/CREATED/
+ * INSTANCE_EXISTS/GR_NO_OPERATION)不进 switch 主体、str 保持 NULL；有错误的码填
+ * str。最后：str 非空 → 打印 "%% <str>" 并返回 CMD_WARNING_CONFIG_FAILED；
+ * 否则返回 CMD_SUCCESS。几乎所有配置命令处理函数的收尾都是
+ * "return bgp_vty_return(vty, bgp_xxx(...))" 这种模式。 */
 int bgp_vty_return(struct vty *vty, enum bgp_create_error_code ret)
 {
 	const char *str = NULL;
@@ -1054,6 +1231,11 @@ int bgp_vty_return(struct vty *vty, enum bgp_create_error_code ret)
 	return CMD_SUCCESS;
 }
 
+/* 【枚举】clear_sort —— clear(重置)命令的“选择范围”。
+ *   clear_all      : 所有邻居；clear_peer : 指定单个邻居；
+ *   clear_group    : 指定 peer-group 的成员；clear_external : 所有 eBGP 邻居；
+ *   clear_as       : 某个特定 AS 的所有邻居。
+ * bgp_clear() 依此分支遍历不同集合。 */
 /* BGP clear sort. */
 enum clear_sort {
 	clear_all,
@@ -1063,6 +1245,11 @@ enum clear_sort {
 	clear_as
 };
 
+/* 【函数】bgp_clear_vty_error —— 把 clear 过程中的错误码翻译成给用户的提示。
+ * 关键分支：BGP_ERR_AF_UNCONFIGURED(该邻居没启用此 AF，提示去开 address-family)、
+ * BGP_ERR_SOFT_RECONFIG_UNCONFIGURED(既无 refresh 能力又没配入向软重配，无法软清)。
+ * vty 为 NULL 时走 zlog_warn(用于非交互触发)。
+ * 注意：get_afi_safi_str 打印 AF 名时传 for_json=false。 */
 static void bgp_clear_vty_error(struct vty *vty, struct peer *peer, afi_t afi,
 				safi_t safi, int error)
 {
@@ -1092,6 +1279,18 @@ static void bgp_clear_vty_error(struct vty *vty, struct peer *peer, afi_t afi,
 	}
 }
 
+/* 【函数】bgp_peer_clear —— 对**某个邻居**按 afi/safi 做清除。是 clear 的“单点”
+ * 执行体，被 bgp_clear() 逐邻居调用。
+ * 三种情况：
+ *   1) afi 与 safi 都 UNSPEC：遍历该邻居所有已启用的 AF(peer_af_array)，
+ *      逐一对每个 AF 执行清理；
+ *   2) 仅指定 afi：遍历该 afi 下所有已启用的 safi；
+ *   3) 同时指定 afi+safi：若该 AF 未启用则返回 1(让上层报 BGP_ERR_AF_UNCONFIGURED)，
+ *      否则直接清理。
+ * stype 区分清除类型：BGP_CLEAR_SOFT_NONE 表示**硬清除**(peer_clear，会话重来)，
+ * 其余值走 peer_clear_soft(软清，只重算路由不动会话)。清理前会把该 peer 对应
+ * subgroup 标记 SUBGRP_STATUS_FORCE_UPDATES，强制重发。
+ * 参数 nnode 是遍历链表时的“下一节点”指针(硬清可能释放当前节点，故由调用方保管)。 */
 static int bgp_peer_clear(struct peer *peer, afi_t afi, safi_t safi,
 			  struct listnode **nnode, enum bgp_clear_type stype)
 {
@@ -1163,6 +1362,22 @@ static int bgp_peer_clear(struct peer *peer, afi_t afi, safi_t safi,
 	return ret;
 }
 
+/* 【函数】bgp_clear —— clear 命令族的核心调度体(对应 "clear ip bgp ..." 等)。
+ * 参数：afi/safi 目标地址族(可 UNSPEC 表示全部)；sort 选择范围(见 enum clear_sort)；
+ *       stype 清除类型(硬/软)；arg 选择范围对应的参数(邻居名/组名/AS)。
+ * 逻辑：按 sort 分四支——clear_all / clear_peer / clear_group / clear_external /
+ *       clear_as，各自遍历对应的 peer 集合并调用 bgp_peer_clear()。
+ * 重点(易错)：
+ *   - 遍历时用 ALL_LIST_ELEMENTS(..., node, nnode, peer)，把 &nnode 透传给
+ *     bgp_peer_clear，因为硬清可能把当前节点(doppelganger)释放掉，必须预存下一节点。
+ *   - 硬清(BGP_CLEAR_SOFT_NONE)且 afi/safi 未指定时，会把 bgp->update_delay_over
+ *     复位(让 read-only 模式重新生效)。
+ *   - GR 相关：遍历中若发现启用了 GR 的邻居(gr_router_detected)，会据当前
+ *     present_zebra_gr_state 调 bgp_zebra_send_capabilities 同步 GR 能力给 zebra；
+ *     这里用到了 bgp_vty.h 里的 VTY_BGP_GR_* 宏或等价的手写分支。
+ *   - afi_safi_unspec 时用 bgp_clearing_batch_begin/end_event_start 把大量清除
+ *     批量合并，减少瞬时抖动。
+ * 返回值几乎恒为 CMD_SUCCESS；个别查找失败分支返回 CMD_WARNING。 */
 /* `clear ip bgp' functions. */
 static int bgp_clear(struct vty *vty, struct bgp *bgp, afi_t afi, safi_t safi,
 		     enum clear_sort sort, enum bgp_clear_type stype,
@@ -1378,6 +1593,8 @@ static int bgp_clear(struct vty *vty, struct bgp *bgp, afi_t afi, safi_t safi,
 	return CMD_SUCCESS;
 }
 
+/* 【函数】bgp_clear_vty —— bgp_clear 的“外壳”：先按实例名(或默认实例)定位 bgp，
+ * 再转调 bgp_clear()。命令处理函数基本都走这一层，把“查实例”与“执行清除”分离。 */
 static int bgp_clear_vty(struct vty *vty, const char *name, afi_t afi,
 			 safi_t safi, enum clear_sort sort,
 			 enum bgp_clear_type stype, const char *arg)
@@ -1402,6 +1619,9 @@ static int bgp_clear_vty(struct vty *vty, const char *name, afi_t afi,
 	return bgp_clear(vty, bgp, afi, safi, sort, stype, arg);
 }
 
+/* 【函数】bgp_clear_star_soft_in / bgp_clear_star_soft_out —— 对所有 AFI/SAFI 做
+ * 一次入向 / 出向软清(soft-in / soft-out)，作用于 name 指定的实例(全邻居)。
+ * 用于 "clear ip bgp * soft in/out" 这类命令：不动会话，仅按策略重算路由。 */
 /* clear soft inbound */
 static void bgp_clear_star_soft_in(struct vty *vty, const char *name)
 {
@@ -1425,11 +1645,20 @@ static void bgp_clear_star_soft_out(struct vty *vty, const char *name)
 }
 
 
+/* 【函数】bgp_clear_soft_in —— 对指定实例、指定 afi/safi 做一次入向软清(全邻居)。
+ * 与 star 版的区别：只作用于单个 afi/safi(而非遍历所有)；vty 传 NULL 表示非交互。
+ * 供 bgp_vty.h 声明的 extern void bgp_clear_soft_in(...) 使用。 */
 void bgp_clear_soft_in(struct bgp *bgp, afi_t afi, safi_t safi)
 {
 	bgp_clear(NULL, bgp, afi, safi, clear_all, BGP_CLEAR_SOFT_IN, NULL);
 }
 
+/* 【函数】peer_flag_modify_vty —— 邻居/组“布尔标志位”的统一设置/清除入口。
+ * 先经 peer_and_group_lookup_vty 定位 peer(或组)；做两处特判：
+ *   1) 直接连接邻居(peer->conf_if 非空)不允许配 disable-connected-check；
+ *   2) 清除 shutdown 标志前先清掉 shutdown 消息(peer_tx_shutdown_message_unset)。
+ * 再按 set 调 peer_flag_set / peer_flag_unset，最后交给 bgp_vty_return 统一回显。
+ * 下面的 peer_flag_set_vty / peer_flag_unset_vty 只是把 set 写死为 1/0 的薄封装。 */
 static int peer_flag_modify_vty(struct vty *vty, const char *ip_str,
 				uint64_t flag, int set)
 {
@@ -1473,6 +1702,10 @@ static int peer_flag_unset_vty(struct vty *vty, const char *ip_str,
 	return peer_flag_modify_vty(vty, ip_str, flag, 0);
 }
 
+/* 【函数】bgp_need_listening —— 确保该 bgp 实例有监听套接字(用于接收邻居连接)。
+ * 若 bm->listen_sockets 里还没有属于本实例的 listener：置 BGP_FLAG_VRF_MAY_LISTEN，
+ * 取到该实例对应的 vrf，然后 bgp_handle_socket() 真正开始监听。
+ * 场景：刚创建 default 实例时调用，让 BGP 端口开始 LISTEN。 */
 static void bgp_need_listening(struct bgp *bgp, struct vty *vty)
 {
 	struct listnode *node;
@@ -1493,6 +1726,11 @@ static void bgp_need_listening(struct bgp *bgp, struct vty *vty)
 
 #include "bgpd/bgp_vty_clippy.c"
 
+/* 【命令】bgp local-mac vni <vni> mac <MAC> seq <seq> —— (隐藏命令，DEFUN_HIDDEN)
+ * 语法：手工注入一条 EVPN MAC 记录(常用于测试)。
+ * 改动：调用 bgp_evpn_local_macip_add()，把 (vni, mac, ip=0, seq) 作为本地 MAC 加入
+ *       EVPN 表。会触发 EVPN 相关处理。
+ * 说明：DEFUN_HIDDEN 表示不在 help 中显示；作用对象是默认实例。 */
 DEFUN_HIDDEN (bgp_local_mac,
               bgp_local_mac_cmd,
               "bgp local-mac vni " CMD_VNI_RANGE " mac WORD seq (0-4294967295)",
@@ -1536,6 +1774,8 @@ DEFUN_HIDDEN (bgp_local_mac,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】no bgp local-mac vni <vni> mac <MAC> —— (隐藏命令) 删除上面注入的 EVPN
+ * 本地 MAC 记录，调用 bgp_evpn_local_macip_del()。 */
 DEFUN_HIDDEN (no_bgp_local_mac,
               no_bgp_local_mac_cmd,
               "no bgp local-mac vni " CMD_VNI_RANGE " mac WORD",
@@ -1575,6 +1815,22 @@ DEFUN_HIDDEN (no_bgp_local_mac,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】router bgp [ASNUM [<view|vrf> NAME] [as-notation <dot|dot+|plain>]]
+ * 这是进入 BGP 配置视图、并取得/创建 bgp 实例的**顶层命令**。DEFUN_NOSH 表示它是
+ * 配置块起点(会切换视图、不参与某些 "no" 语义)。
+ * 语法分支：
+ *   - 只有 "router bgp" (argc==2)：进入默认实例；但若存在多个实例则报错要求显式
+ *     指定 ASN+VRF。
+ *   - "router bgp X [vrf/view NAME] [as-notation ...]"：解析 AS(支持 asdot)、实例
+ *     类型(default/VRF/view)、AS 表示法。
+ * 改名/建实例：先 bgp_lookup_by_as_name_type() 查现有实例；不存在则 bgp_get_vty()
+ *   新建。若 AS/实例名与已有实例不符则报 AS_MISMATCH / INSTANCE_MISMATCH。
+ * 关键副作用(易错点)：
+ *   - 创建 default 实例时调 bgp_need_listening() 开始监听，并 vpn_leak_postchange_all()
+ *     重算 VPN 泄漏(可能之前通过 "router bgp X vrf FOO" 先建了 VRF 实例)。
+ *   - VRF/隐藏实例会 bgp_vpn_leak_export() 并清掉 INSTANCE_HIDDEN/DELETE_IN_PROGRESS。
+ *   - 最后 VTY_PUSH_CONTEXT(BGP_NODE, bgp) 把用户切进该实例的配置视图。
+ *   - 用户显式配置后清除 BGP_VRF_AUTO(自动创建的标记)。 */
 /* "router bgp" commands. */
 DEFUN_NOSH (router_bgp,
        router_bgp_cmd,
@@ -1723,6 +1979,10 @@ DEFUN_NOSH (router_bgp,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】no router bgp [ASNUM [<view|vrf> NAME] ...] —— 删除 bgp 实例。
+ * 重要校验(易错)：删除前若该实例有关联的 l3vni、或(对 default 实例而言)还存在
+ * 依赖它的 VRF 实例(自动创建的会被一并删掉；真正依赖 VPN 泄漏/EVPN 通告的则**拒绝
+ * 删除**并提示 "Dependent VRF instances exist")。校验通过后 bgp_delete()。 */
 /* "no router bgp" commands. */
 DEFUN (no_router_bgp,
        no_router_bgp_cmd,
@@ -1856,6 +2116,9 @@ DEFUN (no_router_bgp,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】bgp session-dscp <0-63> / no bgp session-dscp —— 覆盖 BGP TCP 连接的
+ * DSCP 值。改动：bm->ip_tos(全局，注意是 bm 不是 bgp) = dscp<<2；no 时恢复默认
+ * IPTOS_PREC_INTERNETCONTROL(CS6)。这是全进程级设置，非某实例。 */
 /* bgp session-dscp */
 
 DEFPY (bgp_session_dscp,
@@ -1883,6 +2146,10 @@ DEFPY (no_bgp_session_dscp,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】bgp router-id A.B.C.D / no bgp router-id —— 静态配置 BGP router-id。
+ * 改动：调 bgp_router_id_static_set()，写 bgp->router_id_static 并触发相关重算。
+ * no 版本会校验给定值与当前静态值是否一致(不一致则拒绝)，再置 0 清除。
+ * 注意：这只是**静态**配置值，实际生效的 router-id 可能因与其它实例冲突而被调整。 */
 /* BGP router-id.  */
 
 DEFPY (bgp_router_id,
@@ -1920,6 +2187,13 @@ DEFPY (no_bgp_router_id,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】[no] bgp community alias <COMMUNITY> <ALIAS_NAME> —— 为团体属性起可读别名。
+ * 语法：[no$no] 用同一 DEFPY 处理增删。COMMUNITY 形如 AA:BB 或 AA:BB:CC，
+ *       ALIAS_NAME 是别名。
+ * 改动：两个哈希表——community → alias、alias → community。先分别 lookup：
+ *   - no：从两张表删除。
+ *   - 增：若别名已存在却指向不同团体(或团体已存在却别名不同)则报冲突；否则插入。
+ * 说明：别名会被 bgp_community_alias_vty 注册的命令使用；本命令只维护映射表。 */
 DEFPY(bgp_community_alias, bgp_community_alias_cmd,
       "[no$no] bgp community alias WORD$community ALIAS_NAME$alias_name",
       NO_STR BGP_STR
@@ -1999,6 +2273,13 @@ DEFPY(bgp_community_alias, bgp_community_alias_cmd,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】[no] bgp suppress-fib-pending —— 只向邻居通告“已下发内核 FIB”的路由。
+ * 这里有两处同名命令，注册节点不同、作用域不同(易混)：
+ *   - bgp_global_suppress_fib_pending：全局(CONFIG_NODE)，改 bm 级开关
+ *     bm_wait_for_fib_set(!no)。
+ *   - bgp_suppress_fib_pending：实例(BGP_NODE)，改本实例开关
+ *     bgp_suppress_fib_pending_set(bgp, !no)。
+ * 二者语法文本相同，靠 install_element 的节点区分(见 bgp_vty_init)。 */
 DEFPY (bgp_global_suppress_fib_pending,
        bgp_global_suppress_fib_pending_cmd,
        "[no] bgp suppress-fib-pending",
@@ -2011,6 +2292,7 @@ DEFPY (bgp_global_suppress_fib_pending,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】[no] bgp suppress-fib-pending —— 实例级版本，见上方全局版的说明。 */
 DEFPY (bgp_suppress_fib_pending,
        bgp_suppress_fib_pending_cmd,
        "[no] bgp suppress-fib-pending",
@@ -2024,6 +2306,10 @@ DEFPY (bgp_suppress_fib_pending,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】bgp cluster-id <A.B.C.D|(1-4294967295)> —— 配置路由反射器(RR)的簇 ID。
+ * 改动：bgp_cluster_id_set() 写入 bgp->cluster_id；随后 bgp_clear_star_soft_out()
+ * 对全体邻居做一次出向软清——因为 cluster-id 会影响 RR 反射出向的 CLUSTER_LIST，
+ * 已有路由需要按新值重算/重发。这是“改了配置必须触发重算”的典型例子。 */
 /* BGP Cluster ID.  */
 DEFUN (bgp_cluster_id,
        bgp_cluster_id_cmd,
@@ -2050,6 +2336,8 @@ DEFUN (bgp_cluster_id,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】no bgp cluster-id —— 清除 RR 簇 ID(bgp_cluster_id_unset)，随后同样
+ * 做一次全体出向软清(出向 CLUSTER_LIST 需重算)。 */
 DEFUN (no_bgp_cluster_id,
        no_bgp_cluster_id_cmd,
        "no bgp cluster-id [<A.B.C.D|(1-4294967295)>]",
@@ -2066,6 +2354,10 @@ DEFUN (no_bgp_cluster_id,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】bgp no-rib / no bgp no-rib —— 全局开关“BGP 只做控制面、不把路由装进
+ * 内核 RIB(不下发 zebra)”。改动：设/清 BGP_OPT_NO_FIB 选项(运行时版本
+ * bgp_option_norib_set_runtime / unset_runtime)。已设置/已清除时给出提示并返回
+ * CMD_SUCCESS(幂等)。注意：这是**进程级独立选项**，不是 bgp 实例字段。 */
 DEFPY (bgp_norib,
        bgp_norib_cmd,
        "bgp no-rib",
@@ -2101,6 +2393,8 @@ DEFPY (no_bgp_norib,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】[no] bgp send-extra-data zebra —— 是否向 zebra 发送用于展示的额外数据。
+ * 改动：设/清 bm->flags 的 BM_FLAG_SEND_EXTRA_DATA_TO_ZEBRA(进程级)。 */
 DEFPY (no_bgp_send_extra_data,
        no_bgp_send_extra_data_cmd,
        "[no] bgp send-extra-data zebra",
@@ -2117,6 +2411,9 @@ DEFPY (no_bgp_send_extra_data,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】bgp confederation identifier ASNUM / no ... —— 配置/清除联邦(confederation)
+ * 的本域 AS。改动：bgp_confederation_id_set/unset()。联邦用于把多个小 AS 组织成
+ * 对外呈现为一个大 AS 的域。 */
 DEFUN (bgp_confederation_identifier,
        bgp_confederation_identifier_cmd,
        "bgp confederation identifier ASNUM",
@@ -2154,6 +2451,9 @@ DEFUN (no_bgp_confederation_identifier,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】bgp confederation peers ASNUM... / no ... —— 配置/删除联邦内的成员 AS 列表。
+ * 改动：逐个 ASNUM 调 bgp_confederation_peers_add/remove()。语法末尾 ASNUM... 表示
+ * 可接受多个 AS 参数。这些成员被视为“本域内部”，联邦内 eBGP 走特殊处理。 */
 DEFUN (bgp_confederation_peers,
        bgp_confederation_peers_cmd,
        "bgp confederation peers ASNUM...",
@@ -2204,6 +2504,14 @@ DEFUN (no_bgp_confederation_peers,
 	return CMD_SUCCESS;
 }
 
+/* 【函数】bgp_maxpaths_config_vty —— maximum-paths 配置中枢(设置/清除二合一)。
+ * 参数：peer_type(BGP_PEER_EBGP/IBGP) 决定是 eBGP 还是 iBGP 的 maxpaths；
+ *       mpaths 是最大等价路径数(字符串)；options 是附加选项位；set 决定增删。
+ * 关键点(易错)：
+ *   - afi/safi 取自**当前 CLI 节点**(bgp_node_afi/safi)，故命令挂在各 AF 子节点。
+ *   - 设置值不能超过全局 multipath_num，否则拒绝。
+ *   - 改完调 bgp_maximum_paths_set/unset()，再 bgp_recalculate_all_bestpaths()
+ *     重算所有最佳路径——否则等价多路径不会立即生效。 */
 /**
  * Central routine for maximum-paths configuration.
  * @peer_type: BGP_PEER_EBGP or BGP_PEER_IBGP
@@ -2249,6 +2557,12 @@ static int bgp_maxpaths_config_vty(struct vty *vty, int peer_type,
 	return CMD_SUCCESS;
 }
 
+/* 【命令族】bgp max-med ... —— 在通告的 MED 上做“抬升”控制：
+ *   bgp max-med administrative [N] : 管理性地长期把 MED 抬到 N(或默认值)；
+ *   bgp max-med on-startup <t> [N] : 启动后 t 秒内把 MED 抬到 N。
+ * 改动 bgp->v_maxmed_admin / maxmed_admin_value / v_maxmed_onstartup /
+ *       maxmed_onstartup_value，然后都调 bgp_maxmed_update() 重新计算并通告。
+ * 用途：做流量牵引/让本机在启动或维护期不被优选。 */
 DEFUN (bgp_maxmed_admin,
        bgp_maxmed_admin_cmd,
        "bgp max-med administrative ",
@@ -2352,6 +2666,17 @@ DEFUN (no_bgp_maxmed_onstartup,
 	return CMD_SUCCESS;
 }
 
+/* 【函数族】update-delay 配置(全局版 + 实例版)。
+ * update-delay 的含义：会话建立后先“压住”最佳路径计算与 UPDATE 发送一段时间，
+ * 等底层路由/邻居都稳定后再收敛，避免启动期反复抖动。b_establish_wait 是其中
+ * “等待会话建立”的子时长。
+ *   - bgp_global_update_delay_config_vty : "bgp update-delay D [W]"(bm 级)，
+ *     会先检查是否有实例级配置(有则拒绝并要求先删)，并把值下发到所有实例；
+ *     且要求 D>=W。
+ *   - bgp_update_delay_config_vty : "update-delay D [W]"(实例级)；
+ *     若已有全局配置则拒绝(二选一)。
+ *   - ..._deconfig_vty 是对应的清除；bgp_config_write_update_delay 负责写回。
+ * 易错点：全局与实例级互斥，改动前务必看另一级的当前值。 */
 static int bgp_global_update_delay_config_vty(struct vty *vty,
 					      uint16_t update_delay,
 					      uint16_t establish_wait)
@@ -2533,6 +2858,13 @@ DEFPY (no_bgp_update_delay,
 }
 
 
+/* 【函数族】write-quanta / read-quanta —— 每轮 I/O 读/写多少个报文。
+ *   bgp_wpkt_quanta_config_vty : 设/清 bgp->wpkt_quanta(原子写)；清除回默认
+ *     BGP_WRITE_PACKET_MAX。
+ *   bgp_rpkt_quanta_config_vty : 同理设/清 bgp->rpkt_quanta(BGP_READ_PACKET_MAX)。
+ * bgp_config_write_* 负责写回(仅在非默认值时输出)。
+ * 注意：这些值决定 I/O 线程里栈缓冲区大小，改动要与 BGP_WRITE_PACKET_MAX /
+ * BGP_READ_PACKET_MAX 保持一致，防止栈溢出(见下方英文注释)。 */
 static int bgp_wpkt_quanta_config_vty(struct vty *vty, uint32_t quanta,
 				      bool set)
 {
@@ -2615,6 +2947,10 @@ static void bgp_config_tcp_keepalive(struct vty *vty, struct bgp *bgp)
 	}
 }
 
+/* 【命令】coalesce-time <ms> / no coalesce-time —— 更新子组(subgroup)打包合并计时器。
+ * 改动：设 bgp->heuristic_coalesce=false 并写 bgp->coalesce_time(取命令行值)；
+ * no 版恢复启发式(heuristic_coalesce=true)与默认值 BGP_DEFAULT_SUBGROUP_COALESCE_TIME。
+ * 作用：控制把多个前缀合并进同一次 UPDATE 前的等待时长，是收敛速度与打包效率的权衡。 */
 DEFUN (bgp_coalesce_time,
        bgp_coalesce_time_cmd,
        "coalesce-time (0-4294967295)",
@@ -2647,6 +2983,11 @@ DEFUN (no_bgp_coalesce_time,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】[no] use-underlays-nexthop-weight —— 让 zebra 在递归解析路由时沿用
+ * underlay 的下一跳权重。设置路径置 BGP_FLAG_USE_RECURSIVE_WEIGHT，清除路径清
+ * BGP_WECMP_BEHAVIOR_USE_RECURSIVE_VALUE。
+ * 疑点：set 与 no 使用了**不同名字**的标志位(一个 BGP_FLAG_、一个 BGP_WECMP_)，
+ * 二者是否指同一语义待确认(可能是命名不一致或历史遗留)。 */
 DEFPY (bgp_use_underlying_nexthop_weight,
        bgp_use_underlying_nexthop_weight_cmd,
        "[no] use-underlays-nexthop-weight",
@@ -2663,6 +3004,8 @@ DEFPY (bgp_use_underlying_nexthop_weight,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】maximum-paths / no maximum-paths 等 —— 配置 eBGP/iBGP 等价多路径数。
+ * 均转调 bgp_maxpaths_config_vty()(见上)，选项位区分 eBGP/iBGP 与附加行为。 */
 /* Maximum-paths configuration */
 DEFUN (bgp_maxpaths,
        bgp_maxpaths_cmd,
@@ -3245,6 +3588,18 @@ static int bgp_global_gr_config_vty(struct vty *vty, bool on, bool disable)
 	return bgp_vty_return(vty, ret);
 }
 
+/* 【命令族】bgp graceful-restart ... —— BGP 的优雅重启(GR)配置。
+ * GR 含义：设备/进程重启时，通告对端“我会回来”，对端在一段时间内**保留**从我这
+ * 学到的路由(标记为 stale)而不是立即删除，从而避免路由震荡。
+ * 命令分布要点(易错)：
+ *   - 本组命令多为“双层”语义：在 CONFIG_NODE(全局)下作用于 bm 并下发给所有实例；
+ *     在 BGP_NODE(实例)下只改单实例。处理函数里常以 `if (vty->node == CONFIG_NODE)`
+ *     分叉，分别调用 bgp_global_gr_config_vty / bgp_inst_gr_config_vty。
+ *   - 相关子项：stalepath-time(保留 stale 路由的最长时间)、restart-time(等待对端
+ *     OPEN 的时长)、select-defer-time(重启后推迟选路的时间)、preserve-fw、
+ *     rib-stale-time、notification、disable，以及 per-neighbor 的 GR 设置。
+ *   - 改 restart-time 等会影响 GR 能力通告：需对每个 peer 重发 RESTART 能力，或
+ *     (无动态能力时)重置会话——见下方 bgp_update_graceful_restart_capability。 */
 /* "bgp graceful-restart mode" configuration. */
 DEFUN (bgp_graceful_restart,
 	bgp_graceful_restart_cmd,
@@ -3320,6 +3675,13 @@ DEFUN (bgp_graceful_restart_stalepath_time,
 	return CMD_SUCCESS;
 }
 
+/* 【函数】bgp_update_graceful_restart_capability —— GR 能力变更后“重启该 peer 的会话”，
+ * 使更新后的 GR 能力能在新的 OPEN 里重新协商。
+ * 做法：先取全局与邻居的 GR 模式；若该 peer 根本不在 GR 模式(既不是 PEER_GR，也不是
+ * “继承全局且全局为 GLOBAL_GR”)，直接返回不动它。否则，若会话处于可发通知的状态，
+ * 调 bgp_notify_send(CEASE/CONFIG_CHANGE) 触发重连——用 CEASE 通知让对端知道是配置
+ * 变更导致的，从而可以配合 GR 语义。(见下方英文注释。)
+ * 注意：这是“会断会话”的操作，只在无动态能力(PEER_CAP_DYNAMIC)时才走这里。 */
 /*
  * Reset the BGP session since there's a change
  * in GR capability
@@ -5092,6 +5454,9 @@ void bgp_config_write_listen(struct vty *vty, struct bgp *bgp)
 }
 
 
+/* 【命令】[no] bgp disable-ebgp-connected-route-check —— 关闭“对端(下一跳)必须
+ * 与本地直连”的检查。改动：设/清 BGP_FLAG_DISABLE_NH_CONNECTED_CHK，并做一次
+ * 全体入向软清(bgp_clear_star_soft_in)——因为放宽检查后可能有新的 eBGP 路由变有效。 */
 DEFUN (bgp_disable_connected_route_check,
        bgp_disable_connected_route_check_cmd,
        "bgp disable-ebgp-connected-route-check",
@@ -5120,6 +5485,16 @@ DEFUN (no_bgp_disable_connected_route_check,
 }
 
 
+/* 【函数】peer_remote_as_vty —— "neighbor <X> remote-as <AS|internal|external|auto>"
+ * 的统一实现(新建邻居/组并为它指定对端 AS)。
+ * 解析 as_str：以 'i'/'e'/'a' 开头分别为 internal/external/auto(AS 记 0)，否则按
+ *   数字 AS 解析(asn_str2asn)。
+ * 分派(易错)：peer_str 若能解析为地址 → 先 peer_address_self_check 拒绝把本机配成
+ *   邻居，再 bgp_need_listening() 起监听，调 peer_remote_as(带 sockunion)。
+ *   否则当接口名/主机名/组名：先 peer_lookup_by_conf_if 看是否接口邻居，调
+ *   peer_remote_as(带名字)；失败再试 peer_group_remote_as(peer-group)，都失败则提示
+ *   "先创建 peer-group 或 interface"。成功后同样 bgp_need_listening。
+ * 这是“邻居如何被创建”的核心路径。返回值经 bgp_vty_return 回显。 */
 static int peer_remote_as_vty(struct vty *vty, const char *peer_str,
 			      const char *as_str)
 {
@@ -5183,6 +5558,8 @@ static int peer_remote_as_vty(struct vty *vty, const char *peer_str,
 	return bgp_vty_return(vty, ret);
 }
 
+/* 【命令】[no] bgp default shutdown —— 对“新配置的邻居”默认施加管理性 shutdown
+ * (即新建邻居默认处于 shutdown 状态)。改动：bgp->autoshutdown。 */
 DEFUN (bgp_default_shutdown,
        bgp_default_shutdown_cmd,
        "[no] bgp default shutdown",
@@ -5196,6 +5573,12 @@ DEFUN (bgp_default_shutdown,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】bgp shutdown message MSG... / bgp shutdown / no bgp shutdown —— 对本 bgp
+ * 实例做管理性关闭(admin shutdown)，并可附带 RFC 8203 的 shutdown 通信消息。
+ * 改动：bgp_shutdown_enable(bgp, msg)(msg 过长>BGP_ADMIN_SHUTDOWN_MSG_LEN 则拒绝)、
+ *       no 走 bgp_shutdown_disable。会按 GR 语义通知对端(见 RFC 8203)。
+ * 末尾 ALIAS(no_bgp_shutdown, ...) 给 "no bgp shutdown message MSG..." 起别名，
+ *   复用 no_bgp_shutdown 的处理函数。 */
 DEFPY(bgp_shutdown_msg, bgp_shutdown_msg_cmd, "bgp shutdown message MSG...",
       BGP_STR
       "Administrative shutdown of the BGP instance\n"
@@ -5246,6 +5629,8 @@ ALIAS(no_bgp_shutdown, no_bgp_shutdown_msg_cmd,
       "Administrative shutdown of the BGP instance\n"
       "Add a shutdown message (RFC 8203)\n" "Shutdown message\n")
 
+/* 【命令】neighbor <A.B.C.D|X:X::X:X|WORD> remote-as <ASNUM|internal|external|auto>
+ * 命令壳，取 argv 后转 peer_remote_as_vty()(见上)。这是建立 BGP 邻居最常用的命令。 */
 DEFUN (neighbor_remote_as,
        neighbor_remote_as_cmd,
        "neighbor <A.B.C.D|X:X::X:X|WORD> remote-as <ASNUM|internal|external|auto>",
@@ -5910,6 +6295,12 @@ DEFUN (no_neighbor_password,
 	return bgp_vty_return(vty, ret);
 }
 
+/* 【命令】neighbor <X> activate / no neighbor <X> activate —— 为某邻居**启用/停用**
+ * 当前 address-family(由 CLI 节点决定 afi/safi)。
+ * 改动：peer_activate()/peer_deactivate()。这是“邻居在该 AF 上是否收发路由”的总开关；
+ * 只有 activate 的 AF 才会向该邻居通告/接收该 AF 的路由。
+ * ALIAS_HIDDEN：同一命令另有隐藏别名(供地址族特定的语法复用)。
+ * 易错：不加 activate，就算配了 remote-as 也不会在该 AF 交换路由。 */
 DEFUN (neighbor_activate,
        neighbor_activate_cmd,
        "neighbor <A.B.C.D|X:X::X:X|WORD> activate",
@@ -5960,6 +6351,13 @@ ALIAS_HIDDEN(no_neighbor_activate, no_neighbor_activate_hidden_cmd,
 	     NO_STR NEIGHBOR_STR NEIGHBOR_ADDR_STR2
 	     "Enable the Address Family for this Neighbor\n")
 
+/* 【命令】neighbor <X> peer-group PGNAME / no neighbor ... —— 把邻居加入/移出 peer-group。
+ * 加入：校验地址(拒绝本机、拒绝动态邻居)、要求 group 已存在，然后
+ *   peer_group_bind(bgp, su, peer, group, &as) 建立绑定(会继承 group 的配置)。
+ * 移出(no)：lookup 邻居与 group 后，若曾启用 ENHE 能力则先
+ *   bgp_zebra_terminate_radv，再 peer_notify_unconfig + peer_delete 删除该邻居。
+ * 易错：peer-group 是“模板”，成员邻居的很多配置来自 group；绑定/解绑会触发
+ * 配置向成员下发/回收(见 peer_group2peer_config_copy 等)。 */
 DEFUN (neighbor_set_peer_group,
        neighbor_set_peer_group_cmd,
        "neighbor <A.B.C.D|X:X::X:X|WORD> peer-group PGNAME",
@@ -6064,6 +6462,9 @@ ALIAS_HIDDEN(no_neighbor_set_peer_group, no_neighbor_set_peer_group_hidden_cmd,
 	     "Member of the peer-group\n"
 	     "Peer-group name\n")
 
+/* 【命令族】neighbor <X> passive —— 让本端**被动**等待对端发起 TCP 连接，自己
+ * 不主动去连(置 PEER_FLAG_PASSIVE)；no 形式清除该标志。影响的是会话建立阶段
+ * “由谁 connect”，重连与否交给 FSM。 */
 /* neighbor passive. */
 DEFUN (neighbor_passive,
        neighbor_passive_cmd,
@@ -6088,6 +6489,14 @@ DEFUN (no_neighbor_passive,
 	return peer_flag_unset_vty(vty, argv[idx_peer]->arg, PEER_FLAG_PASSIVE);
 }
 
+/* 【命令族】neighbor <X> shutdown [message MSG...] —— 管理性关闭该邻居会话。
+ * 带 message 时先用 peer_tx_shutdown_message_set() 记录一条 RFC 8203 的
+ * shutdown 通信消息(会随 NOTIFICATION 发给对端)，再置 PEER_FLAG_SHUTDOWN；
+ * no 形式清除该标志。注意“shutdown message”与“shutdown”由 ALIAS 复用同一入口，
+ * 区别只在于是否携带 MSG...。
+ * 【变体】shutdown rtt (1-65535) [count (1-255)] —— RTT 健康检查触发式关闭：
+ *   设置 peer->rtt_expected(期望 RTT，ms) 与 rtt_keepalive_conf(连续多少轮
+ *   keepalive 超标即关)，并置 PEER_FLAG_RTT_SHUTDOWN；no 形式把两者复位(0/1)。 */
 /* neighbor shutdown. */
 DEFUN (neighbor_shutdown_msg,
        neighbor_shutdown_msg_cmd,
@@ -6199,6 +6608,20 @@ DEFUN(no_neighbor_shutdown_rtt,
 				   PEER_FLAG_RTT_SHUTDOWN);
 }
 
+/* 【命令族】neighbor <X> capability ... —— 控制本端为该邻居**通告哪些能力
+ * (Capability)**，以及是否做能力协商：
+ *   capability dynamic         : 置 PEER_FLAG_DYNAMIC_CAPABILITY（动态能力，
+ *                                允许会话期间增删 AFI/SAFI 而不必重连）。
+ *   dont-capability-negotiate  : 置 PEER_FLAG_DONT_CAPABILITY（完全不做协商）。
+ *   capability fqdn            : 置/清 PEER_FLAG_CAPABILITY_FQDN。
+ *   capability extended-nexthop: 置/清 PEER_FLAG_CAPABILITY_ENHE。**接口型邻居
+ *                                (peer->conf_if，即 unnumbered/直连接口)不允许关闭**，
+ *                                且开启时会触发 radv 处理；见下方 no 分支的显式检查。
+ *   capability software-version: 置/清 PEER_FLAG_CAPABILITY_SOFT_VERSION_NEW|OLD
+ *                                （后者由 latest-encoding 开关选择编码版本）。
+ *   这些命令除改标志外，还会调用 bgp_capability_send() **立即向对端发出/撤回**
+ *   对应能力的协商(不等重连)。所有入口都用 peer_and_group_lookup_vty 定位
+ *   peer（邻居或 peer-group 均可），找不到则 CMD_WARNING_CONFIG_FAILED。 */
 /* neighbor capability dynamic. */
 DEFUN (neighbor_capability_dynamic,
        neighbor_capability_dynamic_cmd,
@@ -6369,6 +6792,9 @@ DEFPY(neighbor_capability_software_version,
 }
 
 /* neighbor capability link-local */
+/* 【命令】neighbor <X> capability link-local —— 置/清
+ * PEER_FLAG_CAPABILITY_LINK_LOCAL，并立即用 bgp_capability_send() 向对端
+ * 通告/撤回 Link-Local Next Hop 能力。 */
 DEFPY(neighbor_capability_link_local,
       neighbor_capability_link_local_cmd,
       "[no$no] neighbor <A.B.C.D|X:X::X:X|WORD>$neighbor capability link-local",
@@ -6396,6 +6822,9 @@ DEFPY(neighbor_capability_link_local,
 	return ret;
 }
 
+/* 【命令】neighbor <X> rpki strict —— 置/清 PEER_FLAG_RPKI_STRICT。
+ * strict 模式下 RPKI 校验状态为 "not-found" 的路由也按不可用处理（更严格）。
+ * 注意这里直接用 peer_flag_set/unset（而非 _vty 封装），因为已经不校验返回值。 */
 /* RPKI strict mode */
 DEFPY(neighbor_rpki_strict,
       neighbor_rpki_strict_cmd,
@@ -6418,6 +6847,12 @@ DEFPY(neighbor_rpki_strict,
 	return peer_flag_set(peer, PEER_FLAG_RPKI_STRICT);
 }
 
+/* 【函数】peer_af_flag_modify_vty / peer_af_flag_set_vty / peer_af_flag_unset_vty
+ * —— address-family 维度(按 afi/safi)设置/清除 peer 标志的公共封装，作用对象
+ * 是 peer->af_flags[afi][safi]（**不同于**按会话维度的 peer_flag_*_vty）。
+ * 三者关系：modify(set=1/0) 是中枢，set/unset 是它的两个薄封装。
+ * peer_str 既可为邻居地址/名，也可为 peer-group 名（peer_and_group_lookup_vty）。
+ * 返回值经 bgp_vty_return 转成 CLI 结果。大量 AF 级 neighbor 命令都复用它。 */
 static int peer_af_flag_modify_vty(struct vty *vty, const char *peer_str,
 				   afi_t afi, safi_t safi, uint64_t flag,
 				   int set)
@@ -6449,6 +6884,13 @@ static int peer_af_flag_unset_vty(struct vty *vty, const char *peer_str,
 	return peer_af_flag_modify_vty(vty, peer_str, afi, safi, flag, 0);
 }
 
+/* 【命令族】neighbor <X> capability orf prefix-list <both|send|receive> ——
+ * ORF(Outbound Route Filtering, RFC 5291)能力配置，作用于当前 AF(bgp_node_afi/safi)：
+ *   send    -> 置 PEER_FLAG_ORF_PREFIX_SM（本端把 ORF 发出去，请对端按此过滤其发来的路由）。
+ *   receive -> 置 PEER_FLAG_ORF_PREFIX_RM（本端接收并使用对端发来的 ORF）。
+ *   both    -> 两者都置（用按位或把两处返回值合并）。
+ * 设置后调用 bgp_capability_send(CAPABILITY_CODE_ORF, SET) **立即发起**能力协商。
+ * no 形式对称：unset 对应标志并发送 CAPABILITY_ACTION_UNSET。 */
 /* neighbor capability orf prefix-list. */
 DEFUN (neighbor_capability_orf_prefix,
        neighbor_capability_orf_prefix_cmd,
@@ -6579,6 +7021,12 @@ ALIAS_HIDDEN(
 	"Capability to RECEIVE the ORF from this neighbor\n"
 	"Capability to SEND the ORF to this neighbor\n")
 
+/* 【命令族】neighbor <X> next-hop-self [force|all] —— 向该邻居通告路由时把
+ * 下一跳改写为本端地址，作用于当前 AF：
+ *   无后缀      -> PEER_FLAG_NEXTHOP_SELF（仅对 **eBGP** 学习到的路由生效）。
+ *   force|all   -> PEER_FLAG_FORCE_NEXTHOP_SELF（**对所有路由**生效，含 RR 反射的）。
+ * 注意 force 与 all 两个写法由 ALIAS_HIDDEN 复用到同一实现，语义相同。
+ * no 形式用对称的 peer_af_flag_unset_vty 清除。 */
 /* neighbor next-hop-self. */
 DEFUN (neighbor_nexthop_self,
        neighbor_nexthop_self_cmd,
@@ -10300,6 +10748,12 @@ static int set_ecom_list(struct vty *vty, int argc, struct cmd_token **argv,
 	return CMD_SUCCESS;
 }
 
+/* 【VPN 泄漏(import/export)命令族的公共校验】vpn_policy_getafi —— 从当前 CLI 节点
+ * 取 afi(只允许在 ipv4/ipv6 unicast 块中使用)，并做**互斥校验**：
+ *   - 非 import-vrf 场景(即 vpn 侧命令)时，若已配 import vrf 类标志(V2V import/export)
+ *     则报错要求先取消；
+ *   - import-vrf 场景(v2vimport=true)时，若已配 vpn to vrf 类标志(MPLSVPN<->VRF)则报错。
+ * 即“vpn-to-vrf”与“vrf-to-vrf”两种泄漏方式不能混用。返回 AFI_MAX 表示校验/取 afi 失败。 */
 /*
  * v2vimport is true if we are handling a `import vrf ...` command
  */
@@ -10342,6 +10796,19 @@ static afi_t vpn_policy_getafi(struct vty *vty, struct bgp *bgp, bool v2vimport)
 	return afi;
 }
 
+/* 【VPN 泄漏命令族总览】以下 DEFPY 用于 MPLS L3VPN 里“本 VRF 的路由 ↔ VPNv4/v6
+ * 路由”的相互泄漏(leak/import/export)，关键概念：
+ *   - RD(Route Distinguisher, af_rd_vpn_export)：给本 VRF 泄漏到 VPN 的路由打 RD。
+ *   - RT(Route Target, af_rt_vpn_imexport)：import/export 的 RT 匹配(ecommunity)。
+ *   - route-map 钩子(af_route_map_vpn_imexport)：泄漏时套用策略。
+ *   - nexthop/sid/label 等导出参数(af_nexthop_vpn_export / af_label_vpn_export /
+ *     af_sid_vpn_export)。
+ *   - import vrf 系列(af_import_vrf_route_map / bgp_imexport_vrf)：VRF↔VRF 直接互导
+ *     (不经 VPN 表)；bgp_imexport_vpn 是 VRF↔VPN 一侧。
+ * 通用套路(易错)：改任何泄漏参数前先 vpn_leak_prechange() 把旧的泄漏撤销，改完再
+ * vpn_leak_postchange() 重新建立——否则会残留错误的 VPN 路由。这些命令基本都挂在
+ * BGP_IPV4_NODE / BGP_IPV6_NODE(unicast)里，且受 vpn_policy_getafi 的互斥校验约束。
+ */
 DEFPY (af_rd_vpn_export,
        af_rd_vpn_export_cmd,
        "[no] rd vpn export ASN:NN_OR_IP-ADDRESS:NN$rd_str",
@@ -11342,6 +11809,15 @@ DEFPY (af_routetarget_import,
 	return CMD_SUCCESS;
 }
 
+/* 【命令族】address-family ... —— 进入各 address-family 配置子视图(切换 CLI 节点)。
+ * DEFUN_NOSH 表示是子视图起点。语法示例：
+ *   address-family ipv4 [<unicast|multicast|vpn|labeled-unicast|flowspec>]
+ *   address-family ipv6 [...]    address-family l2vpn evpn
+ *   (旧语法) address-family vpnv4/vpnv6 [unicast]（受 KEEP_OLD_VPN_COMMANDS 包裹）
+ * 作用：仅把 vty->node 切到对应 BGP_*_NODE，本身不改路由配置。真正的 AF 配置由该
+ * 视图内的后续命令完成，且**必须先 activate 邻居**才会在该 AF 生效。
+ * 校验：非默认实例(non-core instance)只允许 unicast/multicast/evpn 三种 SAFI。
+ * 相关：exit_address_family 退出回到 BGP_NODE。 */
 DEFUN_NOSH (address_family_ipv4_safi,
 	address_family_ipv4_safi_cmd,
 	"address-family ipv4 [<unicast|multicast|vpn|labeled-unicast|flowspec>]",
@@ -11755,6 +12231,14 @@ static int bgp_clear_prefix(struct vty *vty, const char *view_name,
 }
 
 /* one clear bgp command to rule them all */
+/* 【命令】clear [ip] bgp [<view|vrf> NAME] [<ipv4|ipv6|l2vpn> [<safi>]]
+ *   <*|ADDR|WORD|ASNUM|external|peer-group NAME> [<soft [<in|out>]|in [prefix-filter]|
+ *   out|message-stats|capabilities>]
+ * 这是**功能最全的 clear 命令**：用 argv_find 逐段解析出 vrf/afi/safi/清除范围
+ * (clr_sort)/清除类型(clr_type)，再统一交给 bgp_clear_vty()。
+ * clr_sort 由最后的选择器决定(见 enum clear_sort)；clr_type 由 soft/in/out/
+ * prefix-filter/message-stats/capabilities 决定，缺省 BGP_CLEAR_SOFT_NONE(硬清)。
+ * 这是 argv_find 用法的最佳示例：大量可选 token 靠“找到才设”的模式拼出最终语义。 */
 DEFUN (clear_ip_bgp_all,
        clear_ip_bgp_all_cmd,
        "clear [ip] bgp [<view|vrf> VIEWVRFNAME] [<ipv4|ipv6|l2vpn> [<unicast|multicast|vpn|labeled-unicast|flowspec|evpn>]] <*|A.B.C.D$neighbor|X:X::X:X$neighbor|WORD$neighbor|ASNUM|external|peer-group PGNAME> [<soft [<in|out>]|in [prefix-filter]|out|message-stats|capabilities>]",
@@ -11863,6 +12347,8 @@ DEFUN (clear_ip_bgp_all,
 	return bgp_clear_vty(vty, vrf, afi, safi, clr_sort, clr_type, clr_arg);
 }
 
+/* 【命令】clear [ip] bgp [<view|vrf> NAME] prefix A.B.C.D/M —— 对**某个具体前缀**
+ * 触发最佳路径重算并重新通告(用于强制刷新单条路由)。转 bgp_clear_prefix()。 */
 DEFUN (clear_ip_bgp_prefix,
        clear_ip_bgp_prefix_cmd,
        "clear [ip] bgp [<view|vrf> VIEWVRFNAME] prefix A.B.C.D/M",
@@ -17972,6 +18458,10 @@ static int bgp_show_one_peer_group(struct vty *vty, struct peer_group *group,
 	return CMD_SUCCESS;
 }
 
+/* 【函数】bgp_show_peer_group_vty —— show bgp peer-group 的实现：定位实例(name 为
+ * NULL 取默认)，遍历 group 列表；给了 group_name 就只显示匹配的那个(找不到且非 json
+ * 时提示 "No such peer-group")。uj 为 true 时输出 JSON。每个组由
+ * bgp_show_one_peer_group 打印详情。 */
 static int bgp_show_peer_group_vty(struct vty *vty, const char *name,
 				   const char *group_name, bool uj)
 {
@@ -18016,6 +18506,8 @@ static int bgp_show_peer_group_vty(struct vty *vty, const char *name,
 	return CMD_SUCCESS;
 }
 
+/* 【命令】show [ip] bgp [<view|vrf> NAME] peer-group [PGNAME] [json]
+ * 命令壳：解析 view/vrf 与可选 PGNAME，转 bgp_show_peer_group_vty()。 */
 DEFUN(show_ip_bgp_peer_groups, show_ip_bgp_peer_groups_cmd,
       "show [ip] bgp [<view|vrf> VIEWVRFNAME] peer-group [PGNAME] [json]",
       SHOW_STR IP_STR BGP_STR BGP_INSTANCE_HELP_STR
@@ -18036,6 +18528,19 @@ DEFUN(show_ip_bgp_peer_groups, show_ip_bgp_peer_groups_cmd,
 
 /* Redistribute VTY commands.  */
 
+/* 【命令族】redistribute <protocol> [route-map NAME] [metric N] —— 把其它路由协议
+ * (connected/static/ospf/isis/rip/kernel/babel...)的路由“再分发”进 BGP。
+ * 语法组合矩阵：可带 route-map、metric，或两者都有；ospf 还有独立的 metric 变体。
+ * 处理套路(以 ipv4 为例，注意这些命令挂在 BGP_IPV4_NODE):
+ *   1) proto_redistnum() 把协议名转成 ZEBRA_ROUTE_*(无效则报错)；
+ *   2) bgp_redist_add() 在 bgp->redist 里登记该协议(顺带设置默认 metric)；
+ *   3) 若要 route-map，bgp_redistribute_rmap_set()；若要 metric，
+ *      bgp_redistribute_metric_set()；
+ *   4) bgp_redistribute_set(bgp, afi, type, ...) 真正生效，并(out_changed)决定是否
+ *      触发对邻居的通告刷新。
+ * 易错：add 只登记结构，必须调 bgp_redistribute_set 才会向 zebra 订阅并开始再分发。
+ * ALIAS_HIDDEN 为同名命令提供隐藏别名(供地址族特定/内部语法复用)。
+ * 对应 no_bgp_redistribute_ipv4 走 bgp_redistribute_unset 相反流程。 */
 DEFUN (bgp_redistribute_ipv4,
        bgp_redistribute_ipv4_cmd,
        "redistribute " FRR_IP_REDIST_STR_BGPD,
@@ -20746,6 +21251,17 @@ int bgp_config_write(struct vty *vty)
 }
 
 
+/* 【数据结构总览：cmd_node —— CLI 的“节点/视图”定义】
+ * 每个 cmd_node 描述一个 CLI 视图：名字、唯一 node 枚举、父节点(决定如何进入)、
+ * 提示符、以及(可选)config_write 回调(写 running-config 时该视图下要输出的内容)。
+ * 命令通过 install_element(node, &cmd) 挂到某个 node，只有在该视图里才可见。
+ * 关键点(易错)：
+ *   - **只有顶层 bgp_node 挂了 config_write=bgp_config_write**；各 address-family
+ *     子节点不再各自挂回调，由 bgp_config_write 内部递归输出——所以改“配置写回”
+ *     要改 bgp_config_write 而非这些 node。
+ *   - no_xpath = true：该节点不参与基于 XPath 的 northbound 配置(传统 VTY-only)。
+ * BGP 的节点层级：CONFIG_NODE →(router bgp)→ BGP_NODE →(address-family ...)->
+ *   各 BGP_*_NODE；EVPN 下还有 BGP_EVPN_VNI_NODE(父为 BGP_EVPN_NODE)。 */
 /* BGP node structure. */
 static struct cmd_node bgp_node = {
 	.name = "bgp",
@@ -20857,8 +21373,15 @@ static struct cmd_node bgp_srv6_node = {
 	.prompt = "%s(config-router-srv6)# ",
 };
 
+/* 【前置声明】community_list_vty 前向声明(实现在文件末尾 ~24202)。 */
 static void community_list_vty(void);
 
+/* 【命令补全函数族】bgp_ac_* 是 CLI 的“Tab 补全”回调(命名为 _ac_ = auto-complete)。
+ *   bgp_ac_peergroup : 遍历所有实例的所有 peer-group，把 group 名加入候选。
+ *   bgp_ac_peer      : 遍历所有 peer，按 token 期望类型(IPv4/IPv6/接口变量)过滤后加入
+ *                      候选；只在与 token 类型相符时提供，避免重复/串类型。
+ *   bgp_ac_neighbor  : 先补 peer；若 token 是 VARIABLE 类型(可填空)再补 peer-group 名。
+ * 这些函数只在交互补全时被调用，不改变配置。 */
 static void bgp_ac_peergroup(vector comps, struct cmd_token *token)
 {
 	struct bgp *bgp;
@@ -20910,6 +21433,11 @@ static void bgp_ac_neighbor(vector comps, struct cmd_token *token)
 		bgp_ac_peergroup(comps, token);
 }
 
+/* 【变量补全注册表】把“命令里的变量名/variable token”绑定到上面的补全函数。
+ * bgp_var_neighbor  : neighbor/neighbors/peer 这些变量名都用 bgp_ac_neighbor 补全。
+ * bgp_var_peergroup : token 名为 PGNAME 的用 bgp_ac_peergroup 补全。
+ * 末尾 {.completions=NULL} 是终止哨兵。在 bgp_vty_init 里通过
+ * cmd_variable_handler_register 注册。 */
 static const struct cmd_variable_handler bgp_var_neighbor[] = {
 	{.varname = "neighbor", .completions = bgp_ac_neighbor},
 	{.varname = "neighbors", .completions = bgp_ac_neighbor},
@@ -20920,10 +21448,21 @@ static const struct cmd_variable_handler bgp_var_peergroup[] = {
 	{.tokenname = "PGNAME", .completions = bgp_ac_peergroup},
 	{.completions = NULL} };
 
+/* 【配置事务(config transaction)机制】解决“整份配置是分批读入的，读一半时不该做
+ * 事后处理(如发 EoR、启动 GR 邻居)”的问题。做法：
+ *   - 读配置开始时 bgp_config_start()：起一个 t_bgp_cfg 定时器(上限 600s)兜底；
+ *   - 配置真正读完 bgp_config_end()：清掉定时器、置 BM_FLAG_CONFIG_LOADED、
+ *     按需 bgp_gr_start_peers()，并(通常延时到 route-map 处理完)发 EoR；
+ *   - 若超时未等到 end，bgp_config_end_timeout() 打错误日志后强制 finish。
+ *   - bgp_config_finish() 对所有实例调用 bgp_config_end 钩子。
+ * bgp_config_inprocess() 返回“事务是否进行中”(定时器是否在跑)，供别处判断是否
+ * 应推迟某些副作用。DEFINE_HOOK(bgp_config_end,...) 声明该钩子点。 */
 DEFINE_HOOK(bgp_config_end, (struct bgp *bgp), (bgp));
 
+/* 配置事务用的定时器句柄(见上)。 */
 static struct event *t_bgp_cfg;
 
+/* 【函数】bgp_config_inprocess —— 配置事务是否进行中。 */
 bool bgp_config_inprocess(void)
 {
 	return event_is_scheduled(t_bgp_cfg);
@@ -21142,6 +21681,9 @@ DEFPY (no_bgp_outq_limit,
 }
 
 
+/* 【函数】bgp_vty_if_init —— 初始化 interface(接口)相关命令：
+ * if_cmd_init() 注册接口视图节点与通用接口命令；再把 "mpls bgp forwarding" 及
+ * multi-domain switching 两个命令挂到 INTERFACE_NODE。 */
 /* Initialization of BGP interface. */
 static void bgp_vty_if_init(void)
 {
@@ -21154,6 +21696,21 @@ static void bgp_vty_if_init(void)
 			&mpls_bgp_l3vpn_multi_domain_switching_cmd);
 }
 
+/* 【函数】bgp_vty_init —— bgpd 启动时**注册全部 CLI 命令**的总入口(本文件核心)。
+ * 它本身不做业务，只做注册；函数体非常长(~2600 行 install_element)，可视为一张
+ * “命令 → 节点”的映射清单。读法建议：
+ *   - 开头几行是全局注册：cmd_variable_handler_register(补全)、
+ *     cmd_init_config_callbacks(绑定配置事务起止回调，见 bgp_config_start/end)。
+ *   - install_node(...)：登记所有 cmd_node(视图)。缺一不可，否则该视图不可进入。
+ *   - install_default(node)：给每个视图挂上通用命令(如 exit/end)。
+ *   - 之后按“功能族”分段：每段用注释标明(例如 router bgp commands 段)，
+ *     install_element(node, &xxx_cmd) 把某命令挂到某节点。
+ * 关键对应关系(易错)：
+ *   - 命令文本在 DEFUN/DEFPY 处定义；这里只决定它出现在哪个视图、以及(同名命令
+ *     挂在不同 node)如何区分作用域——例如 bgp suppress-fib-pending 在 CONFIG_NODE
+ *     是全局版、在 BGP_NODE 是实例版。
+ *   - 许多命令同时挂到多个 AF 子节点(ipv4/ipv6/... ),故 install_element 出现上千次。
+ * 注意：本节只做“注册”，命令的实际语义在各 DEFUN/DEFPY 处理函数里。 */
 void bgp_vty_init(void)
 {
 	cmd_variable_handler_register(bgp_var_neighbor);
@@ -21161,6 +21718,8 @@ void bgp_vty_init(void)
 
 	cmd_init_config_callbacks(bgp_config_start, bgp_config_end);
 
+	/* 【段：注册 BGP 各视图节点】install_node 逐个登记 cmd_node(视图)，缺一则该视图
+	 * 无法进入；紧随其后的 install_default 给每个视图挂上通用命令(exit/end 等)。 */
 	/* Install bgp top node. */
 	install_node(&bgp_node);
 	install_node(&bgp_ipv4_unicast_node);
@@ -21193,6 +21752,8 @@ void bgp_vty_init(void)
 	install_default(BGP_EVPN_VNI_NODE);
 	install_default(BGP_SRV6_NODE);
 
+	/* 【段：CONFIG_NODE 全局 bgp 命令】这一批注册在全局配置节点(非实例内)，
+	 * 影响 bgpd 进程级参数，如 inq/outq-limit、local-mac、suppress-fib-pending 等。 */
 	/* "global bgp inq-limit command */
 	install_element(CONFIG_NODE, &bgp_inq_limit_cmd);
 	install_element(CONFIG_NODE, &no_bgp_inq_limit_cmd);
@@ -21250,6 +21811,8 @@ void bgp_vty_init(void)
 	install_element(CONFIG_NODE,
 			&no_bgp_graceful_restart_rib_stale_time_cmd);
 
+	/* 【段：router bgp 实例命令】以下命令注册在 BGP_NODE(实例视图)或各 AF 子节点，
+	 * 只作用于某个 bgp 实例；同一命令文本常在不同 node 重复注册以区分作用域。 */
 	/* "router bgp" commands. */
 	install_element(CONFIG_NODE, &router_bgp_cmd);
 
@@ -21540,6 +22103,8 @@ void bgp_vty_init(void)
 	install_element(BGP_NODE, &no_bgp_shutdown_cmd);
 	install_element(BGP_NODE, &no_bgp_shutdown_msg_cmd);
 
+	/* 【段：neighbor 命令族】这是最长的一段。neighbor 相关命令挂在 BGP_NODE 及
+	 * 各 AF 子节点上；同一命令往往既注册到实例视图、也注册到 ipv4/ipv6 等地址族视图。 */
 	/* "neighbor remote-as" commands. */
 	install_element(BGP_NODE, &neighbor_remote_as_cmd);
 	install_element(BGP_NODE, &neighbor_interface_config_cmd);
@@ -22633,6 +23198,8 @@ void bgp_vty_init(void)
 	install_element(BGP_IPV6L_NODE, &no_neighbor_damp_cmd);
 	install_element(VIEW_NODE, &show_ip_bgp_neighbor_damp_param_cmd);
 
+	/* 【段：address-family 与按 AF 注册的命令】address_family_* 命令用于从实例视图
+	 * 进入某地址族子视图；此后大量命令按 AF(ipv4/ipv6/vpn/evpn 等)重复注册。 */
 	/* address-family commands. */
 	install_element(BGP_NODE, &address_family_ipv4_safi_cmd);
 	install_element(BGP_NODE, &address_family_ipv6_safi_cmd);
@@ -22660,6 +23227,8 @@ void bgp_vty_init(void)
 	install_element(BGP_VPNV4_NODE, &bgp_retain_route_target_cmd);
 	install_element(BGP_VPNV6_NODE, &bgp_retain_route_target_cmd);
 
+	/* 【段：clear 命令】注册在 ENABLE_NODE(特权视图)，用于清空某邻居/前缀的 BGP 表项，
+	 * 例如 clear ip bgp、clear ip bgp prefix。 */
 	/* "clear ip bgp commands" */
 	install_element(ENABLE_NODE, &clear_ip_bgp_all_cmd);
 
@@ -22668,6 +23237,8 @@ void bgp_vty_init(void)
 	install_element(ENABLE_NODE, &clear_bgp_ipv6_safi_prefix_cmd);
 	install_element(ENABLE_NODE, &clear_bgp_instance_ipv6_safi_prefix_cmd);
 
+	/* 【段：show 命令】注册在 VIEW_NODE(用户视图)，提供只读展示：summary、neighbors、
+	 * peer-group、paths、community 等；实现体多在各 bgp_show_* 函数中。 */
 	/* "show [ip] bgp summary" commands. */
 	install_element(VIEW_NODE, &show_bgp_instance_all_ipv6_updgrps_cmd);
 	install_element(VIEW_NODE, &show_bgp_l2vpn_evpn_updgrps_cmd);
@@ -22696,6 +23267,9 @@ void bgp_vty_init(void)
 	/* "show [ip] bgp route-leak" command */
 	install_element(VIEW_NODE, &show_ip_bgp_route_leak_cmd);
 
+	/* 【段：redistribute 与收尾注册】redistribute 命令把其它路由源(直连/static/ospf 等)
+	 * 引入 BGP；本段末尾调用 community_alias_vty() 完成团体别名命令注册，随后是
+	 * vpn-policy 与 srv6 两个小段，最后调用 bgp_vty_if_init() 注册接口相关命令。 */
 	/* "redistribute" commands.  */
 	install_element(BGP_NODE, &bgp_redistribute_ipv4_hidden_cmd);
 	install_element(BGP_NODE, &no_bgp_redistribute_ipv4_hidden_cmd);
@@ -22812,6 +23386,8 @@ void bgp_vty_init(void)
 
 	install_element(BGP_NODE, &neighbor_ip_transparent_cmd);
 
+	/* 【段：SID / SRv6 导出相关命令】SDN 场景下把本实例的 RD / SID 导出为某地址族路由，
+	 * 以及 SRv6 locator / encap behavior / 邻居 encap srv6 等命令的注册。 */
 	/* srv6 commands */
 	install_element(VIEW_NODE, &show_bgp_srv6_cmd);
 	install_element(BGP_NODE, &bgp_segment_routing_srv6_cmd);
@@ -22829,6 +23405,7 @@ void bgp_vty_init(void)
 	install_element(BGP_IPV4_NODE, &neighbor_encap_srv6_cmd);
 	install_element(BGP_NODE, &no_bgp_sid_vpn_export_cmd);
 
+	/* 【段：接口命令收尾】注册 interface 视图与 mpls bgp forwarding 等命令。 */
 	bgp_vty_if_init();
 }
 
@@ -22837,8 +23414,13 @@ void bgp_vty_init(void)
 #include "bgp_clist.h"
 #include "bgp_ecommunity.h"
 
+/* 【段：团体属性列表的 VTY 实现】本段把 community-list / large-community-list /
+ * extended-community-list 三类“团体属性列表”的配置与显示命令落地：解析用户输入、
+ * 调用 bgp_clist 存储层、出错回显、以及配置写回(config-write)与显示(show)。 */
 /* VTY functions.  */
 
+/* 【函数】community_direct_str —— 把 COMMUNITY_PERMIT / COMMUNITY_DENY 转成
+ * "permit" / "deny" 文本；未知值返回 "unknown"。 */
 /* Direction value to string conversion.  */
 static const char *community_direct_str(int direct)
 {
@@ -22852,6 +23434,8 @@ static const char *community_direct_str(int direct)
 	}
 }
 
+/* 【函数】community_list_perror —— 把 community_list_set 等返回的错误码转成给用户的
+ * vty 报错文本(取值畸形 / 名字与 standard 或 expanded 类型冲突)；无返回值。 */
 /* Display error string.  */
 static void community_list_perror(struct vty *vty, int ret)
 {
@@ -22870,9 +23454,15 @@ static void community_list_perror(struct vty *vty, int ret)
 	}
 }
 
+/* 【宏】COMMUNITY_LIST_STR —— "bgp community-list" 命令里 community-list 关键字的
+ * help 文本，被下方多个 DEFUN 复用。 */
 /* "community-list" keyword help string.  */
 #define COMMUNITY_LIST_STR "Add a community list entry\n"
 
+/* 【DEFUN】community_list_standard —— "bgp community-list <num|standard NAME> [seq N]
+ * <deny|permit> AA:NN..."：新增一条标准团体列表条目。argv 解析出列表名/编号、seq、
+ * 策略、AA:NN 串后调用 community_list_set()；失败(返回<0)时回显错误并返回
+ * CMD_WARNING_CONFIG_FAILED。 */
 /*community-list standard */
 DEFUN (community_list_standard,
        bgp_community_list_standard_cmd,
@@ -22921,6 +23511,8 @@ DEFUN (community_list_standard,
 	return CMD_SUCCESS;
 }
 
+/* 【DEFUN】no_community_list_standard_all —— 删除标准团体列表条目：命令行若给出
+ * deny/permit 与 AA:NN 则只删对应条目，否则删整条/整表；调用 community_list_unset()。 */
 DEFUN (no_community_list_standard_all,
        no_bgp_community_list_standard_all_cmd,
        "no bgp community-list <(1-99)|standard COMMUNITY_LIST_NAME> [seq (0-4294967295)] <deny|permit> AA:NN...",
@@ -22973,6 +23565,8 @@ DEFUN (no_community_list_standard_all,
 	return CMD_SUCCESS;
 }
 
+/* 【ALIAS】no_..._standard_all_list_cmd —— 上一命令不带 seq/deny|permit/AA:NN 的简写
+ * 形式，复用同一处理函数。 */
 ALIAS(no_community_list_standard_all, no_bgp_community_list_standard_all_list_cmd,
       "no bgp community-list <(1-99)|standard COMMUNITY_LIST_NAME>",
       NO_STR BGP_STR COMMUNITY_LIST_STR
@@ -22980,6 +23574,8 @@ ALIAS(no_community_list_standard_all, no_bgp_community_list_standard_all_list_cm
       "Add an standard community-list entry\n"
       "Community list name\n")
 
+/* 【DEFUN】community_list_expanded_all —— 新增/设置一条 expanded(正则式)团体列表
+ * 条目，编号区间 100-500；AA:NN 位置按正则表达式匹配。 */
 /*community-list expanded */
 DEFUN (community_list_expanded_all,
        bgp_community_list_expanded_all_cmd,
@@ -23029,6 +23625,8 @@ DEFUN (community_list_expanded_all,
 	return CMD_SUCCESS;
 }
 
+/* 【DEFUN】no_community_list_expanded_all —— 删除 expanded 团体列表条目(编号 100-500)；
+ * 语义同 no_community_list_standard_all，只是 style 为 COMMUNITY_LIST_EXPANDED。 */
 DEFUN (no_community_list_expanded_all,
        no_bgp_community_list_expanded_all_cmd,
        "no bgp community-list <(100-500)|expanded COMMUNITY_LIST_NAME> [seq (0-4294967295)] <deny|permit> AA:NN...",
@@ -23081,6 +23679,7 @@ DEFUN (no_community_list_expanded_all,
 	return CMD_SUCCESS;
 }
 
+/* 【ALIAS】no_..._expanded_all_list_cmd —— no_community_list_expanded_all 的简写形式。 */
 ALIAS(no_community_list_expanded_all,
       no_bgp_community_list_expanded_all_list_cmd,
       "no bgp community-list <(100-500)|expanded COMMUNITY_LIST_NAME>",
@@ -23089,6 +23688,9 @@ ALIAS(no_community_list_expanded_all,
       "Add an expanded community-list entry\n"
       "Community list name\n")
 
+/* 【函数】community_list_config_str —— 返回某条目的可显示/可写回字符串：标准团体用
+ * community_str()、大团体用 lcommunity_str()，其余(正则式)直接用 entry->config
+ * (配置原文)。返回指针可能指向内部缓存，调用方勿释放。 */
 /* Return configuration string of community-list entry.  */
 static const char *community_list_config_str(struct community_entry *entry)
 {
@@ -23104,6 +23706,8 @@ static const char *community_list_config_str(struct community_entry *entry)
 	return str;
 }
 
+/* 【函数】community_list_show —— 遍历一个团体列表的链表逐条打印：首行输出表头
+ * (编号列表与命名列表措辞不同)，其余行打印 策略 + 配置串。 */
 static void community_list_show(struct vty *vty, struct community_list *list)
 {
 	struct community_entry *entry;
@@ -23128,6 +23732,8 @@ static void community_list_show(struct vty *vty, struct community_list *list)
 	}
 }
 
+/* 【DEFUN】show_community_list —— "show bgp community-list"：列出全部标准/扩展团体
+ * 列表；先打印编号列表(num)再打印命名列表(str)，总是返回 CMD_SUCCESS。 */
 DEFUN (show_community_list,
        show_bgp_community_list_cmd,
        "show bgp community-list",
@@ -23151,6 +23757,8 @@ DEFUN (show_community_list,
 	return CMD_SUCCESS;
 }
 
+/* 【DEFUN】show_community_list_arg —— "show bgp community-list <num|NAME> detail"：
+ * 按名称/编号查单个列表并打印；查不到时报错并返回 CMD_WARNING。 */
 DEFUN (show_community_list_arg,
        show_bgp_community_list_arg_cmd,
        "show bgp community-list <(1-500)|COMMUNITY_LIST_NAME> detail",
@@ -23176,6 +23784,10 @@ DEFUN (show_community_list_arg,
 	return CMD_SUCCESS;
 }
 
+/* 【段：large-community(大团体)】大团体为 RFC 8092 的 4 字节三段式团体。
+ * 【函数】lcommunity_list_set_vty —— 设置一条大团体列表条目的公共实现：解析
+ * seq / 策略 / 团体值，按 style 处理，并按 reject_all_digit_name 决定是否拒绝
+ * “纯数字名字”，最终调用 lcommunity_list_set()。返回 CMD_* 处理码。 */
 /*
  * Large Community code.
  */
@@ -23230,6 +23842,9 @@ static int lcommunity_list_set_vty(struct vty *vty, int argc,
 	return CMD_SUCCESS;
 }
 
+/* 【函数】lcommunity_list_unset_vty —— 删除大团体列表条目的公共实现：解析 seq、
+ * 策略、团体串(可选)；未给策略时删除整条/整表，最终调用 lcommunity_list_unset()。
+ * 总是返回 CMD_SUCCESS。 */
 static int lcommunity_list_unset_vty(struct vty *vty, int argc,
 				     struct cmd_token **argv, int style)
 {
@@ -23275,10 +23890,14 @@ static int lcommunity_list_unset_vty(struct vty *vty, int argc,
 	return CMD_SUCCESS;
 }
 
+/* 【宏】LCOMMUNITY_LIST_STR / LCOMMUNITY_VAL_STR —— large-community-list 命令的
+ * help 文本：列表关键字 / 值格式 aa:bb:cc。 */
 /* "large-community-list" keyword help string.  */
 #define LCOMMUNITY_LIST_STR "Add a large community list entry\n"
 #define LCOMMUNITY_VAL_STR  "large community in 'aa:bb:cc' format\n"
 
+/* 【DEFUN】lcommunity_list_standard —— "bgp large-community-list (1-99) [seq N]
+ * <deny|permit> AA:BB:CC..."；转发给 lcommunity_list_set_vty(STANDARD, 0)。 */
 DEFUN (lcommunity_list_standard,
        bgp_lcommunity_list_standard_cmd,
        "bgp large-community-list (1-99) [seq (0-4294967295)] <deny|permit> AA:BB:CC...",
@@ -23295,6 +23914,8 @@ DEFUN (lcommunity_list_standard,
 				       LARGE_COMMUNITY_LIST_STANDARD, 0);
 }
 
+/* 【DEFUN】lcommunity_list_expanded —— 编号 100-500 的 expanded(正则式)大团体列表，
+ * 转发给 lcommunity_list_set_vty(EXPANDED, 0)。 */
 DEFUN (lcommunity_list_expanded,
        bgp_lcommunity_list_expanded_cmd,
        "bgp large-community-list (100-500) [seq (0-4294967295)] <deny|permit> LINE...",
@@ -23311,6 +23932,8 @@ DEFUN (lcommunity_list_expanded,
 				       LARGE_COMMUNITY_LIST_EXPANDED, 0);
 }
 
+/* 【DEFUN】lcommunity_list_name_standard —— 命名版标准大团体列表，
+ * 转发给 lcommunity_list_set_vty(STANDARD, 1)(拒绝纯数字名字)。 */
 DEFUN (lcommunity_list_name_standard,
        bgp_lcommunity_list_name_standard_cmd,
        "bgp large-community-list standard LCOMMUNITY_LIST_NAME [seq (0-4294967295)] <deny|permit> AA:BB:CC...",
@@ -23328,6 +23951,8 @@ DEFUN (lcommunity_list_name_standard,
 				       LARGE_COMMUNITY_LIST_STANDARD, 1);
 }
 
+/* 【DEFUN】lcommunity_list_name_expanded —— 命名版正则式大团体列表，
+ * 转发给 lcommunity_list_set_vty(EXPANDED, 1)。 */
 DEFUN (lcommunity_list_name_expanded,
        bgp_lcommunity_list_name_expanded_cmd,
        "bgp large-community-list expanded LCOMMUNITY_LIST_NAME [seq (0-4294967295)] <deny|permit> LINE...",
@@ -23345,6 +23970,8 @@ DEFUN (lcommunity_list_name_expanded,
 				       LARGE_COMMUNITY_LIST_EXPANDED, 1);
 }
 
+/* 【DEFUN】no_lcommunity_list_all —— 删除整个大团体列表(按编号或名称)；
+ * 转发给 lcommunity_list_unset_vty(STANDARD)。 */
 DEFUN (no_lcommunity_list_all,
        no_bgp_lcommunity_list_all_cmd,
        "no bgp large-community-list <(1-99)|(100-500)|LCOMMUNITY_LIST_NAME>",
@@ -23359,6 +23986,8 @@ DEFUN (no_lcommunity_list_all,
 					 LARGE_COMMUNITY_LIST_STANDARD);
 }
 
+/* 【DEFUN】no_lcommunity_list_name_standard_all —— 删除命名标准大团体列表，
+ * 转发给 lcommunity_list_unset_vty(STANDARD)。 */
 DEFUN (no_lcommunity_list_name_standard_all,
        no_bgp_lcommunity_list_name_standard_all_cmd,
        "no bgp large-community-list standard LCOMMUNITY_LIST_NAME",
@@ -23372,6 +24001,8 @@ DEFUN (no_lcommunity_list_name_standard_all,
 					 LARGE_COMMUNITY_LIST_STANDARD);
 }
 
+/* 【DEFUN】no_lcommunity_list_name_expanded_all —— 删除命名正则式大团体列表，
+ * 转发给 lcommunity_list_unset_vty(EXPANDED)。 */
 DEFUN (no_lcommunity_list_name_expanded_all,
        no_bgp_lcommunity_list_name_expanded_all_cmd,
        "no bgp large-community-list expanded LCOMMUNITY_LIST_NAME",
@@ -23385,6 +24016,8 @@ DEFUN (no_lcommunity_list_name_expanded_all,
 					 LARGE_COMMUNITY_LIST_EXPANDED);
 }
 
+/* 【DEFUN】no_lcommunity_list_standard —— 按编号删除标准大团体列表条目，
+ * 转发给 lcommunity_list_unset_vty(STANDARD)。 */
 DEFUN (no_lcommunity_list_standard,
        no_bgp_lcommunity_list_standard_cmd,
        "no bgp large-community-list (1-99) [seq (0-4294967295)] <deny|permit> AA:AA:NN...",
@@ -23402,6 +24035,8 @@ DEFUN (no_lcommunity_list_standard,
 					 LARGE_COMMUNITY_LIST_STANDARD);
 }
 
+/* 【DEFUN】no_lcommunity_list_expanded —— 按编号删除正则式大团体列表条目，
+ * 转发给 lcommunity_list_unset_vty(EXPANDED)。 */
 DEFUN (no_lcommunity_list_expanded,
        no_bgp_lcommunity_list_expanded_cmd,
        "no bgp large-community-list (100-500) [seq (0-4294967295)] <deny|permit> LINE...",
@@ -23419,6 +24054,8 @@ DEFUN (no_lcommunity_list_expanded,
 					 LARGE_COMMUNITY_LIST_EXPANDED);
 }
 
+/* 【DEFUN】no_lcommunity_list_name_standard —— 按名称删除标准大团体列表条目，
+ * 转发给 lcommunity_list_unset_vty(STANDARD)。 */
 DEFUN (no_lcommunity_list_name_standard,
        no_bgp_lcommunity_list_name_standard_cmd,
        "no bgp large-community-list standard LCOMMUNITY_LIST_NAME [seq (0-4294967295)] <deny|permit> AA:AA:NN...",
@@ -23437,6 +24074,8 @@ DEFUN (no_lcommunity_list_name_standard,
 					 LARGE_COMMUNITY_LIST_STANDARD);
 }
 
+/* 【DEFUN】no_lcommunity_list_name_expanded —— 按名称删除正则式大团体列表条目，
+ * 转发给 lcommunity_list_unset_vty(EXPANDED)。 */
 DEFUN (no_lcommunity_list_name_expanded,
        no_bgp_lcommunity_list_name_expanded_cmd,
        "no bgp large-community-list expanded LCOMMUNITY_LIST_NAME [seq (0-4294967295)] <deny|permit> LINE...",
@@ -23455,6 +24094,8 @@ DEFUN (no_lcommunity_list_name_expanded,
 					 LARGE_COMMUNITY_LIST_EXPANDED);
 }
 
+/* 【函数】lcommunity_list_show —— 遍历一个大团体列表逐条打印；与 community_list_show
+ * 类似，只是表头措辞为 large community。 */
 static void lcommunity_list_show(struct vty *vty, struct community_list *list)
 {
 	struct community_entry *entry;
@@ -23482,6 +24123,8 @@ static void lcommunity_list_show(struct vty *vty, struct community_list *list)
 	}
 }
 
+/* 【DEFUN】show_lcommunity_list —— "show bgp large-community-list"：列出全部大团体
+ * 列表(先编号后命名)，总是返回 CMD_SUCCESS。 */
 DEFUN (show_lcommunity_list,
        show_bgp_lcommunity_list_cmd,
        "show bgp large-community-list",
@@ -23506,6 +24149,8 @@ DEFUN (show_lcommunity_list,
 	return CMD_SUCCESS;
 }
 
+/* 【DEFUN】show_lcommunity_list_arg —— "show bgp large-community-list <num|NAME> detail"：
+ * 查单个大团体列表并打印；查不到报错并返回 CMD_WARNING。 */
 DEFUN (show_lcommunity_list_arg,
        show_bgp_lcommunity_list_arg_cmd,
        "show bgp large-community-list <(1-500)|LCOMMUNITY_LIST_NAME> detail",
@@ -23530,10 +24175,15 @@ DEFUN (show_lcommunity_list_arg,
 	return CMD_SUCCESS;
 }
 
+/* 【段：extended-community(扩展团体)相关】扩展团体用于 RT(route-target) / Soo 等，
+ * 其值形如 'rt aa:nn_or_IPaddr:nn' 或 'soo ...'；下面是其列表命令。
+ * 【宏】EXTCOMMUNITY_LIST_STR / EXTCOMMUNITY_VAL_STR —— 列表关键字 / 值格式的 help。 */
 /* "extcommunity-list" keyword help string.  */
 #define EXTCOMMUNITY_LIST_STR "Add a extended community list entry\n"
 #define EXTCOMMUNITY_VAL_STR  "Extended community attribute in 'rt aa:nn_or_IPaddr:nn' OR 'soo aa:nn_or_IPaddr:nn' format\n"
 
+/* 【DEFUN】extcommunity_list_standard —— 新增标准扩展团体列表条目(编号 1-99)；
+ * 解析后调用 extcommunity_list_set()，失败回显错误并返回 CMD_WARNING_CONFIG_FAILED。 */
 DEFUN (extcommunity_list_standard,
        bgp_extcommunity_list_standard_cmd,
        "bgp extcommunity-list <(1-99)|standard EXTCOMMUNITY_LIST_NAME> [seq (0-4294967295)] <deny|permit> AA:NN...",
@@ -23580,6 +24230,8 @@ DEFUN (extcommunity_list_standard,
 	return CMD_SUCCESS;
 }
 
+/* 【DEFUN】extcommunity_list_name_expanded —— 新增命名/编号的正则式扩展团体列表
+ * 条目(100-500)，语义同标准版但 style 为 EXTCOMMUNITY_LIST_EXPANDED。 */
 DEFUN (extcommunity_list_name_expanded,
        bgp_extcommunity_list_name_expanded_cmd,
        "bgp extcommunity-list <(100-500)|expanded EXTCOMMUNITY_LIST_NAME> [seq (0-4294967295)] <deny|permit> LINE...",
@@ -23625,6 +24277,8 @@ DEFUN (extcommunity_list_name_expanded,
 	return CMD_SUCCESS;
 }
 
+/* 【DEFUN】no_extcommunity_list_standard_all —— 删除标准扩展团体列表条目；命令行带
+ * deny/permit+AA:NN 则删对应条目，否则删整条/整表；调用 extcommunity_list_unset()。 */
 DEFUN (no_extcommunity_list_standard_all,
        no_bgp_extcommunity_list_standard_all_cmd,
        "no bgp extcommunity-list <(1-99)|standard EXTCOMMUNITY_LIST_NAME> [seq (0-4294967295)] <deny|permit> AA:NN...",
@@ -23676,6 +24330,7 @@ DEFUN (no_extcommunity_list_standard_all,
 	return CMD_SUCCESS;
 }
 
+/* 【ALIAS】no_..._standard_all_list_cmd —— no_extcommunity_list_standard_all 的简写形式。 */
 ALIAS(no_extcommunity_list_standard_all,
       no_bgp_extcommunity_list_standard_all_list_cmd,
       "no bgp extcommunity-list <(1-99)|standard EXTCOMMUNITY_LIST_NAME>",
@@ -23684,6 +24339,8 @@ ALIAS(no_extcommunity_list_standard_all,
       "Specify standard extcommunity-list\n"
       "Community list name\n")
 
+/* 【DEFUN】no_extcommunity_list_expanded_all —— 删除正则式扩展团体列表条目
+ * (编号 100-500)；语义同标准版，style 为 EXTCOMMUNITY_LIST_EXPANDED。 */
 DEFUN (no_extcommunity_list_expanded_all,
        no_bgp_extcommunity_list_expanded_all_cmd,
        "no bgp extcommunity-list <(100-500)|expanded EXTCOMMUNITY_LIST_NAME> [seq (0-4294967295)] <deny|permit> LINE...",
@@ -23736,6 +24393,7 @@ DEFUN (no_extcommunity_list_expanded_all,
 	return CMD_SUCCESS;
 }
 
+/* 【ALIAS】no_..._expanded_all_list_cmd —— no_extcommunity_list_expanded_all 的简写形式。 */
 ALIAS(no_extcommunity_list_expanded_all,
       no_bgp_extcommunity_list_expanded_all_list_cmd,
       "no bgp extcommunity-list <(100-500)|expanded EXTCOMMUNITY_LIST_NAME>",
@@ -23744,6 +24402,8 @@ ALIAS(no_extcommunity_list_expanded_all,
       "Specify expanded extcommunity-list\n"
       "Extended Community list name\n")
 
+/* 【函数】extcommunity_list_show —— 遍历一个扩展团体列表逐条打印；表头措辞为
+ * extended community，其余与 community_list_show 类似。 */
 static void extcommunity_list_show(struct vty *vty, struct community_list *list)
 {
 	struct community_entry *entry;
@@ -23769,6 +24429,8 @@ static void extcommunity_list_show(struct vty *vty, struct community_list *list)
 	}
 }
 
+/* 【DEFUN】show_extcommunity_list —— "show bgp extcommunity-list"：列出全部扩展团体
+ * 列表(先编号后命名)，总是返回 CMD_SUCCESS。 */
 DEFUN (show_extcommunity_list,
        show_bgp_extcommunity_list_cmd,
        "show bgp extcommunity-list",
@@ -23792,6 +24454,8 @@ DEFUN (show_extcommunity_list,
 	return CMD_SUCCESS;
 }
 
+/* 【DEFUN】show_extcommunity_list_arg —— "show bgp extcommunity-list <num|NAME> detail"：
+ * 查单个扩展团体列表并打印；查不到报错并返回 CMD_WARNING。 */
 DEFUN (show_extcommunity_list_arg,
        show_bgp_extcommunity_list_arg_cmd,
        "show bgp extcommunity-list <(1-500)|EXTCOMMUNITY_LIST_NAME> detail",
@@ -23817,6 +24481,10 @@ DEFUN (show_extcommunity_list_arg,
 	return CMD_SUCCESS;
 }
 
+/* 【函数】community_list_config_write —— 把 bgp_clist 中所有 community-list /
+ * extcommunity-list / large-community-list 条目写回 running-config；返回写出的条目数
+ * write(>0 表示本视图有内容需保存)。注意每类列表都有 num(编号) 与 str(命名) 两段
+ * 链表都要遍历。 */
 /* Display community-list and extcommunity-list configuration.  */
 static int community_list_config_write(struct vty *vty)
 {
@@ -23905,6 +24573,9 @@ static int community_list_config_write(struct vty *vty)
 	return write;
 }
 
+/* 【前向声明】community_list_config_write 的前向声明，便于下面 cmd_node 引用。
+ * 【数据结构】community_list_node —— "community list" 视图节点定义：指定节点编号
+ * COMMUNITY_LIST_NODE、空提示符、以及配置写回回调 community_list_config_write。 */
 static int community_list_config_write(struct vty *vty);
 static struct cmd_node community_list_node = {
 	.name = "community list",
@@ -23913,6 +24584,8 @@ static struct cmd_node community_list_node = {
 	.config_write = community_list_config_write,
 };
 
+/* 【函数】community_list_vty —— 注册 community-list / extcommunity-list /
+ * large-community-list 三类命令并安装 community list 节点；最后设置命令补全。 */
 static void community_list_vty(void)
 {
 	install_node(&community_list_node);
@@ -23959,6 +24632,8 @@ static void community_list_vty(void)
 	bgp_community_list_command_completion_setup();
 }
 
+/* 【数据结构】community_alias_node —— "community alias" 视图节点定义，
+ * 其配置写回回调为 bgp_community_alias_write()。 */
 static struct cmd_node community_alias_node = {
 	.name = "community alias",
 	.node = COMMUNITY_ALIAS_NODE,
@@ -23966,6 +24641,8 @@ static struct cmd_node community_alias_node = {
 	.config_write = bgp_community_alias_write,
 };
 
+/* 【函数】community_alias_vty —— 安装 community alias 节点、注册
+ * bgp community-alias 命令并设置补全；由 bgp_vty_init() 在注册阶段调用。 */
 void community_alias_vty(void)
 {
 	install_node(&community_alias_node);

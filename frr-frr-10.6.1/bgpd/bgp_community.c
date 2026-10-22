@@ -3,6 +3,41 @@
  * Copyright (C) 1998, 2001 Kunihiro Ishiguro
  */
 
+/* 【文件导读】 bgp_community.c —— 标准 Community 属性的实现
+ *
+ * 一、本文件做什么
+ *    实现 bgp_community.h 声明的全部操作：内存分配 / 释放、排序去重、
+ *    字符串与二进制互转、全局哈希驻留（intern）与引用计数、集合运算，
+ *    以及供 summary-only 聚合使用的 aggregate 系列函数。
+ *
+ * 二、核心设计：驻留 + 引用计数
+ *    comhash 是全局哈希表（在 community_init 中创建）。任何一份内容相同的
+ *    community 集合，在整个进程里只保留一个 struct community 实例：
+ *      - community_intern：把临时构造的集合放进哈希；若已存在相同者，
+ *        释放临时对象并返回哈希中的那份，同时 refcnt 加一；
+ *      - community_unintern：refcnt 减一，减到 0 时从哈希摘除并释放。
+ *    因此凡是从 community_parse / community_str2com / intern 拿到的指针，
+ *    都是“共享”的：attr 持有它时应保持引用，不要随意 free。
+ *
+ * 三、线格式与内存格式
+ *    线格式：每个 community 4 字节，含义为“2 字节 AS 与 2 字节值”，大端。
+ *    内存里 val 数组同样保存大端（网络字节序），于是：
+ *      - 用 memcmp 就能做全等 / 子集判断；
+ *      - 需要数值时用 ntohl 转换（community_val_get 已代劳）。
+ *    字符串格式为 "AS:VALUE"（如 65001:100），well-known 值打印为关键字
+ *    （no-export、no-advertise 等）。
+ *
+ * 四、推荐阅读顺序
+ *    community_new / community_free -> community_add_val / community_del_val
+ *    -> community_uniq_sort -> community_intern / community_unintern
+ *    -> set_community_string / community_str -> community_gettoken /
+ *    community_str2com -> 末尾的 aggregate 系列。
+ *
+ * 五、返回约定提醒
+ *    community_str 返回对象内部缓存的 str，属于 com 所有，调用者不得 free，
+ *    也不要在 free 掉 com 之后再引用它。
+ */
+
 #include <zebra.h>
 
 #include "command.h"
@@ -16,15 +51,25 @@
 #include "bgpd/bgp_community_alias.h"
 
 /* Hash of community attribute. */
+/* 【全局变量】comhash：所有已驻留标准 community 的全局哈希表。
+ * 哈希键用 community_hash_make、比较用 community_cmp，在 community_init 中
+ * 创建、community_finish 中销毁。凡 refcnt 大于 0 的集合都在此表中。
+ */
 static struct hash *comhash;
 
 /* Allocate a new communities value.  */
+/* 【函数】community_new：分配一个空的 community 结构（val / str / json 均未分配，
+ * val 为 NULL，size 为 0）。只做内存分配，不驻留。
+ */
 static struct community *community_new(void)
 {
 	return XCALLOC(MTYPE_COMMUNITY, sizeof(struct community));
 }
 
 /* Free communities value.  */
+/* 【函数】community_free：释放一个 community 及其内部的 val / str / json。
+ * 参数是二级指针，释放后自动置 NULL，避免悬空指针。
+ */
 void community_free(struct community **com)
 {
 	if (!(*com))
@@ -42,6 +87,9 @@ void community_free(struct community **com)
 }
 
 /* Add one community value to the community. */
+/* 【函数】community_add_val：把单个值追加到集合末尾（不做去重、不排序）。
+ * 入参 val 为主机字节序，函数内部先 htonl 再存入 val 数组（保持大端）。
+ */
 void community_add_val(struct community *com, uint32_t val)
 {
 	com->size++;
@@ -52,6 +100,10 @@ void community_add_val(struct community *com, uint32_t val)
 }
 
 /* Delete one community. */
+/* 【函数】community_del_val：删除与 val 匹配的一个值（按字节比较，故 val 需为
+ * 网络字节序）。命中后前移后续元素并收缩分配；删除后若集合为空则释放 val 数组。
+ * 找到一个匹配即返回，故若有重复值只删一个。
+ */
 void community_del_val(struct community *com, uint32_t *val)
 {
 	int i = 0;
@@ -83,6 +135,9 @@ void community_del_val(struct community *com, uint32_t *val)
 }
 
 /* Delete all communities listed in com2 from com1 */
+/* 【函数】community_delete：把 com2 中列出的每个值都从 com1 删除（原地修改 com1，
+ * 返回 com1）。复杂度为 O(com1->size 乘 com2->size)。
+ */
 struct community *community_delete(struct community *com1,
 				   struct community *com2)
 {
@@ -97,6 +152,9 @@ struct community *community_delete(struct community *com1,
 }
 
 /* Callback function from qsort(). */
+/* 【函数】community_compare：qsort 比较函数，按数值升序比较两个大端值
+ * （先 ntohl 还原为主机序再比大小）。
+ */
 static int community_compare(const void *a1, const void *a2)
 {
 	uint32_t v1;
@@ -114,6 +172,9 @@ static int community_compare(const void *a1, const void *a2)
 	return 0;
 }
 
+/* 【函数】community_include：判断 val（主机字节序）是否在集合中。
+ * 内部先 htonl 再逐项 memcmp。复杂度 O(size)。
+ */
 bool community_include(struct community *com, uint32_t val)
 {
 	int i;
@@ -126,6 +187,9 @@ bool community_include(struct community *com, uint32_t val)
 	return false;
 }
 
+/* 【函数】community_val_get：取出第 i 个值并返回为主机字节序（ntohl）。
+ * 调用者需保证 i 在 [0, size) 范围内。
+ */
 uint32_t community_val_get(struct community *com, int i)
 {
 	uint8_t *p;
@@ -140,6 +204,11 @@ uint32_t community_val_get(struct community *com, int i)
 }
 
 /* Sort and uniq given community. */
+/* 【函数】community_uniq_sort：返回一个新的集合，值已去重并升序排序。
+ * 这是进入哈希驻留前的必经步骤：保证“内容相同即字节相同”，使 memcmp 等价于
+ * 语义相等。注意它不驻留，只构造一个新对象（refcnt 为 0），由调用者决定何时
+ * intern。
+ */
 struct community *community_uniq_sort(struct community *com)
 {
 	int i;
@@ -184,6 +253,12 @@ struct community *community_uniq_sort(struct community *com)
    0xFFFFFF04      "no-peer"
 
    For other values, "AS:VAL" format is used.  */
+/* 【函数】set_community_string：把集合渲染成字符串缓存到 com->str；make_json
+ * 为真时同时构造 com->json（含 "string" 与 "list" 两个字段）。
+ * 为省分配，先遍历一遍估算所需长度、再一次性分配、第二遍填充。
+ * well-known 值打印为固定关键字；其余打印为 "AS:VAL"；translate_alias 为真时
+ * 会把该字符串翻译为配置的别名（bgp_community2alias）。
+ */
 static void set_community_string(struct community *com, bool make_json,
 				 bool translate_alias)
 {
@@ -441,6 +516,12 @@ static void set_community_string(struct community *com, bool make_json,
 }
 
 /* Intern communities attribute.  */
+/* 【函数】community_intern：驻留。把 com 放入全局哈希：
+ *   若哈希中已有内容相同者，释放传入的 com 并返回已存在者；
+ *   否则返回 com 本身。无论哪种情况，返回者的 refcnt 加一；
+ *   若返回者的 str 尚未生成，顺手生成。
+ * 前置断言传入对象的 refcnt 必须为 0，即只允许驻留“未共享”的新对象。
+ */
 struct community *community_intern(struct community *com)
 {
 	struct community *find;
@@ -467,6 +548,9 @@ struct community *community_intern(struct community *com)
 }
 
 /* Free community attribute. */
+/* 【函数】community_unintern：解除一次引用。refcnt 减一；减到 0 时从哈希摘除
+ * 并释放，同时把调用者的指针置 NULL。断言该对象确实在哈希中。
+ */
 void community_unintern(struct community **com)
 {
 	struct community *ret;
@@ -488,6 +572,10 @@ void community_unintern(struct community **com)
 }
 
 /* Create new community attribute. */
+/* 【函数】community_parse：从报文的裸字节解析。pnt 指向网络字节序数据，
+ * length 是字节数（必须是 4 的倍数，否则返回 NULL）。内部构造临时结构后调用
+ * community_uniq_sort 去重排序，再 intern 成共享对象返回。
+ */
 struct community *community_parse(uint32_t *pnt, unsigned short length)
 {
 	struct community tmp;
@@ -506,6 +594,9 @@ struct community *community_parse(uint32_t *pnt, unsigned short length)
 	return community_intern(new);
 }
 
+/* 【函数】community_dup：深拷贝一份集合（拷贝 val，不复制 refcnt，也不驻留）。
+ * 新对象 refcnt 为 0，可继续修改或用于 intern。
+ */
 struct community *community_dup(struct community *com)
 {
 	struct community *new;
@@ -522,6 +613,10 @@ struct community *community_dup(struct community *com)
 }
 
 /* Return string representation of communities attribute. */
+/* 【函数】community_str：返回 com->str（内部缓存），必要时惰性生成。
+ * 返回的字符串归 com 所有，调用者不得 free。make_json 为真且已有 str 但无 json
+ * 时，会先释放旧 str 再重建以补齐 json。
+ */
 char *community_str(struct community *com, bool make_json, bool translate_alias)
 {
 	if (!com)
@@ -537,6 +632,9 @@ char *community_str(struct community *com, bool make_json, bool translate_alias)
 
 /* Make hash value of community attribute. This function is used by
    hash package.*/
+/* 【函数】community_hash_make：对 val 数组（大端）做 jhash2，得到哈希键。
+ * 内容相同必然键相同，因此可用于哈希驻留与查找。
+ */
 unsigned int community_hash_make(const struct community *com)
 {
 	uint32_t *pnt = com->val;
@@ -544,6 +642,9 @@ unsigned int community_hash_make(const struct community *com)
 	return jhash2(pnt, com->size, 0x43ea96c1);
 }
 
+/* 【函数】community_match：判断 com2 是否为 com1 的子集（com1 含 com2 的全部值）。
+ * 双方都为空时返回 true。利用两个指针同步推进的归并式遍历，复杂度 O(n+m)。
+ */
 bool community_match(const struct community *com1, const struct community *com2)
 {
 	int i = 0;
@@ -571,6 +672,9 @@ bool community_match(const struct community *com1, const struct community *com2)
 		return false;
 }
 
+/* 【函数】community_cmp：全等比较（size 相同且 val 字节全等）。这是哈希表的
+ * key 比较回调。两个都为 NULL 视为相等。
+ */
 bool community_cmp(const struct community *com1, const struct community *com2)
 {
 	if (com1 == NULL && com2 == NULL)
@@ -586,6 +690,9 @@ bool community_cmp(const struct community *com1, const struct community *com2)
 }
 
 /* Add com2 to the end of com1. */
+/* 【函数】community_merge：把 com2 的全部值追加到 com1 末尾（原地扩展 com1，
+ * 不做去重；com2 保持不变）。多用于聚合时合并多份集合，之后通常再 uniq_sort。
+ */
 struct community *community_merge(struct community *com1,
 				  struct community *com2)
 {
@@ -599,6 +706,9 @@ struct community *community_merge(struct community *com1,
 }
 
 /* Community token enum. */
+/* 【枚举】community_token：字符串解析器的词法类型。val 是 "AS:VAL" 数字形式，
+ * 其余是 well-known 关键字，unknown 表示非法输入。
+ */
 enum community_token {
 	community_token_val,
 	community_token_gshut,
@@ -619,6 +729,9 @@ enum community_token {
 };
 
 /* Helper to check if a given community is valid */
+/* 【函数】community_valid：校验 "AS:VAL" 形式的字符串。按 ':' 切分，要求至少
+ * 两段、每段非空且数值不超过 UINT16_MAX（标准 community 每段 16 位）。
+ */
 static bool community_valid(const char *community)
 {
 	int octets = 0;
@@ -644,6 +757,12 @@ static bool community_valid(const char *community)
 }
 
 /* Get next community token from string. */
+/* 【函数】community_gettoken：从字符串头部解析下一个 token。
+ *   若以字母开头：匹配 well-known 关键字（graceful-shutdown、no-export 等）；
+ *   若以数字开头：解析 "AS:VAL"，先 community_valid 校验，再手工累加两段 16 位
+ *     数值（前半段左移 16 得到 community_high，后半段得到 community_low）。
+ * 返回指向剩余字符串的指针（NULL 表示结束），并通过 token / val 输出结果。
+ */
 static const char *
 community_gettoken(const char *buf, enum community_token *token, uint32_t *val)
 {
@@ -813,6 +932,11 @@ community_gettoken(const char *buf, enum community_token *token, uint32_t *val)
 }
 
 /* convert string to community structure */
+/* 【函数】community_str2com：解析 "65001:100 no-export ..." 形式的字符串，
+ * 循环调用 community_gettoken 收集所有值，最后 uniq_sort 去重排序。
+ * 返回的是未驻留的新对象（refcnt 为 0），通常由调用方交给 intern。
+ * 遇到未知 token 返回 NULL。
+ */
 struct community *community_str2com(const char *str)
 {
 	struct community *com = NULL;
@@ -859,18 +983,21 @@ struct community *community_str2com(const char *str)
 }
 
 /* Return communities hash entry count.  */
+/* 【函数】community_count：返回全局哈希中已驻留的集合个数（调试 / show 用）。 */
 unsigned long community_count(void)
 {
 	return comhash->count;
 }
 
 /* Return communities hash.  */
+/* 【函数】community_hash：返回全局哈希表指针，供只读遍历（如 show 命令）。 */
 struct hash *community_hash(void)
 {
 	return comhash;
 }
 
 /* Initialize community related hash. */
+/* 【函数】community_init：创建全局哈希表 comhash（进程启动时调用一次）。 */
 void community_init(void)
 {
 	comhash =
@@ -879,6 +1006,7 @@ void community_init(void)
 			    "BGP Community Hash");
 }
 
+/* 【函数】community_hash_free：哈希销毁时的回调，释放每个桶中的数据。 */
 static void community_hash_free(void *data)
 {
 	struct community *com = data;
@@ -886,11 +1014,13 @@ static void community_hash_free(void *data)
 	community_free(&com);
 }
 
+/* 【函数】community_finish：清空并销毁全局哈希表（进程退出时调用）。 */
 void community_finish(void)
 {
 	hash_clean_and_free(&comhash, community_hash_free);
 }
 
+/* 【函数】bgp_aggr_community_lookup：在聚合器的 community 哈希中查找。 */
 static struct community *bgp_aggr_community_lookup(
 						struct bgp_aggregate *aggregate,
 						struct community *community)
@@ -898,6 +1028,7 @@ static struct community *bgp_aggr_community_lookup(
 	return hash_lookup(aggregate->community_hash, community);
 }
 
+/* 【函数】bgp_aggr_community_hash_alloc：哈希插入时的分配回调，返回一份深拷贝。 */
 static void *bgp_aggr_community_hash_alloc(void *p)
 {
 	struct community *ref = (struct community *)p;
@@ -907,6 +1038,9 @@ static void *bgp_aggr_community_hash_alloc(void *p)
 	return community;
 }
 
+/* 【函数】bgp_aggr_community_prepare：哈希遍历回调，把每个桶的集合合并进
+ * 聚合器的 community（首见时复制，其后追加合并）。
+ */
 static void bgp_aggr_community_prepare(struct hash_bucket *hb, void *arg)
 {
 	struct community *hb_community = hb->data;
@@ -919,6 +1053,7 @@ static void bgp_aggr_community_prepare(struct hash_bucket *hb, void *arg)
 		*aggr_community = community_dup(hb_community);
 }
 
+/* 【函数】bgp_aggr_community_remove：释放聚合器持有的 community。 */
 void bgp_aggr_community_remove(void *arg)
 {
 	struct community *community = arg;
@@ -926,6 +1061,9 @@ void bgp_aggr_community_remove(void *arg)
 	community_free(&community);
 }
 
+/* 【函数】bgp_compute_aggregate_community：把某条路由的 community 计入聚合器，
+ * 然后重新计算聚合后的汇总 community。
+ */
 void bgp_compute_aggregate_community(struct bgp_aggregate *aggregate,
 				     struct community *community)
 {
@@ -934,6 +1072,9 @@ void bgp_compute_aggregate_community(struct bgp_aggregate *aggregate,
 }
 
 
+/* 【函数】bgp_compute_aggregate_community_hash：把 community 计入聚合器哈希：
+ * 按需创建哈希；若该集合已在哈希中则 refcnt 加一，否则插入一份深拷贝并加一。
+ */
 void bgp_compute_aggregate_community_hash(struct bgp_aggregate *aggregate,
 					  struct community *community)
 {
@@ -963,6 +1104,9 @@ void bgp_compute_aggregate_community_hash(struct bgp_aggregate *aggregate,
 	aggr_community->refcnt++;
 }
 
+/* 【函数】bgp_compute_aggregate_community_val：遍历聚合器哈希，合并出全部
+ * community，去重排序后存入 aggregate->community。
+ */
 void bgp_compute_aggregate_community_val(struct bgp_aggregate *aggregate)
 {
 	struct community *commerge = NULL;
@@ -988,6 +1132,9 @@ void bgp_compute_aggregate_community_val(struct bgp_aggregate *aggregate)
 
 
 
+/* 【函数】bgp_remove_community_from_aggregate：从聚合器减记一份 community
+ * 引用；refcnt 减到 0 则摘除并释放，并重算汇总 community。
+ */
 void bgp_remove_community_from_aggregate(struct bgp_aggregate *aggregate,
 					 struct community *community)
 {
@@ -1015,6 +1162,9 @@ void bgp_remove_community_from_aggregate(struct bgp_aggregate *aggregate,
 	}
 }
 
+/* 【函数】bgp_remove_comm_from_aggregate_hash：仅从聚合器哈希中减记引用
+ * （refcnt 归零则释放），与上一个函数的区别是不重算汇总 community。
+ */
 void bgp_remove_comm_from_aggregate_hash(struct bgp_aggregate *aggregate,
 		struct community *community)
 {

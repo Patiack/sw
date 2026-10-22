@@ -39,6 +39,33 @@
  */
 
 
+/*
+ * ============================================================================
+ * 文件导读：skiplist.c —— 跳表（skip list）实现
+ * ============================================================================
+ * 本文件是 William Pugh 跳表实现的 FRR 版本（BSD-0-Clause），提供有序字典。
+ * 跳表用多层索引链表替代平衡树：随机决定节点层数（randomLevel），
+ * 查找 / 插入 / 删除平均 O(log N)，最坏 O(N)。
+ *
+ * 结构要点：
+ *   - 节点层数上限 MaxNumberOfLevels=16；层从 0 起，最高为 MaxLevel=15
+ *   - header 是一个 16 层哨兵头，forward[0] 串起所有节点（第 0 层即完整有序链）
+ *   - randomLevel 以 p=0.25 的概率升层（由 2 位随机数决定）
+ *   - 插入时用 update[] 记录各层前驱，再逐层改指针
+ *
+ * 重复键：
+ *   - SKIPLIST_FLAG_ALLOW_DUPLICATES 决定是否允许重复键；允许时按 FIFO 处理，
+ *     删除需同时给出 key 与 value 精确定位
+ *
+ * 关键回调：
+ *   - cmp(key1,key2) 排序比较；del(value) 删除时释放用户数据
+ *
+ * 阅读顺序：
+ *   randomLevel / default_cmp -> skiplist_new / free -> skiplist_insert
+ *   -> skiplist_delete -> first_value / next_value -> first / last / next
+ *   -> 末尾的 skiplist_debug / skiplist_test（调试与自测）
+ * ============================================================================
+ */
 #include <zebra.h>
 
 #include "memory.h"
@@ -48,26 +75,50 @@
 #include "lib_errors.h"
 #include "network.h"
 
+/*
+ * 内存类型登记：跳表本体 / 节点 / 层统计数组三类分配纳入内存记账。
+ */
 DEFINE_MTYPE_STATIC(LIB, SKIP_LIST, "Skip List");
 DEFINE_MTYPE_STATIC(LIB, SKIP_LIST_NODE, "Skip Node");
 DEFINE_MTYPE_STATIC(LIB, SKIP_LIST_STATS, "Skiplist Counters");
 
+/*
+ * 每次随机调用可提供的位数（32 位机上取 31）。
+ */
 #define BitsInRandom 31
 
+/*
+ * 跳表最大层数 16；层编号从 0 到 MaxLevel（= 15）。
+ */
 #define MaxNumberOfLevels 16
 #define MaxLevel (MaxNumberOfLevels-1)
+/*
+ * 宏：为一个 l 层节点分配内存（变长 forward 数组按层数扩展）。
+ */
 #define newNodeOfLevel(l)                                                      \
 	XCALLOC(MTYPE_SKIP_LIST_NODE,                                          \
 		sizeof(struct skiplistnode)                                    \
 			+ (l) * sizeof(struct skiplistnode *))
 
+/*
+ * 宏：为 l+1 个 int 的层统计数组分配内存。
+ * 注意：其元素类型必须与 struct skiplist.level_stats 保持一致。
+ */
 /* XXX must match type of (struct skiplist).level_stats */
 #define newStatsOfLevel(l)                                                     \
 	XCALLOC(MTYPE_SKIP_LIST_STATS, ((l) + 1) * sizeof(int))
 
+/*
+ * 随机数缓冲：从低位依次取出随机比特供 randomLevel 使用，
+ * 以减少 frr_weak_random 的调用次数。
+ */
 static int randomsLeft;
 static int randomBits;
 
+/*
+ * 一致性自检宏：header->forward[0] 与 last 指针必须同时“有 / 无”，
+ * 否则说明有序链与 last 记录不一致。仅在 SKIPLIST_DEBUG 下生效，否则展开为空。
+ */
 #ifdef SKIPLIST_DEBUG
 #define CHECKLAST(sl)                                                          \
 	do {                                                                   \
@@ -81,6 +132,11 @@ static int randomBits;
 #endif
 
 
+/*
+ * randomLevel：随机生成新节点的层数（p=0.25 升层，见文件头说明）。
+ * 返回：0 到 MaxLevel 之间的层号。
+ * 副作用：消耗静态随机比特缓冲 randomsLeft / randomBits。
+ */
 static int randomLevel(void)
 {
 	register int level = 0;
@@ -105,6 +161,10 @@ static int randomLevel(void)
 	return level;
 }
 
+/*
+ * default_cmp：默认键比较函数：直接比较 key1 / key2 两个指针的地址大小。
+ * 返回：-1 / 0 / 1。
+ */
 static int default_cmp(const void *key1, const void *key2)
 {
 	if (key1 < key2)
@@ -114,11 +174,20 @@ static int default_cmp(const void *key1, const void *key2)
 	return 0;
 }
 
+/*
+ * skiplist_count：返回跳表元素个数。
+ */
 unsigned int skiplist_count(struct skiplist *l)
 {
 	return l->count;
 }
 
+/*
+ * skiplist_new：创建跳表。
+ * 分配表结构、16 层哨兵 header、层统计数组；cmp 为空时用 default_cmp，
+ * del 为空则不自动释放 value。
+ * 返回：新跳表指针。
+ */
 struct skiplist *skiplist_new(int flags,
 			      int (*cmp)(const void *key1, const void *key2),
 			      void (*del)(void *val))
@@ -145,6 +214,10 @@ struct skiplist *skiplist_new(int flags,
 	return new;
 }
 
+/*
+ * skiplist_free：释放所有节点（若有 del 回调，对每个真实节点的 value 调 del）、
+ * 层统计数组和表本身。
+ */
 void skiplist_free(struct skiplist *l)
 {
 	register struct skiplistnode *p, *q;
@@ -164,6 +237,12 @@ void skiplist_free(struct skiplist *l)
 }
 
 
+/*
+ * skiplist_insert：插入 key / value。
+ * 先自顶向下用 update[] 记录各层前驱；若不允许重复键且已存在同键值则返回 -1。
+ * 否则随机取层数，逐层改指针插入，并维护 last / count / level_stats。
+ * 返回：成功 0，已存在（不允许重复时）-1。
+ */
 int skiplist_insert(register struct skiplist *l, register void *key,
 		    register void *value)
 {
@@ -235,6 +314,12 @@ int skiplist_insert(register struct skiplist *l, register void *key,
 	return 0;
 }
 
+/*
+ * skiplist_delete：删除指定 key（重复键时再按 value 精确定位）的节点。
+ * 用 update[] 记录各层前驱，找到后逐层摘链，维护 last / level / level_stats / count，
+ * 并对被删 value 调用 del 回调。
+ * 返回：成功 0，未找到 -1。
+ */
 int skiplist_delete(register struct skiplist *l, register void *key,
 		    register void *value) /* used only if duplicates allowed */
 {
@@ -315,6 +400,11 @@ int skiplist_delete(register struct skiplist *l, register void *key,
 }
 
 /*
+ * skiplist_first_value：找到第一个键等于 key 的节点，输出其 value 与游标。
+ * 参数：valuePointer 可空，输出值；cursor 可空，输出游标（供 next_value 用）。
+ * 返回：成功 0，无匹配 -1。
+ */
+/*
  * Obtain first value matching "key". Unless SKIPLIST_FLAG_ALLOW_DUPLICATES
  * is set, this will also be the only value matching "key".
  *
@@ -349,6 +439,10 @@ int skiplist_first_value(register struct skiplist *l, /* in */
 	return 0;
 }
 
+/*
+ * skiplist_search：查找 key 对应的 value（内部即 first_value，不取游标）。
+ * 返回：成功 0，未找到 -1。
+ */
 int skiplist_search(register struct skiplist *l, register void *key,
 		    void **valuePointer)
 {
@@ -356,6 +450,11 @@ int skiplist_search(register struct skiplist *l, register void *key,
 }
 
 
+/*
+ * skiplist_next_value：在允许重复键时，取同一 key 的下一个 value（FIFO 顺序）。
+ * 参数：cursor 为 in / out 游标；首次可传 NULL 由内部自行定位。
+ * 返回：成功 0；key / value 不匹配或已是同键最后一个 -1。
+ */
 /*
  * Caller supplies key and value of an existing item in the list.
  * Function returns the value of the next list item that has the
@@ -431,6 +530,10 @@ int skiplist_next_value(register struct skiplist *l, /* in */
 	return 0;
 }
 
+/*
+ * skiplist_first：取最小键节点，输出其 key 与 value（指针参数可空）。
+ * 返回：成功 0，空表 -1。
+ */
 int skiplist_first(register struct skiplist *l, void **keyPointer,
 		   void **valuePointer)
 {
@@ -452,6 +555,10 @@ int skiplist_first(register struct skiplist *l, void **keyPointer,
 	return 0;
 }
 
+/*
+ * skiplist_last：取最大键节点（用 last 指针 O(1) 命中），输出 key / value。
+ * 返回：成功 0，空表 -1。
+ */
 int skiplist_last(register struct skiplist *l, void **keyPointer,
 		  void **valuePointer)
 {
@@ -467,6 +574,9 @@ int skiplist_last(register struct skiplist *l, void **keyPointer,
 }
 
 /*
+ * skiplist_empty：空返回 true(1)，非空返回 0。
+ */
+/*
  * true = empty
  */
 int skiplist_empty(register struct skiplist *l)
@@ -477,6 +587,11 @@ int skiplist_empty(register struct skiplist *l)
 	return 1;
 }
 
+/*
+ * skiplist_next：遍历用。调用者先把 *cursor 置 NULL 取第一个元素，之后每次取下一个。
+ * 参数：keyPointer / valuePointer 为输出（可空）；cursor 为 in / out。
+ * 返回：成功 0；cursor 为 NULL 或已到末尾 -1。
+ */
 /*
  * Use this to walk the list. Caller sets *cursor to NULL to obtain
  * first element. Return value of 0 indicates valid cursor/element
@@ -516,6 +631,12 @@ int skiplist_next(register struct skiplist *l, /* in */
 	return 0;
 }
 
+/*
+ * skiplist_delete_first：删除最小键节点。
+ * 从第 0 层头节点后继摘链，逐层调整指针，必要时降低 level、更新 last / count，
+ * 并对 value 调用 del 回调。
+ * 返回：成功 0，空表 -1。
+ */
 int skiplist_delete_first(register struct skiplist *l)
 {
 	register int k;
@@ -570,6 +691,9 @@ int skiplist_delete_first(register struct skiplist *l)
 	return 0;
 }
 
+/*
+ * skiplist_debug：向 vty 输出跳表信息：最大层号与各层节点计数（调试用）。
+ */
 void skiplist_debug(struct vty *vty, struct skiplist *l)
 {
 	int i;
@@ -582,6 +706,10 @@ void skiplist_debug(struct vty *vty, struct skiplist *l)
 		vty_out(vty, "  @%d: %d\n", i, l->level_stats[i]);
 }
 
+/*
+ * scramble：把整数打散成“看起来随机”的指针值，供 skiplist_test 造测试键用。
+ * 返回：打散后的伪指针值。
+ */
 static void *scramble(int i)
 {
 	uintptr_t result;
@@ -592,7 +720,14 @@ static void *scramble(int i)
 	return (void *)result;
 }
 
+/*
+ * 自测样本规模：65536 个元素。
+ */
 #define sampleSize 65536
+/*
+ * skiplist_test：跳表自测驱动：多轮执行“批量插入 -> 查找 -> 删除并重插 ->
+ * 逐个删除”，并打印进度；供开发期验证实现正确性（生产不调用）。
+ */
 void skiplist_test(struct vty *vty)
 {
 	struct skiplist *l;

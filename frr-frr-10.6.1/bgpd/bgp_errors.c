@@ -5,11 +5,48 @@
  *               Don Slice
  */
 
+/* ============================================================================
+ * 【文件导读】bgp_errors.c —— bgpd 结构化错误码的“消息注册表”
+ * ============================================================================
+ * 【它是什么】bgp_errors.h 里 enum bgp_log_refs 的每个错误码，其**人类可读消息模板**
+ * 都集中登记在本文件的两个数组里（ferr = FRR error）。代码里用
+ * flog_err(EC_BGP_xxx, ...) 抛出错误码，日志与工具再据此查出标题、描述与处置建议。
+ *
+ * 【两个数组的分工】
+ *   ferr_bgp_warn : 警告级（不影响转发、但需关注，如解析异常、发送队列卡住）。
+ *   ferr_bgp_err  : 错误级（更严重）。
+ * 二者都在 bgp_error_init 里注册进 ferr 框架。每个数组以 {.code = END_FERR} 作为结束
+ * 哨兵——log_ref_add 正是靠它界定数组边界，**末尾这条必须保留，否则会越界读取**。
+ *
+ * 【每条表项的结构】struct log_ref 四要素：
+ *   code        : 错误码，必须取自 bgp_errors.h 的 enum（决定这条消息归哪个码）。
+ *   title       : 一句话标题。
+ *   description : 更详细的说明（发生了什么）。
+ *   suggestion  : 给运维的处置建议。
+ * 有的条目末尾带逗号、有的不带，是历史遗留的书写差异，不影响语义。
+ *
+ * 【最重要的一条规矩：与 enum 严格对应、只往末尾追加】本项目约定本注册表的条目顺序
+ * 与 bgp_errors.h 的 enum **一一对应**。**切勿在 enum 中间插入新错误码**——那样会让
+ * 其后所有码与本表的对应关系错位，日志里打印出的将是**别的**错误的消息，而且编译期
+ * 完全不报错，极难发现。新增错误码请一律**追加到 enum 与注册表的末尾**。另外，某个码
+ * 若在本表里没有条目，运行时也只会显示“未知错误码”，故两边务必同步。
+ *
+ * 【为何整块被 clang-format off / on 包住】这是**手工排版**、按枚举顺序逐条对齐的数据
+ * 表；若放任 clang-format 按列宽重排，会打乱“一条一码”的视觉对应，故显式关闭格式化。
+ * 修改本表时也请保持这种一行一字段的写法，便于人工比对。
+ *
+ * 【阅读顺序】ferr_bgp_warn → ferr_bgp_err → bgp_error_init。
+ * ============================================================================
+ */
+
 #include <zebra.h>
 
 #include "lib/ferr.h"
 #include "bgp_errors.h"
 
+/* 【数据表】警告级错误的注册表：每条把一个错误码(EC_BGP_*)映射到标题 / 描述 / 建议。
+ * 首条为 EC_BGP_ASPATH_FEWER_HOPS。数组末条 {.code = END_FERR} 是结束哨兵，不可删。
+ * 顺序与新增规则详见文件头导读“与 enum 严格对应、只往末尾追加”。 */
 /* clang-format off */
 static struct log_ref ferr_bgp_warn[] = {
 	{
@@ -179,6 +216,9 @@ static struct log_ref ferr_bgp_warn[] = {
 	}
 };
 
+/* 【数据表】错误级错误的注册表（比 warn 更严重）。首条为 EC_BGP_ATTR_FLAG，同样以
+ * {.code = END_FERR} 结束。本表按 enum 顺序排列；末尾若干条（如 EC_BGP_TTL_SECURITY_FAIL）
+ * 是后来追加的新码，务必保持“新码只加在末尾”的约定。 */
 static struct log_ref ferr_bgp_err[] = {
 	{
 		.code = EC_BGP_ATTR_FLAG,
@@ -575,6 +615,8 @@ static struct log_ref ferr_bgp_err[] = {
 };
 /* clang-format on */
 
+/* 【函数】把两张注册表登记进 ferr 框架（先 err、后 warn）。bgpd 启动时调用一次；
+ * 忘记调用会导致 flog_err(EC_BGP_*) 打不出文本，只显示未知错误码。 */
 void bgp_error_init(void)
 {
 	log_ref_add(ferr_bgp_err);

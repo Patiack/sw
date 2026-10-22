@@ -9,6 +9,37 @@
  * This file is part of Free Range Routing (FRR).
  */
 
+/*
+ * ============================ 文件导读 ============================
+ * 本文件是 link_state.h 所定义模型的实现，提供一个协议无关的“链路
+ * 状态数据库(LSDB)”及其上的图(Graph)视图。它被 OSPF / IS-IS 用作
+ * 存储，被 RSVP-TE / PCEP / BGP-LS 等用作消费源。
+ *
+ * 数据结构分三层：
+ *   1) 基础元素：ls_node(节点) / ls_attributes(属性) / ls_prefix(前缀)，
+ *      由 OSPF / IS-IS 填充，各带一个 flags 位掩码标记有效字段。
+ *   2) 图元素：ls_vertex(顶点，持有一个 ls_node) / ls_edge(边，持有一
+ *      组 ls_attributes) / ls_subnet(子网，持有一个 ls_prefix)，分别
+ *      挂在 TED 的三棵 RB 树上，并用 incoming / outgoing 链表维护拓扑。
+ *   3) 容器：ls_ted 聚合上述三棵树；另有 ls_message 用于在各守护进程
+ *      间搬运单个元素。
+ *
+ * 生命周期与所有权(易踩坑)：
+ *   - ls_vertex / ls_edge / ls_subnet 只是“借用”对应的 node / attrs /
+ *     prefix 指针；常规的 _del 不释放被引用对象，带 _all 后缀的版本才
+ *     会连同被引用对象一起释放。
+ *   - 各对象统一由 MTYPE_LS_DB 内存类型分配，便于内存统计与泄漏排查。
+ *   - *_same() 的返回语义是“是否相等”(即 == 的真值)，而非比较结果。
+ *
+ * 跨进程交互：本文件实现了经 zebra 的 ZAPI Opaque(Link State 类型)收
+ * 发 ls_message 的完整链路——注册 / 注销、请求全量同步、解析、发送，
+ * 以及 msg 与图元素之间的相互转换(ls_*2msg 与 ls_msg2*)。
+ *
+ * 阅读顺序建议：先看基础元素的 new / del / same，再看图元素与 TED 的
+ * add / update / find，最后看 ls_message 的编解码与 sync。
+ * ================================================================
+ */
+
 #include <zebra.h>
 
 #include "if.h"
@@ -28,11 +59,25 @@
 #include "link_state.h"
 #include "iso.h"
 
+/*
+ * 本模块统一使用的内存类型。所有动态分配都走 MTYPE_LS_DB，便于
+ * show memory 统计与泄漏排查。
+ */
 /* Link State Memory allocation */
 DEFINE_MTYPE_STATIC(LIB, LS_DB, "Link State Database");
 
 /**
  *  Link State Node management functions
+ */
+/*
+ * 判断两个节点标识是否相同，按值与 origin 比较：
+ *   - origin 不同即不同；origin 为 UNKNOWN 时直接视为相同。
+ *   - IS-IS：比较 sys_id(6 字节)与 level。
+ *   - OSPF：比较 addr 与 area_id。
+ * 返回 1 表示相同、0 表示不同(语义是 == 的真值，不是“比较结果”)。
+ * 注意：OSPF 分支里地址或 Area-ID 任一不同就 return 1，这看起来像
+ * 上游的一处笔误(按语义应为 return 0)；此处按代码原样说明，阅读时
+ * 请以实际行为为准。
  */
 int ls_node_id_same(struct ls_node_id i1, struct ls_node_id i2)
 {
@@ -56,6 +101,14 @@ int ls_node_id_same(struct ls_node_id i1, struct ls_node_id i2)
 	return 1;
 }
 
+/*
+ * 新建一个链路状态节点。adv 为必填的广告标识，origin 为 UNKNOWN 时
+ * 直接返回 NULL。rid / rid6 非空(未指定)时填入并置
+ * LS_NODE_ROUTER_ID / LS_NODE_ROUTER_ID6 标志。若 rid 为空且 origin
+ * 为 OSPF / STATIC / DIRECT，则退回用 adv 里的 OSPF Router-ID 作为
+ * router_id。返回新节点(内存来自 MTYPE_LS_DB)，由 ls_node_del 释放；
+ * 内部用 XCALLOC，分配失败会直接终止进程。
+ */
 struct ls_node *ls_node_new(struct ls_node_id adv, struct in_addr rid,
 			    struct in6_addr rid6)
 {
@@ -83,6 +136,9 @@ struct ls_node *ls_node_new(struct ls_node_id adv, struct in_addr rid,
 	return new;
 }
 
+/*
+ * 释放一个链路状态节点。node 为 NULL 时直接返回(幂等)。
+ */
 void ls_node_del(struct ls_node *node)
 {
 	if (!node)
@@ -91,6 +147,12 @@ void ls_node_del(struct ls_node *node)
 	XFREE(MTYPE_LS_DB, node);
 }
 
+/*
+ * 判断两个节点是否相等。先处理空指针与同一指针；再比较 flags 与 adv
+ * 标识；最后仅对 flags 标记为有效的字段逐一比较(名称、Router-ID、
+ * 节点标志、类型、AS 号、SR / SRv6 信息等)。只要 flags 不同即判为
+ * 不等。返回 1 相等 / 0 不等。
+ */
 int ls_node_same(struct ls_node *n1, struct ls_node *n2)
 {
 	/* First, check pointer */
@@ -154,6 +216,11 @@ int ls_node_same(struct ls_node *n1, struct ls_node *n2)
 /**
  *  Link State Attributes management functions
  */
+/*
+ * 新建一组链路状态属性。要求 adv.origin 非 UNKNOWN，且 local / local6 /
+ * local_id 三者至少有一个非空(否则释放并返回 NULL)。会初始化扩展
+ * 管理组 ext_admin_group。返回新属性，由 ls_attributes_del 释放。
+ */
 struct ls_attributes *ls_attributes_new(struct ls_node_id adv,
 					struct in_addr local,
 					struct in6_addr local6,
@@ -191,6 +258,10 @@ struct ls_attributes *ls_attributes_new(struct ls_node_id adv,
 	return new;
 }
 
+/*
+ * 释放属性中的 SRLG 列表，并把 srlgs 置空、srlg_len 清零，同时清除
+ * LS_ATTR_SRLG 标志位。attr 为 NULL 时直接返回。
+ */
 void ls_attributes_srlg_del(struct ls_attributes *attr)
 {
 	if (!attr)
@@ -204,6 +275,10 @@ void ls_attributes_srlg_del(struct ls_attributes *attr)
 	UNSET_FLAG(attr->flags, LS_ATTR_SRLG);
 }
 
+/*
+ * 释放一组链路状态属性：先释放 SRLG 列表，再终止扩展管理组，最后
+ * 释放结构体本身。attr 为 NULL 时直接返回。
+ */
 void ls_attributes_del(struct ls_attributes *attr)
 {
 	if (!attr)
@@ -216,6 +291,11 @@ void ls_attributes_del(struct ls_attributes *attr)
 	XFREE(MTYPE_LS_DB, attr);
 }
 
+/*
+ * 判断两组属性是否相等。先比指针 / flags / adv，再仅对 flags 标记为
+ * 有效的字段逐一比较：名称、各类度量、管理组、本端与邻居地址、带宽、
+ * 时延与抖动与丢包，以及各种邻接 SID、SRv6、SRLG 等。返回 1 / 0。
+ */
 int ls_attributes_same(struct ls_attributes *l1, struct ls_attributes *l2)
 {
 	/* First, check pointer */
@@ -357,6 +437,10 @@ int ls_attributes_same(struct ls_attributes *l1, struct ls_attributes *l2)
 /**
  *  Link State prefix management functions
  */
+/*
+ * 新建一个链路状态前缀。adv.origin 为 UNKNOWN 时返回 NULL；否则把传入
+ * 的前缀 p 整体复制进 new->pref。由 ls_prefix_del 释放。
+ */
 struct ls_prefix *ls_prefix_new(struct ls_node_id adv, struct prefix *p)
 {
 	struct ls_prefix *new;
@@ -371,6 +455,9 @@ struct ls_prefix *ls_prefix_new(struct ls_node_id adv, struct prefix *p)
 	return new;
 }
 
+/*
+ * 释放一个链路状态前缀。pref 为 NULL 时直接返回。
+ */
 void ls_prefix_del(struct ls_prefix *pref)
 {
 	if (!pref)
@@ -379,6 +466,11 @@ void ls_prefix_del(struct ls_prefix *pref)
 	XFREE(MTYPE_LS_DB, pref);
 }
 
+/*
+ * 判断两个前缀是否相等。先比指针 / flags / adv；再比较前缀本身
+ * (prefix_same)，然后仅对 flags 标记为有效的字段逐一比较(IGP 标志、
+ * 路由标签、扩展标签、度量、SR 与 SRv6 SID)。返回 1 / 0。
+ */
 int ls_prefix_same(struct ls_prefix *p1, struct ls_prefix *p2)
 {
 	/* First, check pointer */
@@ -429,6 +521,12 @@ int ls_prefix_same(struct ls_prefix *p1, struct ls_prefix *p2)
 /**
  *  Link State Vertices management functions
  */
+/*
+ * 把 IS-IS 的 ISO System-ID(6 字节)转换为 64 位 key，供顶点比较使用。
+ * 小端主机上逐字节倒序放入低地址(使数值大小与字节序无关、可稳定
+ * 比较)，并把高两位字节置 0；大端主机上直接内存拷贝。
+ * 之所以要这样处理，是因为 RB 树用数值比较(numcmp)比较 key。
+ */
 uint64_t sysid_to_key(const uint8_t sysid[ISO_SYS_ID_LEN])
 {
 	uint64_t key = 0;
@@ -448,6 +546,13 @@ uint64_t sysid_to_key(const uint8_t sysid[ISO_SYS_ID_LEN])
 	return key;
 }
 
+/*
+ * 依据 ls_node 向 TED 添加顶点。先由 adv.origin 推导 key：OSPF / STATIC
+ * / DIRECT 用 ntohl(Router-ID) 取低 32 位，IS-IS 用 sysid_to_key。
+ * key 为 0(含 UNKNOWN)时直接返回 NULL。随后分配顶点，建立空的入边 /
+ * 出边 / 前缀三张链表(分别设置 edge_cmp 与 subnet_cmp 作比较函数)，
+ * 再插入 RB 树。注意：顶点只保存 node 指针，不接管其所有权。
+ */
 struct ls_vertex *ls_vertex_add(struct ls_ted *ted, struct ls_node *node)
 {
 	struct ls_vertex *new;
@@ -497,6 +602,15 @@ struct ls_vertex *ls_vertex_add(struct ls_ted *ted, struct ls_node *node)
 	return new;
 }
 
+/*
+ * 从 TED 删除顶点并释放其内部链表：
+ *   - 出边：全部 ls_edge_del_all(出边必然以本顶点为源)。
+ *   - 入边：仅 disconnect；若断开后该边已无源顶点(悬空)则连同删除。
+ *   - 子网：全部 ls_subnet_del_all。
+ * 最后从 RB 树摘除并释放顶点结构体，但不释放 node。
+ * 注意：本函数实际会连带删除边与子网本身(及其 attributes / prefix)，
+ * 与头文件“只清链表不删边”的注释略有出入，阅读时以代码为准。
+ */
 void ls_vertex_del(struct ls_ted *ted, struct ls_vertex *vertex)
 {
 	struct listnode *node, *nnode;
@@ -529,6 +643,10 @@ void ls_vertex_del(struct ls_ted *ted, struct ls_vertex *vertex)
 	XFREE(MTYPE_LS_DB, vertex);
 }
 
+/*
+ * 删除顶点并连同其 ls_node 一起释放：先释放 node，再调用 ls_vertex_del
+ * 删除顶点本身。仅在确认 node 不被其它对象引用时使用。
+ */
 void ls_vertex_del_all(struct ls_ted *ted, struct ls_vertex *vertex)
 {
 	if (!ted || !vertex)
@@ -541,6 +659,14 @@ void ls_vertex_del_all(struct ls_ted *ted, struct ls_vertex *vertex)
 	ls_vertex_del(ted, vertex);
 }
 
+/*
+ * 用新 node 更新(或新建)顶点。按 node->adv 查找已有顶点：
+ *   - 找到：新旧节点不同则先释放旧 node 再替换；相同则释放新传入的
+ *     node(避免重复)，并把顶点状态置为 UPDATE。
+ *   - 未找到：调用 ls_vertex_add 新建。
+ * 返回更新后的顶点，出错返回 NULL。
+ * 注意：本函数接管传入 node 的所有权——要么被持有，要么被释放。
+ */
 struct ls_vertex *ls_vertex_update(struct ls_ted *ted, struct ls_node *node)
 {
 	struct ls_vertex *old;
@@ -563,6 +689,10 @@ struct ls_vertex *ls_vertex_update(struct ls_ted *ted, struct ls_node *node)
 	return ls_vertex_add(ted, node);
 }
 
+/*
+ * 按 key 查找顶点：用栈上一个临时顶点作探针，交给 RB 树的 find。
+ * key 为 0 时直接返回 NULL。找到返回顶点指针，否则 NULL。
+ */
 struct ls_vertex *ls_find_vertex_by_key(struct ls_ted *ted, const uint64_t key)
 {
 	struct ls_vertex vertex = {};
@@ -574,6 +704,10 @@ struct ls_vertex *ls_find_vertex_by_key(struct ls_ted *ted, const uint64_t key)
 	return vertices_find(&ted->vertices, &vertex);
 }
 
+/*
+ * 按节点标识查找顶点：先由 origin 推导 key(规则同 ls_vertex_add)，再用
+ * 临时探针在 RB 树中查找。origin 为 UNKNOWN 或未命中时返回 NULL。
+ */
 struct ls_vertex *ls_find_vertex_by_id(struct ls_ted *ted,
 				       struct ls_node_id nid)
 {
@@ -598,6 +732,10 @@ struct ls_vertex *ls_find_vertex_by_id(struct ls_ted *ted,
 	return vertices_find(&ted->vertices, &vertex);
 }
 
+/*
+ * 判断两个顶点是否相等：空 / 同指针特判；key 不同即不等；node 指针
+ * 相同即相等；否则比较各自的 node(ls_node_same)。返回 1 / 0。
+ */
 int ls_vertex_same(struct ls_vertex *v1, struct ls_vertex *v2)
 {
 	if ((v1 && !v2) || (!v1 && v2))
@@ -615,6 +753,11 @@ int ls_vertex_same(struct ls_vertex *v1, struct ls_vertex *v2)
 	return ls_node_same(v1->node, v2->node);
 }
 
+/*
+ * 清理顶点下所有状态为 ORPHAN 的边(入边与出边)和子网。若 zclient 非
+ * NULL，则在删除前把对象状态置为 DELETE，并通过 ls_xxx2msg 加
+ * ls_send_msg 广播一条删除通知，让其它守护进程同步删除。
+ */
 void ls_vertex_clean(struct ls_ted *ted, struct ls_vertex *vertex,
 		     struct zclient *zclient)
 {
@@ -662,6 +805,16 @@ void ls_vertex_clean(struct ls_ted *ted, struct ls_vertex *vertex,
  * Link State Edges management functions
  */
 
+/*
+ * 把一条边挂接到 TED 中相应的顶点上，并在发现反向边时同时建立对端
+ * 连接。逻辑：
+ *   1) 按 attributes->adv 查找源顶点；找不到时临时新建一个只有标识的
+ *      node / vertex，保证图中顶点完整。
+ *   2) 把该边作为出边加入源顶点的 outgoing_edges，并记 edge->source。
+ *   3) 再按目的信息查找反向边 dst；若找到，则把 dst 作为入边挂到源
+ *      顶点、把本边作为入边挂到 dst 的源顶点，并互相设置 destination，
+ *      从而把一条双向链路的两条有向边关联起来。
+ */
 /**
  * This function allows to connect the Edge to the vertices present in the TED.
  * A temporary vertex that corresponds to the source of this Edge i.e. the
@@ -705,6 +858,14 @@ static void ls_edge_connect_to(struct ls_ted *ted, struct ls_edge *edge)
 	}
 }
 
+/*
+ * 由属性推导边的 key。dst 为真取“目的”侧信息，否则取“源”侧：
+ *   - 优先用 IPv4 邻居 / 本地地址(family AF_INET)；
+ *   - 其次用 IPv6 邻居 / 本地地址(family AF_INET6)；
+ *   - 都没有时退回用本侧与对侧标识拼成 64 位 link_id(family AF_LOCAL)。
+ * 若属性为空或没有任何可用标识，返回 family 为 AF_UNSPEC 的 key，
+ * 调用方据此判定该边无法建立。
+ */
 static struct ls_edge_key get_edge_key(struct ls_attributes *attr, bool dst)
 {
 	struct ls_edge_key key = {.family = AF_UNSPEC};
@@ -752,6 +913,13 @@ static struct ls_edge_key get_edge_key(struct ls_attributes *attr, bool dst)
 	return key;
 }
 
+/*
+ * 依据一组 ls_attributes 向 TED 新增边。先用 get_edge_key(源侧)推导
+ * key，若为 AF_UNSPEC 则返回 NULL。随后分配边、登记 attributes 与
+ * key、类型置 EDGE，插入 RB 树，最后调用 ls_edge_connect_to 把边挂接
+ * 到源 / 目的顶点。返回新边。注意：边自身不接管 attributes 的所有权，
+ * 但 ls_edge_del_all 会一并释放它。
+ */
 struct ls_edge *ls_edge_add(struct ls_ted *ted,
 			    struct ls_attributes *attributes)
 {
@@ -780,6 +948,10 @@ struct ls_edge *ls_edge_add(struct ls_ted *ted,
 	return new;
 }
 
+/*
+ * 按 ls_edge_key 查找边。key.family 为 AF_UNSPEC 时返回 NULL。用栈上
+ * 临时边作探针交给 RB 树查找，命中返回边指针，否则 NULL。
+ */
 struct ls_edge *ls_find_edge_by_key(struct ls_ted *ted,
 				    const struct ls_edge_key key)
 {
@@ -792,6 +964,10 @@ struct ls_edge *ls_find_edge_by_key(struct ls_ted *ted,
 	return edges_find(&ted->edges, &edge);
 }
 
+/*
+ * 按属性的“源”侧信息(get_edge_key(attributes,false))查找边，即本端
+ * 地址 / 标识匹配。找到返回对应边，否则 NULL。
+ */
 struct ls_edge *ls_find_edge_by_source(struct ls_ted *ted,
 				       struct ls_attributes *attributes)
 {
@@ -807,6 +983,10 @@ struct ls_edge *ls_find_edge_by_source(struct ls_ted *ted,
 	return edges_find(&ted->edges, &edge);
 }
 
+/*
+ * 按属性的“目的”侧信息(get_edge_key(attributes,true))查找边，即远端
+ * 地址 / 标识匹配。找到返回对应边，否则 NULL。
+ */
 struct ls_edge *ls_find_edge_by_destination(struct ls_ted *ted,
 					    struct ls_attributes *attributes)
 {
@@ -822,6 +1002,14 @@ struct ls_edge *ls_find_edge_by_destination(struct ls_ted *ted,
 	return edges_find(&ted->edges, &edge);
 }
 
+/*
+ * 用新 attributes 更新(或新建)边。先按源侧查找已有边：
+ *   - 找到：新旧属性不同则释放旧 attributes 再替换；相同则释放新传入
+ *     的 attributes，并把状态置为 UPDATE。
+ *   - 未找到：调用 ls_edge_add 新建。
+ * 返回更新后的边。注意：与 ls_vertex_update 类似，本函数接管传入
+ * attributes 的所有权——要么被持有，要么被释放。
+ */
 struct ls_edge *ls_edge_update(struct ls_ted *ted,
 			       struct ls_attributes *attributes)
 {
@@ -848,6 +1036,10 @@ struct ls_edge *ls_edge_update(struct ls_ted *ted,
 	return ls_edge_add(ted, attributes);
 }
 
+/*
+ * 判断两条边是否相等：空 / 同指针特判；用 edge_cmp 比较 key；attributes
+ * 指针相同即相等，否则比较 attributes(ls_attributes_same)。返回 1 / 0。
+ */
 int ls_edge_same(struct ls_edge *e1, struct ls_edge *e2)
 {
 	if ((e1 && !e2) || (!e1 && e2))
@@ -865,6 +1057,10 @@ int ls_edge_same(struct ls_edge *e1, struct ls_edge *e2)
 	return ls_attributes_same(e1->attributes, e2->attributes);
 }
 
+/*
+ * 从 TED 删除一条边：先 ls_disconnect_edge 断开与两端顶点的连接，再从
+ * RB 树摘除并释放边结构体。不释放 attributes。
+ */
 void ls_edge_del(struct ls_ted *ted, struct ls_edge *edge)
 {
 	if (!ted || !edge)
@@ -877,6 +1073,10 @@ void ls_edge_del(struct ls_ted *ted, struct ls_edge *edge)
 	XFREE(MTYPE_LS_DB, edge);
 }
 
+/*
+ * 删除边并连同其 ls_attributes 一起释放(先释放 attributes，再删除边
+ * 本身)。
+ */
 void ls_edge_del_all(struct ls_ted *ted, struct ls_edge *edge)
 {
 	if (!ted || !edge)
@@ -890,6 +1090,13 @@ void ls_edge_del_all(struct ls_ted *ted, struct ls_edge *edge)
 
 /**
  * Link State Subnet Management functions.
+ */
+/*
+ * 依据 ls_prefix 向 TED 新增子网：分配子网、以 ls_pref->pref 作 key、
+ * 类型置 SUBNET。按 ls_pref->adv 查找所属顶点，找不到时临时新建一个
+ * 只有标识的 node / vertex。把子网挂到该顶点的 prefixes 链表，再插入
+ * 子网 RB 树。返回新子网。注意：子网自身不接管 ls_pref 的所有权，但
+ * ls_subnet_del_all 会一并释放它。
  */
 struct ls_subnet *ls_subnet_add(struct ls_ted *ted,
 				struct ls_prefix *ls_pref)
@@ -924,6 +1131,13 @@ struct ls_subnet *ls_subnet_add(struct ls_ted *ted,
 	return new;
 }
 
+/*
+ * 用新 pref 更新(或新建)子网。先按前缀查找已有子网：
+ *   - 找到：新旧前缀不同则释放旧 ls_pref 再替换；相同则释放新传入的
+ *     pref，并把状态置为 UPDATE。
+ *   - 未找到：调用 ls_subnet_add 新建。
+ * 返回更新后的子网。本函数接管传入 pref 的所有权。
+ */
 struct ls_subnet *ls_subnet_update(struct ls_ted *ted, struct ls_prefix *pref)
 {
 	struct ls_subnet *old;
@@ -946,6 +1160,10 @@ struct ls_subnet *ls_subnet_update(struct ls_ted *ted, struct ls_prefix *pref)
 	return ls_subnet_add(ted, pref);
 }
 
+/*
+ * 判断两个子网是否相等：空 / 同指针特判；比较前缀 key(prefix_same)；
+ * ls_pref 指针相同即相等，否则比较 ls_prefix。返回 1 / 0。
+ */
 int ls_subnet_same(struct ls_subnet *s1, struct ls_subnet *s2)
 {
 	if ((s1 && !s2) || (!s1 && s2))
@@ -963,6 +1181,10 @@ int ls_subnet_same(struct ls_subnet *s1, struct ls_subnet *s2)
 	return ls_prefix_same(s1->ls_pref, s2->ls_pref);
 }
 
+/*
+ * 从 TED 删除子网：先从所属顶点的 prefixes 链表移除，再从子网 RB 树
+ * 摘除并释放子网结构体。不释放 ls_pref。
+ */
 void ls_subnet_del(struct ls_ted *ted, struct ls_subnet *subnet)
 {
 	if (!ted || !subnet)
@@ -975,6 +1197,10 @@ void ls_subnet_del(struct ls_ted *ted, struct ls_subnet *subnet)
 	XFREE(MTYPE_LS_DB, subnet);
 }
 
+/*
+ * 删除子网并连同其 ls_prefix 一起释放(先释放 ls_pref，再删除子网
+ * 本身)。
+ */
 void ls_subnet_del_all(struct ls_ted *ted, struct ls_subnet *subnet)
 {
 	if (!ted || !subnet)
@@ -986,6 +1212,10 @@ void ls_subnet_del_all(struct ls_ted *ted, struct ls_subnet *subnet)
 	ls_subnet_del(ted, subnet);
 }
 
+/*
+ * 按 struct prefix 查找子网：把前缀复制到栈上临时子网的 key，交给 RB
+ * 树查找。prefix 为 NULL 时返回 NULL。
+ */
 struct ls_subnet *ls_find_subnet(struct ls_ted *ted,
 				 const struct prefix *prefix)
 {
@@ -1000,6 +1230,11 @@ struct ls_subnet *ls_find_subnet(struct ls_ted *ted,
 
 /**
  * Link State TED management functions
+ */
+/*
+ * 新建一个链路状态数据库(TED)：分配结构体、记录 key / as_number /
+ * name(名称用 strlcpy 截断到 MAX_NAME_LENGTH)，并初始化三棵 RB 树。
+ * 返回新 TED。注意：name 为 NULL 时 strlcpy 会写入空串。
  */
 struct ls_ted *ls_ted_new(const uint32_t key, const char *name,
 			  uint32_t as_number)
@@ -1021,6 +1256,10 @@ struct ls_ted *ls_ted_new(const uint32_t key, const char *name,
 	return new;
 }
 
+/*
+ * 释放 TED 结构体本身。仅当库为空(顶点 / 边 / 子网计数均为 0)时才真
+ * 正释放，并结束三棵 RB 树；否则直接返回，避免留下悬空引用。
+ */
 void ls_ted_del(struct ls_ted *ted)
 {
 	if (ted == NULL)
@@ -1039,6 +1278,13 @@ void ls_ted_del(struct ls_ted *ted)
 	XFREE(MTYPE_LS_DB, ted);
 }
 
+/*
+ * 删除 TED 中所有顶点 / 边 / 子网(均用 _del_all 版本，连同其 node /
+ * attributes / prefix 一起释放)，再删除 TED 自身。形参是二级指针，
+ * 函数会把调用者的指针置为 NULL。
+ * 注意删除顺序：先顶点、再边、再子网。顶点删除时已连带处理其关联的
+ * 边与子网，故后续遍历通常为空操作。
+ */
 void ls_ted_del_all(struct ls_ted **ted)
 {
 	struct ls_vertex *vertex;
@@ -1061,6 +1307,10 @@ void ls_ted_del_all(struct ls_ted **ted)
 	*ted = NULL;
 }
 
+/*
+ * 删除 TED 中所有状态为 ORPHAN 的顶点 / 边 / 子网。与 ls_ted_del_all
+ * 不同，只清理被标记为孤立的元素。分别在顶点 / 边 / 子网三棵树中扫描。
+ */
 void ls_ted_clean(struct ls_ted *ted)
 {
 	struct ls_vertex *vertex;
@@ -1087,6 +1337,12 @@ void ls_ted_clean(struct ls_ted *ted)
 
 }
 
+/*
+ * 把一条边连接到顶点：source 为真时作为出边加入 outgoing_edges 并设
+ * edge->source；为假时作为入边加入 incoming_edges 并设 edge->destination。
+ * 任一指为 NULL 时直接返回。用 listnode_add_sort_nodup 保证同一列表内
+ * 不出现重复项。
+ */
 void ls_connect(struct ls_vertex *vertex, struct ls_edge *edge, bool source)
 {
 	if (vertex == NULL || edge == NULL)
@@ -1101,6 +1357,11 @@ void ls_connect(struct ls_vertex *vertex, struct ls_edge *edge, bool source)
 	}
 }
 
+/*
+ * 把一条边从顶点断开(ls_connect 的逆操作)：从对应链表删除，并把
+ * edge->source 或 edge->destination 置 NULL。vertex / edge 为 NULL 时
+ * 直接返回。
+ */
 void ls_disconnect(struct ls_vertex *vertex, struct ls_edge *edge, bool source)
 {
 
@@ -1116,6 +1377,11 @@ void ls_disconnect(struct ls_vertex *vertex, struct ls_edge *edge, bool source)
 	}
 }
 
+/*
+ * 用一条边连接源顶点与目的顶点：先设置 edge 的 source / destination，
+ * 再分别把边加入源顶点的出边表与目的顶点的入边表。src / dst 为 NULL
+ * 时跳过对应方向。
+ */
 void ls_connect_vertices(struct ls_vertex *src, struct ls_vertex *dst,
 			 struct ls_edge *edge)
 {
@@ -1132,6 +1398,11 @@ void ls_connect_vertices(struct ls_vertex *src, struct ls_vertex *dst,
 		listnode_add_sort_nodup(dst->incoming_edges, edge);
 }
 
+/*
+ * 把一条边同时从源顶点与目的顶点断开，并把该边状态标记为 ORPHAN，
+ * 等待后续 ls_vertex_clean / ls_ted_clean 清理。edge 为 NULL 时直接
+ * 返回。
+ */
 void ls_disconnect_edge(struct ls_edge *edge)
 {
 	if (edge == NULL)
@@ -1148,6 +1419,11 @@ void ls_disconnect_edge(struct ls_edge *edge)
  * Link State Message management functions
  */
 
+/*
+ * 注册到 zebra 的 OPAQUE API。server 为真时注册为 LINK_STATE_SYNC(持有
+ * LSDB 的服务端)，否则注册为 LINK_STATE_UPDATE(消费更新的客户端)。
+ * 直接透传 zebra 的返回值(0 成功 / -1 失败)。
+ */
 int ls_register(struct zclient *zclient, bool server)
 {
 	int rc;
@@ -1160,6 +1436,9 @@ int ls_register(struct zclient *zclient, bool server)
 	return rc;
 }
 
+/*
+ * 从 zebra 的 OPAQUE API 注销(与 ls_register 对应)。透传返回值。
+ */
 int ls_unregister(struct zclient *zclient, bool server)
 {
 	int rc;
@@ -1172,6 +1451,10 @@ int ls_unregister(struct zclient *zclient, bool server)
 	return rc;
 }
 
+/*
+ * 发送一条无数据的 LINK_STATE_SYNC 消息，请求服务端回送完整 LSDB。
+ * 先检查发送缓冲区是否够放一个 opaque 头；不够则返回 -1。
+ */
 int ls_request_sync(struct zclient *zclient)
 {
 	/* Check buffer size */
@@ -1183,6 +1466,12 @@ int ls_request_sync(struct zclient *zclient)
 	return zclient_send_opaque(zclient, LINK_STATE_SYNC, NULL, 0);
 }
 
+/*
+ * 从数据流解析出一个 ls_node。先读 adv 与 flags，再按 flags 位逐段读取
+ * 对应字段(名称、Router-ID、节点标志、类型、AS 号、SRGB、SR 算法、
+ * SRLB、MSD)。STREAM_GET 系列宏失败时会 goto stream_failure，那里打印
+ * 错误、释放已分配内存并返回 NULL。
+ */
 static struct ls_node *ls_parse_node(struct stream *s)
 {
 	struct ls_node *node;
@@ -1227,6 +1516,14 @@ stream_failure:
 	return NULL;
 }
 
+/*
+ * 从数据流解析出一组 ls_attributes。先读 adv 与 flags，再按 flags 位
+ * 逐段读取各字段(名称、度量、管理组、扩展管理组、地址、带宽、时延
+ * 与抖动与丢包、邻接 SID、SRv6 邻接 SID、SRLG)。扩展管理组按位图
+ * 批量设置；SRLG 先读长度再逐条读取。
+ * 踩坑：STREAM_GET 宏失败会 goto stream_failure；该处会先释放 SRLG
+ * 列表再释放结构体，故需保证 srlgs 已被初始化为 NULL，避免误释放。
+ */
 static struct ls_attributes *ls_parse_attributes(struct stream *s)
 {
 	struct ls_attributes *attr;
@@ -1369,6 +1666,12 @@ stream_failure:
 
 }
 
+/*
+ * 从数据流解析出一个 ls_prefix。读取 adv / flags / 前缀地址族与掩码
+ * 长度，用 prefix_blen 计算前缀字节数后读取前缀，再按 flags 读取 IGP
+ * 标志、路由标签、扩展标签、度量、SR 与 SRv6 SID。解析失败释放内存并
+ * 返回 NULL。
+ */
 static struct ls_prefix *ls_parse_prefix(struct stream *s)
 {
 	struct ls_prefix *ls_pref;
@@ -1409,6 +1712,13 @@ stream_failure:
 	return NULL;
 }
 
+/*
+ * 从数据流解析一条完整的链路状态消息：先读 event 与 type，再按 type
+ * 分派去解析 node / attributes / prefix(attributes 类型会先读远端节点
+ * 标识)。类型非法或子对象解析失败时 goto stream_failure，打印错误并
+ * 释放 msg 后返回 NULL。
+ * 注意：错误路径只释放 message 结构体本身，未释放本次已解析出的子对象。
+ */
 struct ls_message *ls_parse_msg(struct stream *s)
 {
 	struct ls_message *msg;
@@ -1448,6 +1758,13 @@ stream_failure:
 	return NULL;
 }
 
+/*
+ * 把 ls_node 序列化进流(ls_parse_node 的逆操作)。先写 adv，再写 flags，
+ * 然后按 flags 位逐段写入对应字段。名称写入时先写长度(含结尾 0)，与
+ * 解析端格式保持一致。始终返回 0。
+ * 注意：字段顺序必须与 ls_parse_node 严格对应，任何一侧增删字段都要
+ * 同步另一侧，否则线上格式会错位。
+ */
 static int ls_format_node(struct stream *s, struct ls_node *node)
 {
 	size_t len;
@@ -1489,6 +1806,12 @@ static int ls_format_node(struct stream *s, struct ls_node *node)
 	return 0;
 }
 
+/*
+ * 把 ls_attributes 序列化进流(ls_parse_attributes 的逆操作)。先写 adv
+ * 与 flags，再按 flags 位逐段写入各字段。扩展管理组先写字数
+ * (admin_group_nb_words)再逐字写偏移；SRLG 先写长度再逐条写。
+ * 必须与解析端字段顺序保持严格一致。
+ */
 static int ls_format_attributes(struct stream *s, struct ls_attributes *attr)
 {
 	size_t len, nb_ext_adm_grp;
@@ -1618,6 +1941,11 @@ static int ls_format_attributes(struct stream *s, struct ls_attributes *attr)
 	return 0;
 }
 
+/*
+ * 把 ls_prefix 序列化进流(ls_parse_prefix 的逆操作)：写 adv、flags、
+ * 前缀族与掩码长度、前缀字节，再按 flags 写 IGP 标志、路由标签、扩展
+ * 标签、度量、SR 与 SRv6 SID。需与解析端顺序严格一致。
+ */
 static int ls_format_prefix(struct stream *s, struct ls_prefix *ls_pref)
 {
 	size_t len;
@@ -1653,6 +1981,11 @@ static int ls_format_prefix(struct stream *s, struct ls_prefix *ls_pref)
 	return 0;
 }
 
+/*
+ * 按消息类型把消息体序列化进流：先写 event 与 type，再按 type 分派。
+ * attributes 类型会先写远端节点标识。类型非法时打印警告并返回 -1；
+ * 成功时返回子格式函数的返回值(通常为 0)。
+ */
 static int ls_format_msg(struct stream *s, struct ls_message *msg)
 {
 
@@ -1678,6 +2011,12 @@ static int ls_format_msg(struct stream *s, struct ls_message *msg)
 	return -1;
 }
 
+/*
+ * 计算一条链路状态消息体的最大字节数：取 ls_node / ls_attributes /
+ * ls_prefix 三者 sizeof 的最大值，供发送前做缓冲区容量检查。
+ * 注意：若 ls_message 容器新增成员结构体，需同步更新本函数(头文件中
+ * 也有对应提示)。
+ */
 /* Help to compute zapi message size based on the ls_xxx structs' data */
 static size_t get_max_ls_msg_size(void)
 {
@@ -1692,6 +2031,14 @@ static size_t get_max_ls_msg_size(void)
 	return max;
 }
 
+/*
+ * 把一条链路状态消息编码成 ZAPI Opaque(Link State 类型)消息并发出。
+ * 校验：event 不能是 UNDEF；发送缓冲区要能容纳头加最大消息体。dst 为
+ * NULL 时用 zapi_opaque_init(广播给所有已注册进程)，否则用
+ * zapi_opaque_unicast_init 单播给指定进程。编码成功后回填长度并发送。
+ * 成功返回 zclient_send_message 的结果，失败返回 -1。
+ * 注意：msg 内容被内联编码，其生命周期仍由调用方管理。
+ */
 int ls_send_msg(struct zclient *zclient, struct ls_message *msg,
 		struct zapi_opaque_reg_info *dst)
 {
@@ -1728,6 +2075,12 @@ int ls_send_msg(struct zclient *zclient, struct ls_message *msg,
 
 	return zclient_send_message(zclient);
 }
+/*
+ * 由顶点构造消息。msg 为 NULL 时新分配并清零，否则先 memset 清空复用。
+ * 类型固定为 NODE，事件由顶点的 status 映射(NEW 为 ADD、UPDATE 为
+ * UPDATE、DELETE 为 DELETE、SYNC 为 SYNC、UNSET 或 ORPHAN 为 UNDEF)。
+ * data.node 指向顶点持有的 node，remote_id 置 UNKNOWN。返回可用的 msg。
+ */
 struct ls_message *ls_vertex2msg(struct ls_message *msg,
 				 struct ls_vertex *vertex)
 {
@@ -1762,6 +2115,11 @@ struct ls_message *ls_vertex2msg(struct ls_message *msg,
 	return msg;
 }
 
+/*
+ * 由边构造消息：类型为 ATTRIBUTES，事件由边 status 映射，data.attr 指向
+ * 边的 attributes。remote_id 取目的顶点的 adv(存在目的顶点时)，否则
+ * 置 UNKNOWN。msg 为 NULL 时新分配并清零。返回可用的 msg。
+ */
 struct ls_message *ls_edge2msg(struct ls_message *msg, struct ls_edge *edge)
 {
 	/* Allocate space if needed */
@@ -1798,6 +2156,11 @@ struct ls_message *ls_edge2msg(struct ls_message *msg, struct ls_edge *edge)
 	return msg;
 }
 
+/*
+ * 由子网构造消息：类型为 PREFIX，事件由子网 status 映射，data.prefix
+ * 指向子网的 ls_pref，remote_id 置 UNKNOWN。msg 为 NULL 时新分配并
+ * 清零。返回可用的 msg。
+ */
 struct ls_message *ls_subnet2msg(struct ls_message *msg,
 				 struct ls_subnet *subnet)
 {
@@ -1832,6 +2195,13 @@ struct ls_message *ls_subnet2msg(struct ls_message *msg,
 	return msg;
 }
 
+/*
+ * 把消息应用到 TED 的顶点并返回该顶点：
+ *   SYNC / ADD  新增顶点并置相应状态；UPDATE 更新；
+ *   DELETE      先按标识查找；delete 为真时直接删除(del_all)并返回
+ *               NULL，否则只把状态改为 DELETE。
+ * 其它事件返回 NULL。
+ */
 struct ls_vertex *ls_msg2vertex(struct ls_ted *ted, struct ls_message *msg,
 				bool delete)
 {
@@ -1872,6 +2242,11 @@ struct ls_vertex *ls_msg2vertex(struct ls_ted *ted, struct ls_message *msg,
 	return vertex;
 }
 
+/*
+ * 把消息应用到 TED 的边并返回该边：SYNC / ADD 新增、UPDATE 更新、
+ * DELETE 按源侧查找后按 delete 决定删除或仅标记。其它事件返回 NULL。
+ * 注意：本函数接管传入 attributes 的所有权(新增 / 更新时)。
+ */
 struct ls_edge *ls_msg2edge(struct ls_ted *ted, struct ls_message *msg,
 			    bool delete)
 {
@@ -1912,6 +2287,11 @@ struct ls_edge *ls_msg2edge(struct ls_ted *ted, struct ls_message *msg,
 	return edge;
 }
 
+/*
+ * 把消息应用到 TED 的子网并返回该子网：SYNC / ADD 新增、UPDATE 更新、
+ * DELETE 按前缀查找后按 delete 决定删除或仅标记。其它事件返回 NULL。
+ * 注意：本函数接管传入 prefix 的所有权(新增 / 更新时)。
+ */
 struct ls_subnet *ls_msg2subnet(struct ls_ted *ted, struct ls_message *msg,
 				bool delete)
 {
@@ -1952,6 +2332,11 @@ struct ls_subnet *ls_msg2subnet(struct ls_ted *ted, struct ls_message *msg,
 	return subnet;
 }
 
+/*
+ * 消息到图元素的统一分派入口：按 msg->type 调用 ls_msg2vertex /
+ * ls_msg2edge / ls_msg2subnet，并把结果转成通用 ls_element 返回；未知
+ * 类型返回 NULL。这是消费者处理一条收到的消息时最常用的入口。
+ */
 struct ls_element *ls_msg2ted(struct ls_ted *ted, struct ls_message *msg,
 			       bool delete)
 {
@@ -1975,6 +2360,12 @@ struct ls_element *ls_msg2ted(struct ls_ted *ted, struct ls_message *msg,
 	return lse;
 }
 
+/*
+ * 直接从数据流解析并应用到 TED：内部依次调用 ls_parse_msg、ls_msg2ted，
+ * 最后释放消息。解析失败返回 NULL。
+ * 注意：返回的 ls_element 指向消息内的元素；新增 / 更新时元素已被 TED
+ * 接管(不会被 ls_delete_msg 释放)，被删除时返回 NULL。
+ */
 struct ls_element *ls_stream2ted(struct ls_ted *ted, struct stream *s,
 				  bool delete)
 {
@@ -1990,6 +2381,12 @@ struct ls_element *ls_stream2ted(struct ls_ted *ted, struct stream *s,
 	return lse;
 }
 
+/*
+ * 释放一条消息。仅当 event 为 DELETE 时，才连同消息内承载的元素一起
+ * 释放(node / attributes / prefix)——因为此时元素没有被 TED 接管。对
+ * 于 ADD / UPDATE / SYNC，元素已交由 TED 管理，这里只释放消息结构体
+ * 本身，避免重复释放或产生悬空指针。msg 为 NULL 时直接返回。
+ */
 void ls_delete_msg(struct ls_message *msg)
 {
 	if (msg == NULL)
@@ -2012,6 +2409,10 @@ void ls_delete_msg(struct ls_message *msg)
 	XFREE(MTYPE_LS_DB, msg);
 }
 
+/*
+ * 把整个 TED 按“顶点、边、子网”的顺序逐个封装成消息并发送给 dst，用于
+ * 响应一次同步请求。栈上复用同一条 msg，减少分配开销。始终返回 0。
+ */
 int ls_sync_ted(struct ls_ted *ted, struct zclient *zclient,
 		struct zapi_opaque_reg_info *dst)
 {
@@ -2039,6 +2440,10 @@ int ls_sync_ted(struct ls_ted *ted, struct zclient *zclient,
 /**
  *  Link State Show functions
  */
+/*
+ * 节点来源枚举(ls_origin)到可读文本的映射表，下标必须与枚举顺序一一
+ * 对应(UNKNOWN / ISIS_L1 / ISIS_L2 / OSPFv2 / DIRECT / STATIC)。
+ */
 static const char *const origin2txt[] = {
 	"Unknown",
 	"ISIS_L1",
@@ -2048,6 +2453,10 @@ static const char *const origin2txt[] = {
 	"Static"
 };
 
+/*
+ * 节点类型枚举(ls_node_type)到可读文本的映射表，下标与枚举顺序对应
+ * (NONE / STANDARD / ABR / ASBR / RMT_ASBR / PSEUDO)。
+ */
 static const char *const type2txt[] = {
 	"Unknown",
 	"Standard",
@@ -2057,6 +2466,10 @@ static const char *const type2txt[] = {
 	"Pseudo"
 };
 
+/*
+ * 元素状态枚举(ls_status)到可读文本的映射表，下标与枚举顺序对应
+ * (UNSET / NEW / UPDATE / DELETE / SYNC / ORPHAN)。
+ */
 static const char *const status2txt[] = {
 	"Unknown",
 	"New",
@@ -2066,6 +2479,10 @@ static const char *const status2txt[] = {
 	"Orphan"
 };
 
+/*
+ * 把节点标识渲染成字符串：IS-IS 用 %pSY 打印 System-ID，其余(OSPF 等)
+ * 用 %pI4 打印 IPv4 地址。返回传入的 str 缓冲区；size 为其容量。
+ */
 static const char *ls_node_id_to_text(struct ls_node_id lnid, char *str,
 				      size_t size)
 {
@@ -2077,6 +2494,13 @@ static const char *ls_node_id_to_text(struct ls_node_id lnid, char *str,
 	return str;
 }
 
+/*
+ * 以 vty 文本形式打印单个顶点。verbose 为假时只打印一行摘要(出边 /
+ * 入边 / 子网计数)；为真时进一步打印节点类型、AS 号、Segment Routing
+ * 能力(SRGB / SRLB / 算法 / MSD)，并逐条列出出边、入边与子网。
+ * 内部用 sbuf 拼接整段文本后一次性 vty_out 输出。vertex 为 NULL 时
+ * 直接返回。
+ */
 static void ls_show_vertex_vty(struct ls_vertex *vertex, struct vty *vty,
 			       bool verbose)
 {
@@ -2189,6 +2613,11 @@ end:
 	sbuf_free(&sbuf);
 }
 
+/*
+ * 以 JSON 形式打印单个顶点的信息。按 flags 逐项把节点标识、Router-ID、
+ * 类型、AS 号、Segment Routing(SRGB / SRLB / 算法 / MSD)等加入 json
+ * 对象。vertex 为 NULL 时直接返回。
+ */
 static void ls_show_vertex_json(struct ls_vertex *vertex,
 				struct json_object *json)
 {
@@ -2248,6 +2677,11 @@ static void ls_show_vertex_json(struct ls_vertex *vertex,
 	}
 }
 
+/*
+ * 顶点展示入口：有 json 时走 JSON，否则有 vty 时走文本，两者都为空则
+ * 什么也不做。头文件声明“同时指定时以 JSON 为准”，此实现正体现该
+ * 优先级。
+ */
 void ls_show_vertex(struct ls_vertex *vertex, struct vty *vty,
 		    struct json_object *json, bool verbose)
 {
@@ -2257,6 +2691,10 @@ void ls_show_vertex(struct ls_vertex *vertex, struct vty *vty,
 		ls_show_vertex_vty(vertex, vty, verbose);
 }
 
+/*
+ * 打印数据库中的全部顶点：JSON 模式下放入 "vertices" 数组(每项一个
+ * 对象)，文本模式下逐个 vty 输出。
+ */
 void ls_show_vertices(struct ls_ted *ted, struct vty *vty,
 		      struct json_object *json, bool verbose)
 {
@@ -2277,6 +2715,13 @@ void ls_show_vertices(struct ls_ted *ted, struct vty *vty,
 	}
 }
 
+/*
+ * 把边的 key 渲染成文本：按地址族分别用 %pI4 / %pI6 打印地址，AF_LOCAL
+ * 打印 link_id 数值，其它打印 "(Unknown)"。
+ * 注意：返回值指向一个 4 槽位的静态环形缓冲，多次调用时按次序轮换，
+ * 以避免同一 printf 中多个结果互相覆盖；若同时需要多于 4 个结果，需
+ * 自行拷贝。
+ */
 static const char *edge_key_to_text(struct ls_edge_key key)
 {
 #define FORMAT_BUF_COUNT 4
@@ -2305,6 +2750,12 @@ static const char *edge_key_to_text(struct ls_edge_key key)
 	return rv;
 }
 
+/*
+ * 以 vty 文本形式打印单条边。先打印边 key、本端地址、广告顶点、度量与
+ * 状态；verbose 为真时逐项打印 TE 度量、管理组与扩展管理组、IPv4 与
+ * IPv6 地址、标识、各类带宽、远端 AS、时延与抖动与丢包、邻接 SID、
+ * SRv6 邻接 SID 与 SRLG 等。用 sbuf 拼接后一次性输出。
+ */
 static void ls_show_edge_vty(struct ls_edge *edge, struct vty *vty,
 			     bool verbose)
 {
@@ -2481,8 +2932,17 @@ end:
 	sbuf_free(&sbuf);
 }
 
+/*
+ * 扩展管理组的十六进制文本 "0x%08x" 所需缓冲长度(10 个字符加结尾 0，共 11)。
+ */
 #define AG_LEN 11
 
+/*
+ * 以 JSON 形式打印单条边：把边标识、状态、来源、两端顶点 key、度量与
+ * 名称，以及逐项的 TE 属性(管理组与扩展管理组、地址、带宽、时延、
+ * SRLG、邻接 SID 与 SRv6 邻接 SID)加入 json 对象。扩展管理组会同时
+ * 输出 words(十六进制)与 bitPositions(置位下标)两种视角。
+ */
 static void ls_show_edge_json(struct ls_edge *edge, struct json_object *json)
 {
 	struct ls_attributes *attr;
@@ -2714,6 +3174,10 @@ static void ls_show_edge_json(struct ls_edge *edge, struct json_object *json)
 	}
 }
 
+/*
+ * 边展示入口：有 json 走 JSON，否则有 vty 走文本。edge 为 NULL 时直接
+ * 返回。
+ */
 void ls_show_edge(struct ls_edge *edge, struct vty *vty,
 		  struct json_object *json, bool verbose)
 {
@@ -2727,6 +3191,9 @@ void ls_show_edge(struct ls_edge *edge, struct vty *vty,
 		ls_show_edge_vty(edge, vty, verbose);
 }
 
+/*
+ * 打印数据库中所有边：JSON 模式放入 "edges" 数组，文本模式逐个输出。
+ */
 void ls_show_edges(struct ls_ted *ted, struct vty *vty,
 		   struct json_object *json, bool verbose)
 {
@@ -2747,6 +3214,11 @@ void ls_show_edges(struct ls_ted *ted, struct vty *vty,
 	}
 }
 
+/*
+ * 以 vty 文本形式打印单个子网：先打印前缀、广告顶点、度量与状态；
+ * verbose 为真时再打印来源、IGP 标志、路由标签、扩展标签、SR SID，以及
+ * SRv6 SID(用 seg6local_action2str 转换端点行为名称)。
+ */
 static void ls_show_subnet_vty(struct ls_subnet *subnet, struct vty *vty,
 			       bool verbose)
 {
@@ -2793,6 +3265,11 @@ end:
 	sbuf_free(&sbuf);
 }
 
+/*
+ * 以 JSON 形式打印单个子网：把子网标识、状态、来源、广告顶点、所属
+ * 顶点 key 与度量，以及 IGP 标志、路由标签、扩展标签、SR SID 与 SRv6
+ * SID 加入 json 对象。
+ */
 static void ls_show_subnet_json(struct ls_subnet *subnet,
 				struct json_object *json)
 {
@@ -2839,6 +3316,10 @@ static void ls_show_subnet_json(struct ls_subnet *subnet,
 	}
 }
 
+/*
+ * 子网展示入口：有 json 走 JSON，否则有 vty 走文本。subnet 为 NULL 时
+ * 直接返回。
+ */
 void ls_show_subnet(struct ls_subnet *subnet, struct vty *vty,
 		    struct json_object *json, bool verbose)
 {
@@ -2852,6 +3333,10 @@ void ls_show_subnet(struct ls_subnet *subnet, struct vty *vty,
 		ls_show_subnet_vty(subnet, vty, verbose);
 }
 
+/*
+ * 打印数据库中所有子网：JSON 模式放入 "subnets" 数组，文本模式逐个
+ * 输出。
+ */
 void ls_show_subnets(struct ls_ted *ted, struct vty *vty,
 		     struct json_object *json, bool verbose)
 {
@@ -2872,6 +3357,11 @@ void ls_show_subnets(struct ls_ted *ted, struct vty *vty,
 	}
 }
 
+/*
+ * 打印整个 TED：JSON 模式下建立 "ted" 对象，写入名称、key 与三类计数，
+ * 再分别嵌入顶点 / 边 / 子网；文本模式下打印库名与总数，并逐个输出三
+ * 类元素。ted 需非空。
+ */
 void ls_show_ted(struct ls_ted *ted, struct vty *vty, struct json_object *json,
 		 bool verbose)
 {
@@ -2908,6 +3398,11 @@ void ls_show_ted(struct ls_ted *ted, struct vty *vty, struct json_object *json,
 	}
 }
 
+/*
+ * 以调试日志(zlog_debug)导出整个 TED 的内部结构：逐个顶点打印其入边与
+ * 出边，再逐个边打印源与目的顶点，最后逐个子网打印所属顶点。仅用于排
+ * 障，输出到日志而非 vty。ted 需非空。
+ */
 void ls_dump_ted(struct ls_ted *ted)
 {
 	struct ls_vertex *vertex;

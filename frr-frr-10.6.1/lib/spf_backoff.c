@@ -11,6 +11,40 @@
  * This file is part of FRRouting (FRR)
  */
 
+/*
+ * ============================================================================
+ * 文件导读：lib/spf_backoff.c —— SPF 退避定时器实现
+ * ============================================================================
+ * 本文件实现 IETF SPF 延迟算法（draft-ietf-rtgwg-backoff-algo）的状态机与
+ * 定时器，向上层提供“收到拓扑事件后应延迟多久再跑 SPF”的决策。
+ *
+ * 三个延迟参数与两个计时器构成核心：
+ *   init_delay  本安静期内第一次事件的固定延迟；
+ *   short_delay 短时间内又发生事件时的短等待；
+ *   long_delay  事件持续超过 timetolearn 后的长等待（抑制抖动）；
+ *   holddown    用于把状态机拉回 QUIET 的静默计时；timetolearn 计时到期则
+ *               进入 LONG_WAIT。
+ *
+ * 关键数据结构：
+ *   struct spf_backoff：保存参数、状态（QUIET / SHORT_WAIT / LONG_WAIT）、
+ *   两个 event（holddown 与 timetolearn）以及调试用名字与事件时间。
+ *
+ * 与其他模块的关系：
+ *   - 依赖 frrevent 的事件定时器（event_add_timer_msec、event_cancel 等）；
+ *   - 通过 DEFUN 注册 debug 命令，并在 write_config 中回显；
+ *   - 被 isisd / ospfd 等 IGP 在 SPF 调度处使用。
+ *
+ * 易踩的坑：
+ *   - schedule 在 SHORT_WAIT / LONG_WAIT 时会重置 holddown 定时器；
+ *   - holddown 到期会取消 timetolearn 计时并清空 first_event_time。
+ *
+ * 建议阅读顺序：
+ *   1) debug 开关与 backoff_debug 宏；
+ *   2) 状态枚举与 spf_backoff 结构；
+ *   3) state2str、new / free；
+ *   4) 两个定时器回调与 schedule 状态机；
+ *   5) show、DEFUN 命令、write_config、cmd_init 与访问器。
+ */
 #include <zebra.h>
 
 #include "spf_backoff.h"
@@ -20,22 +54,44 @@
 #include "frrevent.h"
 #include "vty.h"
 
+/*
+ * 注册本文件使用的内存类型：SPF_BACKOFF（实例本体）与 SPF_BACKOFF_NAME
+ * （实例名副本）。
+ */
 DEFINE_MTYPE_STATIC(LIB, SPF_BACKOFF, "SPF backoff");
 DEFINE_MTYPE_STATIC(LIB, SPF_BACKOFF_NAME, "SPF backoff name");
 
+/*
+ * 全局 SPF 退避调试开关，由 debug spf-delay-ietf 命令控制。
+ * 下表宏 backoff_debug 在开关打开时输出 zlog_debug。
+ */
 static bool debug_spf_backoff = false;
+/*
+ * backoff_debug：条件式调试日志宏，仅当 debug_spf_backoff 为真时打印。
+ * 用法同 zlog_debug，接受格式化参数。
+ */
 #define backoff_debug(...)                                                     \
 	do {                                                                   \
 		if (debug_spf_backoff)                                         \
 			zlog_debug(__VA_ARGS__);                               \
 	} while (0)
 
+/*
+ * enum spf_backoff_state：退避状态机的三种状态。
+ * QUIET 空闲、SHORT_WAIT 短等待、LONG_WAIT 长等待。
+ */
 enum spf_backoff_state {
 	SPF_BACKOFF_QUIET,
 	SPF_BACKOFF_SHORT_WAIT,
 	SPF_BACKOFF_LONG_WAIT
 };
 
+/*
+ * struct spf_backoff：SPF 退避实例。
+ * m 为事件循环；init/short/long/holddown/timetolearn 为算法参数（毫秒）；
+ * state 为当前状态；t_holddown / t_timetolearn 为两个定时器句柄；
+ * name 为实例名；first_event_time / last_event_time 供调试展示事件时间。
+ */
 struct spf_backoff {
 	struct event_loop *m;
 
@@ -57,6 +113,10 @@ struct spf_backoff {
 	struct timeval last_event_time;
 };
 
+/*
+ * spf_backoff_state2str：状态枚举转字符串（QUIET / SHORT_WAIT / LONG_WAIT）。
+ * 未知状态返回 "???"。
+ */
 static const char *spf_backoff_state2str(enum spf_backoff_state state)
 {
 	switch (state) {
@@ -70,6 +130,11 @@ static const char *spf_backoff_state2str(enum spf_backoff_state state)
 	return "???";
 }
 
+/*
+ * spf_backoff_new：分配并初始化 SPF 退避实例。
+ * 参数：m 事件循环；name 实例名（XSTRDUP 复制）；其余为各延迟 / 时长参数。
+ * 返回新实例，初始状态 QUIET。
+ */
 struct spf_backoff *spf_backoff_new(struct event_loop *m, const char *name,
 				    long init_delay, long short_delay,
 				    long long_delay, long holddown,
@@ -92,6 +157,11 @@ struct spf_backoff *spf_backoff_new(struct event_loop *m, const char *name,
 	return rv;
 }
 
+/*
+ * spf_backoff_free：释放 SPF 退避实例。
+ * 参数：backoff 可为 NULL（直接返回）。
+ * 副作用：取消两个定时器，释放名字副本，再释放实例本体。
+ */
 void spf_backoff_free(struct spf_backoff *backoff)
 {
 	if (!backoff)
@@ -104,6 +174,11 @@ void spf_backoff_free(struct spf_backoff *backoff)
 	XFREE(MTYPE_SPF_BACKOFF, backoff);
 }
 
+/*
+ * spf_backoff_timetolearn_elapsed：TimeToLearn 计时到期回调。
+ * 参数：event 携带 spf_backoff 实例。
+ * 副作用：状态切到 LONG_WAIT（表示事件已持续足够久，改用长延迟抑制抖动）。
+ */
 static void spf_backoff_timetolearn_elapsed(struct event *event)
 {
 	struct spf_backoff *backoff = EVENT_ARG(event);
@@ -113,6 +188,12 @@ static void spf_backoff_timetolearn_elapsed(struct event *event)
 		      backoff->name, spf_backoff_state2str(backoff->state));
 }
 
+/*
+ * spf_backoff_holddown_elapsed：Holddown 计时到期回调。
+ * 参数：event 携带 spf_backoff 实例。
+ * 副作用：取消 TimeToLearn 计时、清空首次事件时间、状态回到 QUIET
+ * （表示已安静足够久，下一次事件重新按 init_delay 起算）。
+ */
 static void spf_backoff_holddown_elapsed(struct event *event)
 {
 	struct spf_backoff *backoff = EVENT_ARG(event);
@@ -124,6 +205,14 @@ static void spf_backoff_holddown_elapsed(struct event *event)
 		      backoff->name, spf_backoff_state2str(backoff->state));
 }
 
+/*
+ * spf_backoff_schedule：状态机核心入口，收到 IGP 事件时调用。
+ * 参数：backoff 实例。
+ * 返回建议的 SPF 延迟（毫秒）：QUIET->init_delay，SHORT_WAIT->short_delay，
+ * LONG_WAIT->long_delay。
+ * 副作用：QUIET 时启动 timetolearn 与 holddown 两个定时器并记录首次事件时间；
+ * SHORT/LONG_WAIT 时重置 holddown 定时器；每次更新 last_event_time。
+ */
 long spf_backoff_schedule(struct spf_backoff *backoff)
 {
 	long rv = 0;
@@ -167,6 +256,12 @@ long spf_backoff_schedule(struct spf_backoff *backoff)
 	return rv;
 }
 
+/*
+ * timeval_format：把 timeval 格式化为可读本地时间字符串。
+ * 参数：tv 待格式化的时间。
+ * 返回静态缓冲区中的字符串；若 tv 为零则返回 "(never)"，格式化失败返回 "???"。
+ * 注意：使用静态缓冲区且非线程安全，仅供即时打印。
+ */
 static const char *timeval_format(struct timeval *tv)
 {
 	struct tm tm_store;
@@ -190,6 +285,11 @@ static const char *timeval_format(struct timeval *tv)
 	return timebuf;
 }
 
+/*
+ * spf_backoff_show：把实例状态、各延时参数、两个定时器剩余时间与首次 / 最近
+ * 事件时间输出到 VTY。
+ * 参数：backoff 实例；vty 输出目标；prefix 每行前缀（供调用者缩进）。
+ */
 void spf_backoff_show(struct spf_backoff *backoff, struct vty *vty,
 		      const char *prefix)
 {
@@ -233,6 +333,10 @@ void spf_backoff_show(struct spf_backoff *backoff, struct vty *vty,
 		timeval_format(&backoff->last_event_time));
 }
 
+/*
+ * DEFUN spf_backoff_debug：命令 "debug spf-delay-ietf"。
+ * 打开全局 SPF 退避调试开关，始终返回 CMD_SUCCESS。
+ */
 DEFUN(spf_backoff_debug,
       spf_backoff_debug_cmd,
       "debug spf-delay-ietf",
@@ -243,6 +347,10 @@ DEFUN(spf_backoff_debug,
 	return CMD_SUCCESS;
 }
 
+/*
+ * DEFUN no_spf_backoff_debug：命令 "no debug spf-delay-ietf"。
+ * 关闭全局 SPF 退避调试开关，始终返回 CMD_SUCCESS。
+ */
 DEFUN(no_spf_backoff_debug,
       no_spf_backoff_debug_cmd,
       "no debug spf-delay-ietf",
@@ -254,6 +362,11 @@ DEFUN(no_spf_backoff_debug,
 	return CMD_SUCCESS;
 }
 
+/*
+ * spf_backoff_write_config：把全局 SPF 退避调试配置写出到 VTY。
+ * 参数：vty 输出目标。
+ * 返回写出的行数（开启 debug 时为 1）。
+ */
 int spf_backoff_write_config(struct vty *vty)
 {
 	int written = 0;
@@ -266,6 +379,10 @@ int spf_backoff_write_config(struct vty *vty)
 	return written;
 }
 
+/*
+ * spf_backoff_cmd_init：在 ENABLE 与 CONFIG 节点注册 debug / no debug
+ * 两条命令。由守护进程启动时调用。
+ */
 void spf_backoff_cmd_init(void)
 {
 	install_element(ENABLE_NODE, &spf_backoff_debug_cmd);
@@ -274,26 +391,41 @@ void spf_backoff_cmd_init(void)
 	install_element(CONFIG_NODE, &no_spf_backoff_debug_cmd);
 }
 
+/*
+ * spf_backoff_init_delay：返回首次事件延迟 init_delay（毫秒）。
+ */
 long spf_backoff_init_delay(struct spf_backoff *backoff)
 {
 	return backoff->init_delay;
 }
 
+/*
+ * spf_backoff_short_delay：返回短等待延迟 short_delay（毫秒）。
+ */
 long spf_backoff_short_delay(struct spf_backoff *backoff)
 {
 	return backoff->short_delay;
 }
 
+/*
+ * spf_backoff_long_delay：返回长等待延迟 long_delay（毫秒）。
+ */
 long spf_backoff_long_delay(struct spf_backoff *backoff)
 {
 	return backoff->long_delay;
 }
 
+/*
+ * spf_backoff_holddown：返回 Holddown 时长（毫秒）。
+ */
 long spf_backoff_holddown(struct spf_backoff *backoff)
 {
 	return backoff->holddown;
 }
 
+/*
+ * spf_backoff_timetolearn：返回 TimeToLearn 时长（毫秒）。
+ */
 long spf_backoff_timetolearn(struct spf_backoff *backoff)
 {
 	return backoff->timetolearn;

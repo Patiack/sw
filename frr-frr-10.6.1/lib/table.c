@@ -4,6 +4,37 @@
  * Copyright (C) 1998 Kunihiro Ishiguro
  */
 
+/*
+ * ============================================================================
+ * 文件导读：table.c —— 路由表（radix / 前缀树）实现
+ * ============================================================================
+ * 本文件实现 table.h 声明的路由表：一棵按前缀比特位组织的前缀树（radix tree），
+ * 并额外维护一张哈希表 rn_hash_node 以加速“精确前缀”查找。
+ *
+ * 树的形态：
+ *   - 每个节点持有一个前缀 p，左右子树 link[0] / link[1] 由 p 之后的下一比特决定
+ *   - 查找 / 插入时沿比特逐层下降；分叉处可能插入“公共前缀”节点（route_common）
+ *   - 节点带引用计数 lock，降为 0 时自动删除并回收；父节点若成为空壳也会被删除
+ *
+ * 两个加速点：
+ *   - 精确匹配走哈希 rn_hash_node（prefix_cmp 比较，prefix_hash_key 取键）
+ *   - 最长前缀匹配 route_node_match 仍沿树下降
+ *
+ * 关键内部函数：
+ *   route_common     求两前缀的最长公共前缀
+ *   set_link         按比特把子节点挂到父节点
+ *   route_node_get   取或建节点（含公共前缀节点的插入）
+ *   route_table_free 迭代式整树释放（避免递归爆栈）
+ *
+ * 与其他模块的关系：
+ *   - 依赖 prefix.h 做前缀比较 / 掩码 / 取比特；依赖 typesafe.h 的 DECLARE_HASH
+ *   - delegate（table.h）负责节点内存管理；cleanup 回调在节点释放前调用
+ *
+ * 阅读顺序：
+ *   route_common / set_link -> route_node_get -> route_node_match / lookup
+ *   -> route_node_delete -> route_top / route_next -> 迭代器三函数
+ * ============================================================================
+ */
 #define FRR_COMPILING_TABLE_C
 
 #include <zebra.h>
@@ -19,14 +50,27 @@ DEFINE_MTYPE(LIB, ROUTE_NODE, "Route node");
 
 static void route_table_free(struct route_table *);
 
+/*
+ * 哈希相等比较函数：直接比较前缀（prefix_cmp），返回 0 表示相等。
+ * 供并行哈希 rn_hash_node 在哈希冲突时判定两项是否相同。
+ */
 static int route_table_hash_cmp(const struct route_node *a,
 				const struct route_node *b)
 {
 	return prefix_cmp(&a->p, &b->p);
 }
 
+/*
+ * 展开 typesafe 哈希 rn_hash_node 的头 / 项类型与操作函数
+ * （初始化 / 查找 / 增 / 删 / 结束），节点上的挂链项是字段 nodehash。
+ */
 DECLARE_HASH(rn_hash_node, struct route_node, nodehash, route_table_hash_cmp,
 	     prefix_hash_key);
+/*
+ * route_table_init_with_delegate：分配并初始化一张路由表。
+ * 参数：delegate 节点创建 / 销毁委托（不能为空）。
+ * 返回：新表指针；同时初始化内部并行哈希以及 count / top 等字段。
+ */
 /*
  * route_table_init_with_delegate
  */
@@ -41,17 +85,27 @@ route_table_init_with_delegate(route_table_delegate_t *delegate)
 	return rt;
 }
 
+/*
+ * route_table_finish：对外接口，销毁整张表（内部转调 route_table_free）。
+ */
 void route_table_finish(struct route_table *rt)
 {
 	route_table_free(rt);
 }
 
+/*
+ * route_node_new：通过委托分配一个（尚未设置前缀的）新节点。
+ */
 /* Allocate new route node. */
 static struct route_node *route_node_new(struct route_table *table)
 {
 	return table->delegate->create_node(table->delegate, table);
 }
 
+/*
+ * route_node_set：分配新节点并设置前缀、所属表，同时加入并行哈希。
+ * 返回：新节点（引用计数为 0，需调用者加锁）。
+ */
 /* Allocate new route node with prefix set. */
 static struct route_node *route_node_set(struct route_table *table,
 					 const struct prefix *prefix)
@@ -68,6 +122,10 @@ static struct route_node *route_node_set(struct route_table *table,
 	return node;
 }
 
+/*
+ * route_node_free：释放节点：先调用表级 cleanup 回调，再交给委托 destroy_node。
+ * 注意：cleanup 可能间接释放整张表（见 route_node_delete 中的脆弱代码警告）。
+ */
 /* Free route node. */
 static void route_node_free(struct route_table *table, struct route_node *node)
 {
@@ -76,6 +134,11 @@ static void route_node_free(struct route_table *table, struct route_node *node)
 	table->delegate->destroy_node(table->delegate, table, node);
 }
 
+/*
+ * route_table_free：释放整张路由表及其全部节点。
+ * 采用迭代（非递归）后序遍历：反复下降到叶子再回收，避免深树递归爆栈。
+ * 每个节点先从哈希摘下再 route_node_free；最后断言 count 已归零。
+ */
 /* Free route table. */
 static void route_table_free(struct route_table *rt)
 {
@@ -127,10 +190,19 @@ static void route_table_free(struct route_table *rt)
 	return;
 }
 
+/*
+ * 掩码查表：maskbit[n] 给出“前 n 个比特为 1”的字节掩码，用于把非前缀位清零。
+ */
 /* Utility mask array. */
 static const uint8_t maskbit[] = {0x00, 0x80, 0xc0, 0xe0, 0xf0,
 				  0xf8, 0xfc, 0xfe, 0xff};
 
+/*
+ * route_common：计算两个前缀 n 与 p 的最长公共前缀，写入 new。
+ * 参数：n 为树中已有节点前缀，p 为目标前缀，new 为输出。
+ * 特例：FLOWSPEC 家族直接返回 p（不做逐位比较）。
+ * 副作用：仅写 new，不改动 n / p。
+ */
 /* Common prefix route genaration. */
 static void route_common(const struct prefix *n, const struct prefix *p,
 			 struct prefix *new)
@@ -169,6 +241,10 @@ static void route_common(const struct prefix *n, const struct prefix *p,
 	}
 }
 
+/*
+ * set_link：把子节点 new 挂到父节点 node 下。
+ * 方向由 new 前缀在 node->prefixlen 位置上的比特决定（link[bit]），并回填 parent。
+ */
 static void set_link(struct route_node *node, struct route_node *new)
 {
 	unsigned int bit = prefix_bit(&new->p.u.prefix, node->p.prefixlen);
@@ -177,6 +253,12 @@ static void set_link(struct route_node *node, struct route_node *new)
 	new->parent = node;
 }
 
+/*
+ * route_node_match：最长前缀匹配（LPM）。
+ * 沿树下降，记录沿途“有 info 的最深节点”作为匹配结果。
+ * 返回：匹配节点（已加锁）；无匹配返回 NULL。
+ * 坑：只有 info 非 NULL 的节点才算“有效路由”。
+ */
 /* Find matched prefix. */
 struct route_node *route_node_match(struct route_table *table,
 				    union prefixconstptr pu)
@@ -208,6 +290,11 @@ struct route_node *route_node_match(struct route_table *table,
 	return NULL;
 }
 
+/*
+ * route_node_lookup：精确查找前缀对应的节点。
+ * 先把查询前缀 apply_mask 归一化，再查并行哈希。
+ * 返回：命中且 info 非 NULL 的节点（已加锁）；否则 NULL。
+ */
 /* Lookup same prefix node.  Return NULL when we can't find route. */
 struct route_node *route_node_lookup(struct route_table *table,
 				     union prefixconstptr pu)
@@ -220,6 +307,11 @@ struct route_node *route_node_lookup(struct route_table *table,
 	return (node && node->info) ? route_lock_node(node) : NULL;
 }
 
+/*
+ * route_node_lookup_maynull：同 route_node_lookup，但不要求 info 非 NULL
+ * （即允许返回“占位 / 待填充”的节点）。
+ * 返回：命中节点（已加锁）；否则 NULL。
+ */
 /* Lookup same prefix node.  Return NULL when we can't find route. */
 struct route_node *route_node_lookup_maynull(struct route_table *table,
 					     union prefixconstptr pu)
@@ -232,6 +324,13 @@ struct route_node *route_node_lookup_maynull(struct route_table *table,
 	return node ? route_lock_node(node) : NULL;
 }
 
+/*
+ * route_node_get：取或建节点（插入路由的核心）。
+ * 流程：先查哈希（命中且 info 非空则加锁返回）；否则沿树下降直到分叉点，
+ *       必要时插入“公共前缀”节点并重新挂链，最终为新前缀建节点。
+ * 返回：目标前缀节点（已加锁）。
+ * 副作用：可能新增 1~2 个节点并更新 table->count；FLOWSPEC 时会释放 p。
+ */
 /* Add node to routing table. */
 struct route_node *route_node_get(struct route_table *table,
 				  union prefixconstptr pu)
@@ -310,6 +409,13 @@ struct route_node *route_node_get(struct route_table *table,
 	return new;
 }
 
+/*
+ * route_node_delete：从树和哈希中删除节点。
+ * 前提：node->lock 必须为 0；若同时有左右孩子则直接返回（不可删）。
+ * 把唯一孩子上提替代自己，更新 count，摘哈希，释放自己；
+ * 若父节点变成无引用空壳，则递归删除父节点。
+ * 脆弱点：route_node_free 可能顺带释放整张表，见函数内英文 WARNING。
+ */
 /* Delete node from the routing table. */
 void route_node_delete(struct route_node *node)
 {
@@ -360,6 +466,9 @@ void route_node_delete(struct route_node *node)
 		route_node_delete(parent);
 }
 
+/*
+ * route_top：返回树中最左节点（前缀序遍历起点）并加锁；空表返回 NULL。
+ */
 /* Get first node and lock it.  This function is useful when one wants
    to lookup all the node exist in the routing table. */
 struct route_node *route_top(struct route_table *table)
@@ -373,6 +482,12 @@ struct route_node *route_top(struct route_table *table)
 	return table->top;
 }
 
+/*
+ * route_next：前序遍历取下一个节点：先解锁当前 node，再给下一个加锁返回。
+ * 顺序：左孩子 -> 右孩子 -> 回溯找“尚未访问的右兄弟”。
+ * 返回：下一个节点；遍历结束返回 NULL。
+ * 坑：会释放对当前节点的引用，故须先保存 next 指针。
+ */
 /* Unlock current node and lock next node then return it. */
 struct route_node *route_next(struct route_node *node)
 {
@@ -409,6 +524,9 @@ struct route_node *route_next(struct route_node *node)
 	return NULL;
 }
 
+/*
+ * route_next_until：同 route_next，但回溯到 limit 节点即停止（用于限定子树范围）。
+ */
 /* Unlock current node and lock next node until limit. */
 struct route_node *route_next_until(struct route_node *node,
 				    const struct route_node *limit)
@@ -446,11 +564,18 @@ struct route_node *route_next_until(struct route_node *node,
 	return NULL;
 }
 
+/*
+ * route_table_count：返回表中节点总数。
+ */
 unsigned long route_table_count(struct route_table *table)
 {
 	return table->count;
 }
 
+/*
+ * route_node_create：默认委托的节点创建函数：清零分配一个 route_node。
+ * 返回：新节点指针。
+ */
 /**
  * route_node_create
  *
@@ -464,6 +589,9 @@ struct route_node *route_node_create(route_table_delegate_t *delegate,
 	return node;
 }
 
+/*
+ * route_node_destroy：默认委托的节点销毁函数：释放节点内存。
+ */
 /**
  * route_node_destroy
  *
@@ -476,17 +604,27 @@ void route_node_destroy(route_table_delegate_t *delegate,
 }
 
 /*
+ * 默认委托：使用 route_node_create / route_node_destroy 做节点的默认内存管理。
+ */
+/*
  * Default delegate.
  */
 static route_table_delegate_t default_delegate = {
 	.create_node = route_node_create,
 	.destroy_node = route_node_destroy};
 
+/*
+ * route_table_get_default_delegate：返回默认委托的指针。
+ */
 route_table_delegate_t *route_table_get_default_delegate(void)
 {
 	return &default_delegate;
 }
 
+/*
+ * route_table_init：用默认委托创建路由表。
+ * 返回：新表指针。
+ */
 /*
  * route_table_init
  */
@@ -495,6 +633,11 @@ struct route_table *route_table_init(void)
 	return route_table_init_with_delegate(&default_delegate);
 }
 
+/*
+ * route_table_prefix_iter_cmp：按“迭代顺序”比较两个前缀，体现前缀树的排序语义。
+ * 返回：p1 在 p2 之前为 -1，相等为 0，之后为 +1（与 strcmp 同向）。
+ * 语义：若一个前缀包含另一个，则短者在前；否则比较公共前缀后的第一个比特。
+ */
 /**
  * route_table_prefix_iter_cmp
  *
@@ -555,6 +698,10 @@ int route_table_prefix_iter_cmp(const struct prefix *p1,
 }
 
 /*
+ * route_get_subtree_next：返回“node 子树之后”的第一个节点（迭代顺序）。
+ * 做法：沿父链上溯，找到第一个拥有右兄弟的祖先，返回其右兄弟；无则 NULL。
+ */
+/*
  * route_get_subtree_next
  *
  * Helper function that returns the first node that follows the nodes
@@ -572,6 +719,11 @@ static struct route_node *route_get_subtree_next(struct route_node *node)
 	return NULL;
 }
 
+/*
+ * route_table_get_next_internal：找出迭代顺序中“严格大于前缀 p”的第一个节点。
+ * 沿树下降，区分四种情形：命中等长、p 在子树内、子树在 p 之前、互不包含。
+ * 返回：目标节点（不加锁，由调用者处理）；无则 NULL。
+ */
 /**
  * route_table_get_next_internal
  *
@@ -676,6 +828,10 @@ route_table_get_next_internal(struct route_table *table,
 	return NULL;
 }
 
+/*
+ * route_table_get_next：对外接口：返回严格大于 pu 的下一个节点并给其加锁。
+ * 内部转调 route_table_get_next_internal 并断言顺序正确。
+ */
 /**
  * route_table_get_next
  *
@@ -697,6 +853,9 @@ struct route_node *route_table_get_next(struct route_table *table,
 }
 
 /*
+ * route_table_iter_init：初始化迭代器：清零、状态置 INIT、绑定目标表。
+ */
+/*
  * route_table_iter_init
  */
 void route_table_iter_init(route_table_iter_t *iter, struct route_table *table)
@@ -706,6 +865,10 @@ void route_table_iter_init(route_table_iter_t *iter, struct route_table *table)
 	iter->table = table;
 }
 
+/*
+ * route_table_iter_pause：暂停迭代：记录当前前缀到 pause_prefix，解锁当前节点。
+ * 之后再次调用 iter_next 会从该前缀之后恢复；仅在 ITERATING 状态有效。
+ */
 /*
  * route_table_iter_pause
  *
@@ -742,6 +905,9 @@ void route_table_iter_pause(route_table_iter_t *iter)
 	}
 }
 
+/*
+ * route_table_iter_cleanup：释放迭代器持有的资源（解锁当前节点并把状态置 DONE）。
+ */
 /*
  * route_table_iter_cleanup
  *

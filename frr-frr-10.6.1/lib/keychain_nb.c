@@ -4,11 +4,52 @@
  *
  * Copyright (C) 2024 LabN Consulting, L.L.C.
  */
+/*
+ * 文件导读：keychain_nb.c —— frr-keychain 的 YANG 北向（northbound）回调
+ *
+ * 1. 本文件在 FRR 里干什么：
+ *    实现 ietf-key-chain 模块的配置回调与状态查询回调，把 YANG 数据树
+ *    （配置与状态）与 keychain.c 里的 struct keychain / struct key 关联
+ *    起来。命令行（keychain_cli.c）与 NETCONF / RESTCONF 等北向客户端的
+ *    修改最终都经这些回调落到内存对象上。
+ *
+ * 2. 回调类型：
+ *    - create / destroy：配置节点（容器、叶子）的新增与删除；
+ *    - modify：已有叶子的取值修改；
+ *    - get_next / get_keys / lookup_entry：列表（key chain、key）的遍历
+ *      与按 key 定位，供框架枚举与按索引查找；
+ *    - get_elem：状态叶子（last-modified-timestamp、lifetime-active 等）
+ *      的取值回调，从内存对象实时计算。
+ *
+ * 3. 关键辅助函数：
+ *    - keychain_touch：打时间戳（更新 last_touch，用于 last-modified 状态）；
+ *    - __dnode_get_key2 / __dnode_get_key3：由数据节点定位到对应 key
+ *      （key3 用于多一层路径的 always 节点）；
+ *    - __lifetime_create / __lifetime_start_date_time_modify /
+ *      __lifetime_no_end_time_create / __lifetime_duration_modify /
+ *      __lifetime_end_date_time_modify：时间窗口的公共处理，通过
+ *      send / accept 两个布尔参数区分作用于发送还是接收方向。
+ *
+ * 4. 阅读顺序建议：
+ *    先看 keychain_touch 与 key chain 级回调，再看 key 级回调，然后看
+ *    lifetime 公共函数及其大量薄封装，接着是 crypto-algorithm 与
+ *    key-string 回调，最后是状态叶子回调与模块信息 ietf_key_chain_info。
+ *
+ * 5. 易踩的坑：
+ *    - 几乎所有回调都要先判断 args->event 是否为 NB_EV_APPLY，只有
+ *      VALIDATE / APPLY 阶段才真正落地；
+ *    - 相对路径 ../ 的层数取决于节点深度，always 节点比普通 lifetime
+ *      节点多一层，故有 __dnode_get_key2 与 __dnode_get_key3 之分。
+ */
 #include <zebra.h>
 #include "lib_errors.h"
 #include "northbound.h"
 #include "keychain.h"
 
+/*
+ * 更新密钥链的 last_touch 为当前时间。
+ * 任何配置修改后都会调用，供 last-modified-timestamp 状态叶子读取。
+ */
 static void keychain_touch(struct keychain *keychain)
 {
 	keychain->last_touch = time(NULL);
@@ -16,6 +57,11 @@ static void keychain_touch(struct keychain *keychain)
 
 /*
  * XPath: /ietf-key-chain:key-chains/key-chain
+ */
+/*
+ * 回调：创建 key-chain 列表项（按名称）。
+ * 仅在 NB_EV_APPLY 阶段动作：按 name 获取（不存在则新建）密钥链并打时间戳。
+ * 返回值：NB_OK。
  */
 static int key_chains_key_chain_create(struct nb_cb_create_args *args)
 {
@@ -31,6 +77,11 @@ static int key_chains_key_chain_create(struct nb_cb_create_args *args)
 	return NB_OK;
 }
 
+/*
+ * 回调：删除 key-chain 列表项。
+ * 按 name 查出密钥链并调用 keychain_delete 释放。
+ * 返回值：NB_OK。
+ */
 static int key_chains_key_chain_destroy(struct nb_cb_destroy_args *args)
 {
 	const char *name;
@@ -43,6 +94,11 @@ static int key_chains_key_chain_destroy(struct nb_cb_destroy_args *args)
 	return NB_OK;
 }
 
+/*
+ * 回调：遍历 key-chain 列表的下一项。
+ * 首次调用（prev 为空）返回链表头，否则返回当前节点的 next。
+ * 返回值：下一个 listnode，末尾返回 NULL。
+ */
 static const void *key_chains_key_chain_get_next(struct nb_cb_get_next_args *args)
 {
 	const struct listnode *prev = args->list_entry;
@@ -50,6 +106,10 @@ static const void *key_chains_key_chain_get_next(struct nb_cb_get_next_args *arg
 	return prev ? prev->next : keychain_list->head;
 }
 
+/*
+ * 回调：取出 key-chain 列表项的 key（仅 name 一个）。
+ * 返回值：NB_OK；keys->num 置 1，key[0] 填密钥链名称。
+ */
 static int key_chains_key_chain_get_keys(struct nb_cb_get_keys_args *args)
 {
 	const struct listnode *node = args->list_entry;
@@ -60,6 +120,10 @@ static int key_chains_key_chain_get_keys(struct nb_cb_get_keys_args *args)
 	return NB_OK;
 }
 
+/*
+ * 回调：按 key（name）在全局链表定位 key-chain 对应的 listnode。
+ * 返回值：命中的 listnode；未找到返回 NULL。
+ */
 static const void *key_chains_key_chain_lookup_entry(struct nb_cb_lookup_entry_args *args)
 {
 	const char *name = args->keys->key[0];
@@ -74,12 +138,23 @@ static const void *key_chains_key_chain_lookup_entry(struct nb_cb_lookup_entry_a
 }
 
 
+/*
+ * 空操作的销毁回调。
+ * 某些 lifetime 子节点的清理要么由兄弟节点触发、要么随父容器一起销毁，
+ * 因此这里无需额外动作，直接返回 NB_OK。
+ */
 static int __destroy_nop(struct nb_cb_destroy_args *args)
 {
 	/* modified by sibling or cleaned up by container destroy */
 	return NB_OK;
 }
 
+/*
+ * 由数据节点定位到对应的 key（相对路径深两层调用者用此版本）。
+ * 参数：dnode 当前节点；touch 为 true 时同时更新所属密钥链的时间戳。
+ * 路径：../../../name 取链名，../../key-id 取编号。
+ * 返回值：命中的 struct key（未找到返回 NULL）。
+ */
 static struct key *__dnode_get_key2(const struct lyd_node *dnode, bool touch)
 {
 	struct keychain *keychain;
@@ -96,6 +171,12 @@ static struct key *__dnode_get_key2(const struct lyd_node *dnode, bool touch)
 	return key;
 }
 
+/*
+ * 由数据节点定位到对应的 key（相对路径深三层的 always 节点用此版本）。
+ * 参数：dnode 当前节点；touch 为 true 时同时更新所属密钥链的时间戳。
+ * 路径：../../../../name 取链名，../../../key-id 取编号。
+ * 返回值：命中的 struct key（未找到返回 NULL）。
+ */
 static struct key *__dnode_get_key3(const struct lyd_node *dnode, bool touch)
 {
 	struct keychain *keychain;
@@ -115,6 +196,11 @@ static struct key *__dnode_get_key3(const struct lyd_node *dnode, bool touch)
 /*
  * XPath: /ietf-key-chain:key-chains/key-chain/description
  */
+/*
+ * 回调：修改 key-chain 的 description。
+ * 释放旧描述字符串后用 YANG 节点值重建（MTYPE_KEYCHAIN_DESC），并打时间戳。
+ * 返回值：NB_OK。
+ */
 static int key_chains_key_chain_description_modify(struct nb_cb_modify_args *args)
 {
 	struct keychain *keychain;
@@ -133,6 +219,10 @@ static int key_chains_key_chain_description_modify(struct nb_cb_modify_args *arg
 	return NB_OK;
 }
 
+/*
+ * 回调：删除 key-chain 的 description。
+ * 释放描述字符串并打时间戳。返回值：NB_OK。
+ */
 static int key_chains_key_chain_description_destroy(struct nb_cb_destroy_args *args)
 {
 	struct keychain *keychain;
@@ -152,6 +242,10 @@ static int key_chains_key_chain_description_destroy(struct nb_cb_destroy_args *a
 /*
  * XPath: /ietf-key-chain:key-chains/key-chain/last-modified-timestamp
  */
+/*
+ * 状态回调：读取 key-chain 的 last-modified-timestamp。
+ * 返回 date-and-time 类型的状态数据，取自密钥链的 last_touch 字段。
+ */
 static struct yang_data *key_chains_key_chain_last_modified_timestamp_get_elem(struct nb_cb_get_elem_args *args)
 {
 	const struct listnode *kcnode = args->list_entry;
@@ -163,6 +257,12 @@ static struct yang_data *key_chains_key_chain_last_modified_timestamp_get_elem(s
 
 /*
  * XPath: /ietf-key-chain:key-chains/key-chain/key
+ */
+/*
+ * 回调：创建 key 列表项（按 key-id）。
+ * VALIDATE 阶段校验 key-id 不超过 32 位（超限则报错并拒绝）；
+ * APPLY 阶段按 name 找到密钥链，用 key_get 取（不存在则建）对应编号的 key。
+ * 返回值：NB_OK 或校验失败时 NB_EV_VALIDATE。
  */
 static int key_chains_key_chain_key_create(struct nb_cb_create_args *args)
 {
@@ -197,6 +297,11 @@ static int key_chains_key_chain_key_create(struct nb_cb_create_args *args)
 	return NB_OK;
 }
 
+/*
+ * 回调：删除 key 列表项。
+ * key-id 超过 32 位返回 NB_ERR_NOT_FOUND；否则按 name 与编号定位 key 并删除。
+ * 返回值：NB_OK 或 NB_ERR_NOT_FOUND。
+ */
 static int key_chains_key_chain_key_destroy(struct nb_cb_destroy_args *args)
 {
 	struct keychain *keychain;
@@ -219,6 +324,11 @@ static int key_chains_key_chain_key_destroy(struct nb_cb_destroy_args *args)
 	return NB_OK;
 }
 
+/*
+ * 回调：遍历某密钥链下 key 列表的下一项。
+ * 由父列表项（parent_list_entry）取出密钥链对象，首次返回其 key 链表头。
+ * 返回值：下一个 listnode，末尾返回 NULL。
+ */
 static const void *key_chains_key_chain_key_get_next(struct nb_cb_get_next_args *args)
 {
 	const struct listnode *kcnode = args->parent_list_entry;
@@ -228,6 +338,10 @@ static const void *key_chains_key_chain_key_get_next(struct nb_cb_get_next_args 
 	return prev ? prev->next : keychain->key->head;
 }
 
+/*
+ * 回调：取出 key 列表项的 key（仅 key-id 一个，十进制字符串）。
+ * 返回值：NB_OK；keys->num 置 1，key[0] 填编号。
+ */
 static int key_chains_key_chain_key_get_keys(struct nb_cb_get_keys_args *args)
 {
 	const struct listnode *node = args->list_entry;
@@ -240,6 +354,11 @@ static int key_chains_key_chain_key_get_keys(struct nb_cb_get_keys_args *args)
 	return NB_OK;
 }
 
+/*
+ * 回调：在某密钥链内按 key（key-id）定位 key 对应的 listnode。
+ * 把字符串 key-id 转成整数后与各 key 的 index 比较。
+ * 返回值：命中的 listnode；未找到返回 NULL。
+ */
 static const void *key_chains_key_chain_key_lookup_entry(struct nb_cb_lookup_entry_args *args)
 {
 	const struct listnode *kcnode = args->parent_list_entry;
@@ -255,6 +374,14 @@ static const void *key_chains_key_chain_key_lookup_entry(struct nb_cb_lookup_ent
 	return NULL;
 }
 
+/*
+ * lifetime 公共处理：初始化时间窗口为默认“常生效”。
+ * 参数：send / accept 指明作用于哪个方向；always 为 true 时节点位于
+ *       .../always（路径更深一层，用 __dnode_get_key3 定位 key）。
+ * 行为：把对应方向的 start 置 0（无起始限制）、end 置 -1（永不过期）、
+ *       duration 置 0。
+ * 返回值：NB_OK。
+ */
 static int __lifetime_create(struct nb_cb_create_args *args, bool send,
 			     bool accept, bool always)
 {
@@ -280,6 +407,11 @@ static int __lifetime_create(struct nb_cb_create_args *args, bool send,
 	return NB_OK;
 }
 
+/*
+ * lifetime 公共处理：设置起始时间（start-date-time）。
+ * 参数：send / accept 指明作用方向；时间从节点解析后写入 start。
+ * 返回值：NB_OK。
+ */
 static int __lifetime_start_date_time_modify(struct nb_cb_modify_args *args,
 					     bool send, bool accept)
 {
@@ -300,6 +432,11 @@ static int __lifetime_start_date_time_modify(struct nb_cb_modify_args *args,
 	return NB_OK;
 }
 
+/*
+ * lifetime 公共处理：设置永不过期（no-end-time）。
+ * 参数：send / accept 指明作用方向；把对应方向的 end 置 -1。
+ * 返回值：NB_OK。
+ */
 static int __lifetime_no_end_time_create(struct nb_cb_create_args *args,
 					 bool send, bool accept)
 {
@@ -316,6 +453,12 @@ static int __lifetime_no_end_time_create(struct nb_cb_create_args *args,
 	return NB_OK;
 }
 
+/*
+ * lifetime 公共处理：设置持续时长（duration）。
+ * 参数：send / accept 指明作用方向。
+ * 行为：end = start-date-time + duration。
+ * 返回值：NB_OK。
+ */
 static int __lifetime_duration_modify(struct nb_cb_modify_args *args, bool send,
 				      bool accept)
 {
@@ -337,6 +480,11 @@ static int __lifetime_duration_modify(struct nb_cb_modify_args *args, bool send,
 	return NB_OK;
 }
 
+/*
+ * lifetime 公共处理：设置结束时间（end-date-time）。
+ * 参数：send / accept 指明作用方向；时间从节点解析后写入 end。
+ * 返回值：NB_OK。
+ */
 static int __lifetime_end_date_time_modify(struct nb_cb_modify_args *args,
 					   bool send, bool accept)
 {
@@ -359,6 +507,10 @@ static int __lifetime_end_date_time_modify(struct nb_cb_modify_args *args,
 /*
  * XPath: /ietf-key-chain:key-chains/key-chain/key/lifetime/send-accept-lifetime
  */
+/*
+ * 创建 send-accept-lifetime 容器（同时作用于发送与接收窗口）。
+ * 置默认时间范围（无起始限制、永不过期）。转交 __lifetime_create。
+ */
 static int key_chains_key_chain_key_lifetime_send_accept_lifetime_create(
 	struct nb_cb_create_args *args)
 {
@@ -369,6 +521,10 @@ static int key_chains_key_chain_key_lifetime_send_accept_lifetime_create(
 /*
  * XPath: /ietf-key-chain:key-chains/key-chain/key/lifetime/send-accept-lifetime/always
  */
+/*
+ * 创建 send-accept-lifetime/always：发送与接收窗口同时置为常生效默认值。
+ * always 节点路径更深，内部用 __dnode_get_key3 定位 key。
+ */
 static int key_chains_key_chain_key_lifetime_send_accept_lifetime_always_create(
 	struct nb_cb_create_args *args)
 {
@@ -377,6 +533,10 @@ static int key_chains_key_chain_key_lifetime_send_accept_lifetime_always_create(
 
 /*
  * XPath: /ietf-key-chain:key-chains/key-chain/key/lifetime/send-accept-lifetime/start-date-time
+ */
+/*
+ * 修改 send-accept-lifetime/start-date-time：写入发送与接收窗口的起始时间。
+ * 转交 __lifetime_start_date_time_modify。
  */
 static int
 key_chains_key_chain_key_lifetime_send_accept_lifetime_start_date_time_modify(
@@ -388,6 +548,10 @@ key_chains_key_chain_key_lifetime_send_accept_lifetime_start_date_time_modify(
 /*
  * XPath: /ietf-key-chain:key-chains/key-chain/key/lifetime/send-accept-lifetime/no-end-time
  */
+/*
+ * 创建 send-accept-lifetime/no-end-time：发送与接收窗口设为永不过期。
+ * 转交 __lifetime_no_end_time_create。
+ */
 static int
 key_chains_key_chain_key_lifetime_send_accept_lifetime_no_end_time_create(
 	struct nb_cb_create_args *args)
@@ -398,6 +562,10 @@ key_chains_key_chain_key_lifetime_send_accept_lifetime_no_end_time_create(
 /*
  * XPath: /ietf-key-chain:key-chains/key-chain/key/lifetime/send-accept-lifetime/duration
  */
+/*
+ * 修改 send-accept-lifetime/duration：发送与接收窗口的结束时间
+ * = 起始时间 + 持续秒数。转交 __lifetime_duration_modify。
+ */
 static int key_chains_key_chain_key_lifetime_send_accept_lifetime_duration_modify(
 	struct nb_cb_modify_args *args)
 {
@@ -406,6 +574,10 @@ static int key_chains_key_chain_key_lifetime_send_accept_lifetime_duration_modif
 
 /*
  * XPath: /ietf-key-chain:key-chains/key-chain/key/lifetime/send-accept-lifetime/end-date-time
+ */
+/*
+ * 修改 send-accept-lifetime/end-date-time：写入发送与接收窗口的结束时间。
+ * 转交 __lifetime_end_date_time_modify。
  */
 static int
 key_chains_key_chain_key_lifetime_send_accept_lifetime_end_date_time_modify(
@@ -417,6 +589,10 @@ key_chains_key_chain_key_lifetime_send_accept_lifetime_end_date_time_modify(
 /*
  * XPath: /ietf-key-chain:key-chains/key-chain/key/lifetime/send-lifetime
  */
+/*
+ * 创建 send-lifetime 容器（仅作用于发送窗口）。
+ * 置默认时间范围（无起始限制、永不过期）。转交 __lifetime_create。
+ */
 static int key_chains_key_chain_key_lifetime_send_lifetime_create(
 	struct nb_cb_create_args *args)
 {
@@ -427,6 +603,10 @@ static int key_chains_key_chain_key_lifetime_send_lifetime_create(
 /*
  * XPath: /ietf-key-chain:key-chains/key-chain/key/lifetime/send-lifetime/always
  */
+/*
+ * 创建 send-lifetime/always：发送窗口置为常生效默认值。
+ * always 节点路径更深，内部用 __dnode_get_key3 定位 key。
+ */
 static int key_chains_key_chain_key_lifetime_send_lifetime_always_create(
 	struct nb_cb_create_args *args)
 {
@@ -436,6 +616,10 @@ static int key_chains_key_chain_key_lifetime_send_lifetime_always_create(
 /*
  * XPath: /ietf-key-chain:key-chains/key-chain/key/lifetime/send-lifetime/start-date-time
  */
+/*
+ * 修改 send-lifetime/start-date-time：写入发送窗口的起始时间。
+ * 转交 __lifetime_start_date_time_modify。
+ */
 static int key_chains_key_chain_key_lifetime_send_lifetime_start_date_time_modify(struct nb_cb_modify_args *args)
 {
 	return __lifetime_start_date_time_modify(args, true, false);
@@ -443,6 +627,10 @@ static int key_chains_key_chain_key_lifetime_send_lifetime_start_date_time_modif
 
 /*
  * XPath: /ietf-key-chain:key-chains/key-chain/key/lifetime/send-lifetime/no-end-time
+ */
+/*
+ * 创建 send-lifetime/no-end-time：发送窗口设为永不过期。
+ * 转交 __lifetime_no_end_time_create。
  */
 static int key_chains_key_chain_key_lifetime_send_lifetime_no_end_time_create(struct nb_cb_create_args *args)
 {
@@ -452,6 +640,10 @@ static int key_chains_key_chain_key_lifetime_send_lifetime_no_end_time_create(st
 /*
  * XPath: /ietf-key-chain:key-chains/key-chain/key/lifetime/send-lifetime/duration
  */
+/*
+ * 修改 send-lifetime/duration：发送窗口结束时间 = 起始时间 + 持续秒数。
+ * 转交 __lifetime_duration_modify。
+ */
 static int key_chains_key_chain_key_lifetime_send_lifetime_duration_modify(struct nb_cb_modify_args *args)
 {
 	return __lifetime_duration_modify(args, true, false);
@@ -460,6 +652,10 @@ static int key_chains_key_chain_key_lifetime_send_lifetime_duration_modify(struc
 /*
  * XPath: /ietf-key-chain:key-chains/key-chain/key/lifetime/send-lifetime/end-date-time
  */
+/*
+ * 修改 send-lifetime/end-date-time：写入发送窗口的结束时间。
+ * 转交 __lifetime_end_date_time_modify。
+ */
 static int key_chains_key_chain_key_lifetime_send_lifetime_end_date_time_modify(struct nb_cb_modify_args *args)
 {
 	return __lifetime_end_date_time_modify(args, true, false);
@@ -467,6 +663,10 @@ static int key_chains_key_chain_key_lifetime_send_lifetime_end_date_time_modify(
 
 /*
  * XPath: /ietf-key-chain:key-chains/key-chain/key/lifetime/accept-lifetime
+ */
+/*
+ * 创建 accept-lifetime 容器（仅作用于接收窗口）。
+ * 置默认时间范围（无起始限制、永不过期）。转交 __lifetime_create。
  */
 static int key_chains_key_chain_key_lifetime_accept_lifetime_create(
 	struct nb_cb_create_args *args)
@@ -478,6 +678,10 @@ static int key_chains_key_chain_key_lifetime_accept_lifetime_create(
 /*
  * XPath: /ietf-key-chain:key-chains/key-chain/key/lifetime/accept-lifetime/always
  */
+/*
+ * 创建 accept-lifetime/always：接收窗口置为常生效默认值。
+ * always 节点路径更深，内部用 __dnode_get_key3 定位 key。
+ */
 static int key_chains_key_chain_key_lifetime_accept_lifetime_always_create(struct nb_cb_create_args *args)
 {
 	return __lifetime_create(args, false, true, true);
@@ -485,6 +689,10 @@ static int key_chains_key_chain_key_lifetime_accept_lifetime_always_create(struc
 
 /*
  * XPath: /ietf-key-chain:key-chains/key-chain/key/lifetime/accept-lifetime/start-date-time
+ */
+/*
+ * 修改 accept-lifetime/start-date-time：写入接收窗口的起始时间。
+ * 转交 __lifetime_start_date_time_modify。
  */
 static int key_chains_key_chain_key_lifetime_accept_lifetime_start_date_time_modify(struct nb_cb_modify_args *args)
 {
@@ -494,6 +702,10 @@ static int key_chains_key_chain_key_lifetime_accept_lifetime_start_date_time_mod
 /*
  * XPath: /ietf-key-chain:key-chains/key-chain/key/lifetime/accept-lifetime/no-end-time
  */
+/*
+ * 创建 accept-lifetime/no-end-time：接收窗口设为永不过期。
+ * 转交 __lifetime_no_end_time_create。
+ */
 static int key_chains_key_chain_key_lifetime_accept_lifetime_no_end_time_create(struct nb_cb_create_args *args)
 {
 	return __lifetime_no_end_time_create(args, false, true);
@@ -501,6 +713,10 @@ static int key_chains_key_chain_key_lifetime_accept_lifetime_no_end_time_create(
 
 /*
  * XPath: /ietf-key-chain:key-chains/key-chain/key/lifetime/accept-lifetime/duration
+ */
+/*
+ * 修改 accept-lifetime/duration：接收窗口结束时间 = 起始时间 + 持续秒数。
+ * 转交 __lifetime_duration_modify。
  */
 static int key_chains_key_chain_key_lifetime_accept_lifetime_duration_modify(struct nb_cb_modify_args *args)
 {
@@ -510,6 +726,10 @@ static int key_chains_key_chain_key_lifetime_accept_lifetime_duration_modify(str
 /*
  * XPath: /ietf-key-chain:key-chains/key-chain/key/lifetime/accept-lifetime/end-date-time
  */
+/*
+ * 修改 accept-lifetime/end-date-time：写入接收窗口的结束时间。
+ * 转交 __lifetime_end_date_time_modify。
+ */
 static int key_chains_key_chain_key_lifetime_accept_lifetime_end_date_time_modify(struct nb_cb_modify_args *args)
 {
 	return __lifetime_end_date_time_modify(args, false, true);
@@ -517,6 +737,14 @@ static int key_chains_key_chain_key_lifetime_accept_lifetime_end_date_time_modif
 
 /*
  * XPath: /ietf-key-chain:key-chains/key-chain/key/crypto-algorithm
+ */
+/*
+ * 回调：修改 key 的 crypto-algorithm。
+ * VALIDATE 阶段把算法名（先剥去 ietf-key-chain: 前缀）映射为枚举值，
+ * 未识别的算法报错返回 NB_ERR_VALIDATION；未启用 openssl 时若映射为
+ * KEYCHAIN_ALGO_NULL 也报错。
+ * APPLY 阶段把枚举值写入 key->hash_algo 并打时间戳。
+ * 返回值：NB_OK 或 NB_ERR_VALIDATION。
  */
 static int key_chains_key_chain_key_crypto_algorithm_modify(struct nb_cb_modify_args *args)
 {
@@ -562,6 +790,11 @@ static int key_chains_key_chain_key_crypto_algorithm_modify(struct nb_cb_modify_
 	return NB_OK;
 }
 
+/*
+ * 回调：删除 key 的 crypto-algorithm。
+ * 把 key->hash_algo 复位为 KEYCHAIN_ALGO_NULL 并打时间戳。
+ * 返回值：NB_OK。
+ */
 static int key_chains_key_chain_key_crypto_algorithm_destroy(
 	struct nb_cb_destroy_args *args)
 {
@@ -585,6 +818,11 @@ static int key_chains_key_chain_key_crypto_algorithm_destroy(
 
 /*
  * XPath: /ietf-key-chain:key-chains/key-chain/key/key-string/keystring
+ */
+/*
+ * 回调：修改 key 的 key-string/keystring。
+ * 释放旧密钥串后用 YANG 节点值重建（MTYPE_KEY），并打时间戳。
+ * 返回值：NB_OK。
  */
 static int key_chains_key_chain_key_key_string_keystring_modify(struct nb_cb_modify_args *args)
 {
@@ -612,6 +850,10 @@ static int key_chains_key_chain_key_key_string_keystring_modify(struct nb_cb_mod
 	return NB_OK;
 }
 
+/*
+ * 回调：删除 key 的 key-string/keystring。
+ * 释放密钥串并打时间戳。返回值：NB_OK。
+ */
 static int key_chains_key_chain_key_key_string_keystring_destroy(struct nb_cb_destroy_args *args)
 {
 	struct keychain *keychain;
@@ -637,6 +879,12 @@ static int key_chains_key_chain_key_key_string_keystring_destroy(struct nb_cb_de
 /*
  * XPath: /ietf-key-chain:key-chains/key-chain/key/send-lifetime-active
  */
+/*
+ * 状态回调：读取 key 的 send-lifetime-active。
+ * 按发送窗口是否覆盖当前时间判定：send.start 为 0 表示无起始限制即生效；
+ * 否则需 start <= now 且（end >= now 或 end == -1）。
+ * 返回布尔型状态数据。
+ */
 static struct yang_data *key_chains_key_chain_key_send_lifetime_active_get_elem(struct nb_cb_get_elem_args *args)
 {
 	const struct listnode *node = args->list_entry;
@@ -656,6 +904,11 @@ static struct yang_data *key_chains_key_chain_key_send_lifetime_active_get_elem(
 /*
  * XPath: /ietf-key-chain:key-chains/key-chain/key/accept-lifetime-active
  */
+/*
+ * 状态回调：读取 key 的 accept-lifetime-active。
+ * 判定规则同 send 版本，只是作用于接收窗口（accept.start / accept.end）。
+ * 返回布尔型状态数据。
+ */
 static struct yang_data *key_chains_key_chain_key_accept_lifetime_active_get_elem(struct nb_cb_get_elem_args *args)
 {
 	const struct listnode *node = args->list_entry;
@@ -672,12 +925,24 @@ static struct yang_data *key_chains_key_chain_key_accept_lifetime_active_get_ele
 	return yang_data_new_bool(args->xpath, active);
 }
 
+/*
+ * 本模块声明的 YANG feature 列表。
+ * independent-send-accept-lifetime 表示支持发送 / 接收窗口各自独立配置。
+ * 以 NULL 结尾。
+ */
 static const char * const keychain_features[] = {
 	"independent-send-accept-lifetime",
 	NULL,
 };
 
 /* clang-format off */
+/*
+ * ietf-key-chain 模块信息：把每个 YANG XPath 与对应的回调绑定。
+ * 列表项（key-chain、key）绑定 create / destroy / get_next / get_keys /
+ * lookup_entry 及 CLI 回显回调；lifetime 各叶子绑定 modify / create 与
+ * 空销毁回调 __destroy_nop；状态叶子绑定 get_elem。
+ * 末尾以 xpath = NULL 的哨兵节点结束。
+ */
 const struct frr_yang_module_info ietf_key_chain_info = {
 	.name = "ietf-key-chain",
 	.features = (const char **)keychain_features,

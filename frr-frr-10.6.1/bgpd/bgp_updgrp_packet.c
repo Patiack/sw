@@ -8,6 +8,45 @@
  * @author Rajesh Varadarajan <rajesh@sproute.net>
  * @author Pradosh Mohapatra <pradosh@sproute.net>
  */
+/* ============================================================================
+ * 【文件导读】bgp_updgrp_packet.c —— bpacket：报文共享缓冲与“逐 peer 改写”的实现
+ * ============================================================================
+ * 职责与定位：
+ *   本文件是 update-group 主线的“编码与共享”环节，也是 FRR 相对逐 peer 独立组包的性能
+ *   关键。核心思想：同组 peer 出向内容相同，于是把一条/一批更新**只编码一次**成一串字节
+ *   (bpacket->buffer)，交给整组共享；发送瞬间再用 bpacket_reformat_for_peer() 仅按每个
+ *   peer 微调少数字段（典型是下一跳），而不是为每个 peer 重新序列化整条报文。
+ *
+ * 三条职责：
+ *   1) bpacket_queue 系列 —— 报文队列：入队(带哨兵)、出队、压缩、按 peer 推进游标、
+ *      长度/水位统计。队列尾始终有一个 buffer==NULL 的“哨兵”，见 bpacket_queue_add。
+ *   2) bpacket_reformat_for_peer —— 共享缓冲的逐 peer 改写：根据 vecarr 里记录的偏移，
+ *      只改下一跳字段（IPv4/IPv6/VPNv4/VPNv6/EVPN），其余字节照发。
+ *   3) subgroup_update_packet / subgroup_withdraw_packet / subgroup_default_*_packet ——
+ *      从子组的 sync->update / sync->withdraw FIFO 取 adv，编码成完整 UPDATE 并入队。
+ *
+ * 关键数据结构：
+ *   bpacket          —— 一份已编码报文 + 接收者 peer 列表(peers) + 版本号(ver) + 改写向量(arr)。
+ *   bpacket_attr_vec_arr(arr) —— “哪些字段需逐 peer 改写”的偏移表；本文件写入(编码时)与读取
+ *                      (reformat 时)。BGP_ATTR_VEC_NH 指下一跳在其所在属性中的字节偏移。
+ *   bpacket_queue    —— bpacket 的 TAILQ；curr_count 含哨兵，hwm_count 记录水位峰值。
+ *
+ * 关键路径：
+ *   上游：bgp_packet.c 的 bgp_generate_updgrp_packets（每 peer 出队→reformat→写 obuf）；
+ *        bgp_updgrp.c 的 subgroup_trigger_write（触发写）。
+ *   下游：lib 的 stream/bgp_packet_attribute / mpattr_* 编码原语。
+ *
+ * 关键函数清单（建议阅读顺序）：
+ *   1) bpacket_queue_add / bpacket_queue_add_packet —— 理解“哨兵”队列模型。
+ *   2) bpacket_add_peer / bpacket_queue_advance_peer / bpacket_queue_remove_peer —— peer 游标推进。
+ *   3) bpacket_reformat_for_peer —— 逐 peer 改写下一跳（共享的核心代价所在）。
+ *   4) subgroup_update_packet —— 把 update FIFO 编码成一条最大填充的 UPDATE。
+ *   5) subgroup_withdraw_packet —— 同上，但生成 UPDATE 撤销。
+ *   6) subgroup_default_update_packet / _withdraw_packet —— default-originate 特例。
+ *
+ * 建议阅读顺序：先 1、2（队列与 peer 游标），再 3（改写），最后 4、5、6（编码）。
+ * ============================================================================
+ */
 
 #include <zebra.h>
 
@@ -51,6 +90,9 @@
 /********************
  * PUBLIC FUNCTIONS
  ********************/
+/* ========== 1. bpacket 与 bpacket_queue 的基础操作 ========== */
+/* 【bpacket_alloc】分配一个空的 bpacket（buffer/peers/arr 均为初始态）。
+ * 调用时机：bpacket_queue_add 需要新报文对象时。 */
 struct bpacket *bpacket_alloc(void)
 {
 	struct bpacket *pkt;
@@ -60,6 +102,7 @@ struct bpacket *bpacket_alloc(void)
 	return pkt;
 }
 
+/* 【bpacket_free】释放 bpacket：先释放其字节流 buffer（若已填充），再释放本体。 */
 void bpacket_free(struct bpacket *pkt)
 {
 	if (pkt->buffer)
@@ -68,6 +111,7 @@ void bpacket_free(struct bpacket *pkt)
 	XFREE(MTYPE_BGP_PACKET, pkt);
 }
 
+/* 【bpacket_queue_init】初始化一个 bpacket 队列（空 TAILQ）。 */
 void bpacket_queue_init(struct bpacket_queue *q)
 {
 	TAILQ_INIT(&(q->pkts));
@@ -81,6 +125,9 @@ void bpacket_queue_init(struct bpacket_queue *q)
  *
  * Users of bpacket_queue should use bpacket_queue_add instead.
  */
+/* 【bpacket_queue_add_packet】内部：把 pkt 追加到队列末尾，并更新 curr_count 与水位 hwm_count。
+ * 参数 q：队列；pkt：待追加报文。
+ * 关键点：若队列非空则插在“最后一个节点之后”（即新哨兵总在尾部）；水位只增不减。 */
 static void bpacket_queue_add_packet(struct bpacket_queue *q,
 				     struct bpacket *pkt)
 {
@@ -104,6 +151,17 @@ static void bpacket_queue_add_packet(struct bpacket_queue *q,
  * not free or use the stream after
  * invoking this function.
  */
+/* 【bpacket_queue_add】把一份已编码的报文字节流 s 加入队列，返回真正的报文对象。
+ * 参数 q：子组报文队列；s：编码好的字节流（本函数“接管”其所有权，调用者勿再使用/释放）；
+ *     vecarrp：逐 peer 改写偏移表（无则用空表）。
+ * 返回：编码本次报文对应的 bpacket（注意“哨兵”语义，见下）。
+ * 调用时机：subgroup_update_packet / subgroup_withdraw_packet / subgroup_default_*_packet。
+ * 关键点（哨兵模型，务必理解）：
+ *   - 队列尾部始终保留一个 buffer==NULL 的“哨兵”包，新 peer 默认挂在该哨兵上，表示
+ *     “从之后的新报文开始收”而不接收已在队列里的旧报文。
+ *   - 入队时把 s 填进“当前哨兵”，再在其后追加一个新哨兵；返回的是被填入内容的那个包
+ *     (last_pkt)，即本次真实报文。ver 从 1 起单调递增（新哨兵 = 旧哨兵 ver+1）。
+ *   - 空队列分支：直接新建首个包 ver=1 并添加，同时它也是新的哨兵。 */
 struct bpacket *bpacket_queue_add(struct bpacket_queue *q, struct stream *s,
 				  struct bpacket_attr_vec_arr *vecarrp)
 {
@@ -144,16 +202,20 @@ struct bpacket *bpacket_queue_add(struct bpacket_queue *q, struct stream *s,
 	return last_pkt;
 }
 
+/* 【bpacket_queue_first】返回队列首包（最早未处理）。 */
 struct bpacket *bpacket_queue_first(struct bpacket_queue *q)
 {
 	return (TAILQ_FIRST(&(q->pkts)));
 }
 
+/* 【bpacket_queue_last】返回队列尾包（通常就是哨兵）。 */
 struct bpacket *bpacket_queue_last(struct bpacket_queue *q)
 {
 	return TAILQ_LAST(&(q->pkts), pkt_queue);
 }
 
+/* 【bpacket_queue_remove】从队首移除并返回一个 bpacket（不释放），curr_count 减一。
+ * 调用时机：出队消费(bgp_generate_updgrp_packets)、cleanup 时。 */
 struct bpacket *bpacket_queue_remove(struct bpacket_queue *q)
 {
 	struct bpacket *first;
@@ -166,16 +228,21 @@ struct bpacket *bpacket_queue_remove(struct bpacket_queue *q)
 	return first;
 }
 
+/* 【bpacket_queue_length】队列中“真实报文”条数（curr_count 含哨兵，故减 1）。 */
 unsigned int bpacket_queue_length(struct bpacket_queue *q)
 {
 	return q->curr_count - 1;
 }
 
+/* 【bpacket_queue_hwm_length】历史水位峰值对应的真实报文条数。 */
 unsigned int bpacket_queue_hwm_length(struct bpacket_queue *q)
 {
 	return q->hwm_count - 1;
 }
 
+/* 【bpacket_queue_is_full】判断队列是否达到实例配置的最大长度(default_subgroup_pkt_queue_max)。
+ * 关键点：curr_count 含哨兵，直接与上限比较；满时 subgroup_*_packet 会停止继续编码，
+ *   形成对慢 peer/慢链路的下游背压。 */
 bool bpacket_queue_is_full(struct bgp *bgp, struct bpacket_queue *q)
 {
 	if (q->curr_count >= bgp->default_subgroup_pkt_queue_max)
@@ -183,6 +250,10 @@ bool bpacket_queue_is_full(struct bgp *bgp, struct bpacket_queue *q)
 	return false;
 }
 
+/* 【bpacket_add_peer】把一个 peer_af 登记为某报文的接收者，并把其发送游标指向该报文。
+ * 参数 pkt：目标报文；paf：接收 peer。
+ * 关键点：paf->next_pkt_to_send = pkt —— 该 peer 下一次发送就从这个包开始；
+ *   peer 出队后由 bpacket_queue_advance_peer 沿队列推进。 */
 void bpacket_add_peer(struct bpacket *pkt, struct peer_af *paf)
 {
 	if (!pkt || !paf)
@@ -195,6 +266,7 @@ void bpacket_add_peer(struct bpacket *pkt, struct peer_af *paf)
 /*
  * bpacket_queue_cleanup
  */
+/* 【bpacket_queue_cleanup】清空并释放整个队列的所有 bpacket（含哨兵）。 */
 void bpacket_queue_cleanup(struct bpacket_queue *q)
 {
 	struct bpacket *pkt;
@@ -204,6 +276,7 @@ void bpacket_queue_cleanup(struct bpacket_queue *q)
 	}
 }
 
+/* ========== 2. peer 游标推进与队列压缩 ========== */
 /*
  * bpacket_queue_compact
  *
@@ -212,6 +285,11 @@ void bpacket_queue_cleanup(struct bpacket_queue *q)
  *
  * @return the number of packets deleted.
  */
+/* 【bpacket_queue_compact】从头压缩队列：删除队首那些“已无任何接收者(peers 空)”的报文。
+ * 参数 q：队列。
+ * 返回：删除的报文数。
+ * 调用时机：peer 出队后(bpacket_queue_advance_peer)、peer 移除后(bpacket_queue_remove_peer)。
+ * 关键点：遇到哨兵(buffer==NULL)或还有接收者的包即停——哨兵是队列尾，不能删。 */
 static int bpacket_queue_compact(struct bpacket_queue *q)
 {
 	int num_deleted;
@@ -243,6 +321,15 @@ static int bpacket_queue_compact(struct bpacket_queue *q)
 	return num_deleted;
 }
 
+/* 【bpacket_queue_advance_peer】某 peer 成功发出其当前报文后，把它的发送游标沿队列前移一格。
+ * 参数 paf：已发送的 peer。
+ * 返回：无。
+ * 调用时机：bgp_packet.c 把该 peer 的 next_pkt_to_send 写出后调用。
+ * 关键点：
+ *   - 游标已到哨兵(buffer==NULL)则表示该 peer 收完了当前队列，无需推进。
+ *   - 把 paf 从旧包的 peers 链表摘掉、加到下一个包上并更新 next_pkt_to_send。
+ *   - 摘链后可能使队首若干包失去全部接收者，调用 compact 压缩；若有删除则尝试子组合并
+ *     （队列变短可能让本子组满足合并条件）。 */
 void bpacket_queue_advance_peer(struct peer_af *paf)
 {
 	struct bpacket *pkt;
@@ -273,6 +360,11 @@ void bpacket_queue_advance_peer(struct peer_af *paf)
  * Remove the peer from the packet queue of the subgroup it belongs
  * to.
  */
+/* 【bpacket_queue_remove_peer】把一个 peer 从其所属子组的报文队列里摘除（清空其游标并压缩）。
+ * 参数 paf：待移除 peer。
+ * 返回：无。
+ * 调用时机：update_subgroup_remove_peer_internal。
+ * 关键点：LIST_REMOVE 从当前所在包的 peers 里摘掉；next_pkt_to_send 置 NULL。 */
 void bpacket_queue_remove_peer(struct peer_af *paf)
 {
 	struct bpacket_queue *q;
@@ -286,6 +378,11 @@ void bpacket_queue_remove_peer(struct peer_af *paf)
 	bpacket_queue_compact(q);
 }
 
+/* 【bpacket_queue_virtual_length】该 peer 视角下“还没发出去”的报文条数（虚拟队列长度）。
+ * 参数 paf：目标 peer。
+ * 返回：从 next_pkt_to_send 到队尾哨兵的报文数（含 ver 回绕补偿）。
+ * 调用时机：用于判断某 peer 是否积压（如丢弃邻居时的检查）。
+ * 关键点：用 bpacket 的 ver 序号差计算；ver 单调递增，回绕时按 UINT_MAX 环补偿。 */
 unsigned int bpacket_queue_virtual_length(struct peer_af *paf)
 {
 	struct bpacket *pkt;
@@ -312,6 +409,8 @@ unsigned int bpacket_queue_virtual_length(struct peer_af *paf)
 /*
  * Dump the bpacket queue
  */
+/* 【bpacket_queue_show_vty】打印队列：逐包输出其指针、版本、buffer，以及每个接收 peer。
+ * 参数 q：队列；vty：输出。调用时机：show update-group packet-queue。 */
 void bpacket_queue_show_vty(struct bpacket_queue *q, struct vty *vty)
 {
 	struct bpacket *pkt;
@@ -330,6 +429,24 @@ void bpacket_queue_show_vty(struct bpacket_queue *q, struct vty *vty)
 	return;
 }
 
+/* 【bpacket_reformat_for_peer】共享报文“逐 peer 改写”的核心：复制一份共享 buffer，按该
+ *   peer 的实际情况改写其中的下一跳字段后返回可发送的流。
+ * 参数 pkt：共享 bpacket；paf：目标 peer。
+ * 返回：改写后的新 stream（调用者负责发送/释放），出错返回 NULL。
+ * 调用时机：bgp_packet.c 的 bgp_generate_updgrp_packets 对该 peer 出队后。
+ * 关键点（代价与语义）：
+ *   - 先 stream_dup 复制整个共享 buffer（这一步是共享机制的“代价”）；若 vecarr 未标记
+ *     BGP_ATTR_VEC_NH 已更新，说明本报文无需按 peer 改写，直接返回副本。
+ *   - vec->offset 指向某属性(MP_REACH/MP_NEXTHOP)内“下一个字段”的偏移；先用
+ *     stream_getc_from 读出下一跳长度 nhlen，据此判定 AFI(或 enhe 能力强制 IPv6)与点对点/
+ *     多路访问等情形。
+ *   - IPv4 分支：读取 v4 nexthop，按 route-map 是否设置下一跳、对端地址(peer-address)、
+ *     nexthop 是否 INADDR_ANY、“EBGP 且非 multiaccess 且未 nexthop-unchanged”等规则，决定
+ *     是否把下一跳改成 peer->nexthop.v4；VPNv4 需额外跳过 8 字节 RD。
+ *   - IPv6 分支：处理 global(gnh) 与 link-local(lnh) 两个下一跳，兼容 16/24/32/40 字节的多种
+ *     nhlen(含 VPN 的 RD 前缀)；若协商了 link-local 能力则强制填 peer 的 link-local 地址。
+ *   - L2VPN(EVPN) 分支：仅当下一跳为 INADDR_ANY 时改为 peer 下一跳，不允许 route-map 改写。
+ *   - 全程保持其余字节不变——这正是“一次编码、多 peer 共享”的精髓。 */
 struct stream *bpacket_reformat_for_peer(struct bpacket *pkt,
 					 struct peer_af *paf)
 {
@@ -617,10 +734,17 @@ struct stream *bpacket_reformat_for_peer(struct bpacket *pkt,
 	return s;
 }
 
+/* ========== 3. 从 adv FIFO 编码报文 ========== */
 /*
  * Update the vecarr offsets to go beyond 'pos' bytes, i.e. add 'pos'
  * to each offset.
  */
+/* 【bpacket_attr_vec_arr_update】把 vecarr 中所有偏移整体加上 pos。
+ * 参数 vecarr：偏移表；pos：要加的字节数。
+ * 返回：无。
+ * 调用时机：subgroup_update_packet 拼接 MP_REACH_NLRI 流后——因为 MP 属性是插在报文中间
+ *   的，其后所有属性的偏移都要顺延，故本表记录的下一跳偏移需整体后移。
+ * 关键点：仅 BGP_ATTR_VEC_NH 一项，但用循环以适配未来更多 vector 类型。 */
 static void bpacket_attr_vec_arr_update(struct bpacket_attr_vec_arr *vecarr,
 					size_t pos)
 {
@@ -636,6 +760,7 @@ static void bpacket_attr_vec_arr_update(struct bpacket_attr_vec_arr *vecarr,
 /*
  * Return if there are packets to build for this subgroup.
  */
+/* 【subgroup_packets_to_build】子组是否还有待编码的撤销或通告（两个 FIFO 非空即真）。 */
 bool subgroup_packets_to_build(struct update_subgroup *subgrp)
 {
 	struct bgp_advertise *adv;
@@ -655,6 +780,21 @@ bool subgroup_packets_to_build(struct update_subgroup *subgrp)
 }
 
 /* Make BGP update packet.  */
+/* 【subgroup_update_packet】把子组 sync->update FIFO 里的待发通告编码成**一条**填满的 UPDATE
+ *   报文（尽量塞进尽可能多的前缀），加入队列并返回。
+ * 参数 subgrp：目标子组。
+ * 返回：入队的新 bpacket；无可编码内容或队列已满或属性超长时返回 NULL。
+ * 调用时机：bgp_generate_updgrp_packets（发送调度）在报文入队前准备内容时。
+ * 关键点（编码流程）：
+ *   - 队列满(背压)直接返回；用 work(s) 为主属性流、scratch(snlri) 为 MP_REACH_NLRI 流。
+ *   - 循环取 update FIFO 首 adv：先按剩余空间判断能否再塞一条 NLRI，不能则 break。
+ *   - 首条时写 BGP 报文头(含 marker/type)、withdrawn len=0、attrlen 占位、MP_REACH 起始位置，
+ *     并调 bgp_packet_attribute 编码全部非 MP 属性(顺带填 vecarr 的下一跳偏移)；若属性已
+ *     超长则 flush 整个 update 队列并返回 NULL。
+ *   - 普通 IPv4 单播 NLRI 直接追加；其它 AF 走 MP_REACH（含 RD、标签、addpath id）编码进 snlri。
+ *   - 每条编码后做属性 sync：释放 adj->attr 再 intern 新属性(或首次 scount++)，并清理 adv。
+ *   - 收尾：闭合 MP 属性、回填总属性长度；若有 MP 则 stream_dupcat 拼接主属性与 MP 流并
+ *     bpacket_attr_vec_arr_update 顺延偏移；否则直接 dup。最后 set_size 并 bpacket_queue_add。 */
 struct bpacket *subgroup_update_packet(struct update_subgroup *subgrp)
 {
 	struct bpacket_attr_vec_arr vecarr;
@@ -939,6 +1079,17 @@ struct bpacket *subgroup_update_packet(struct update_subgroup *subgrp)
     2-octet withdrawn route length (=0) | 2-octet attrlen |
      mp_unreach attr type | attr len | afi | safi | withdrawn prefixes
 */
+/* 【subgroup_withdraw_packet】把子组 sync->withdraw FIFO 里的待撤销前缀编码成一条 UPDATE
+ *   (撤销)报文，入队并返回。报文布局见上方英文注释（IPv4 单播用 Withdrawn Routes 字段，
+ *   其它 AF 用 MP_UNREACH_NLRI 属性）。
+ * 参数 subgrp：目标子组。
+ * 返回：入队的新 bpacket；无内容或队列满时 NULL。
+ * 调用时机：发送调度。
+ * 关键点：
+ *   - 队列满即返回；循环取 withdraw FIFO 首 adv，按剩余空间判断能否再塞一条。
+ *   - IPv4 单播直接追加到 Withdrawn Routes；否则首条时写 MP_UNREACH 头(afi/safi/占位长度)。
+ *   - 每条编码后 scount-- 并 bgp_adj_out_remove_subgroup 彻底移除该 adj（撤销后即无通告状态）。
+ *   - 收尾：IPv4 回填 unfeasible_len 并补 attrlen=0；其它 AF 闭合 MP_UNREACH 长度与总属性长度。 */
 struct bpacket *subgroup_withdraw_packet(struct update_subgroup *subgrp)
 {
 	struct bpacket *pkt;
@@ -1099,6 +1250,18 @@ struct bpacket *subgroup_withdraw_packet(struct update_subgroup *subgrp)
 	return NULL;
 }
 
+/* 【subgroup_default_update_packet】为 default-originate 单独编码一条“通告默认路由”的
+ *   UPDATE 并入队、触发写出。
+ * 参数 subgrp：目标子组；attr：默认路由属性；from：来源 peer（本地为 peer_self）。
+ * 返回：无。
+ * 调用时机：subgroup_default_originate 通告分支。
+ * 关键点：
+ *   - LABELED_UNICAST 时给默认前缀附加显式空标签(EXPLICIT_NULL)。
+ *   - 报文单独 stream_new，写头/withdrawn=0/属性长度占位，bgp_packet_attribute 编码属性
+ *     （用 BGP_ADDPATH_TX_ID_FOR_DEFAULT_ORIGINATE 作为 addpath id），再写 IPv4 单播 NLRI、
+ *     set_size、入队并 subgroup_trigger_write。
+ *   - 首次发送时 scount++ 并置 SUBGRP_STATUS_PEER_DEFAULT_ORIGINATED（避免重复计数）。
+ *   - 仅在 debug/trace 开启时才做昂贵的属性字符串格式化。 */
 void subgroup_default_update_packet(struct update_subgroup *subgrp,
 				    struct attr *attr, struct peer *from)
 {
@@ -1208,6 +1371,14 @@ void subgroup_default_update_packet(struct update_subgroup *subgrp,
 	}
 }
 
+/* 【subgroup_default_withdraw_packet】为 default-originate 单独编码一条“撤销默认路由”的
+ *   UPDATE 并入队、触发写出。
+ * 参数 subgrp：目标子组。
+ * 返回：无。
+ * 调用时机：subgroup_default_originate 撤销分支。
+ * 关键点：IPv4 单播走 Withdrawn Routes 字段（回填 unfeasible_len 并补 attrlen=0）；其它 AF
+ *   走 MP_UNREACH_NLRI；入队后 subgroup_trigger_write；若此前置过 PEER_DEFAULT_ORIGINATED
+ *   则 scount-- 并清该标志。 */
 void subgroup_default_withdraw_packet(struct update_subgroup *subgrp)
 {
 	struct peer *peer;
@@ -1305,6 +1476,14 @@ void subgroup_default_withdraw_packet(struct update_subgroup *subgrp)
 	}
 }
 
+/* ========== 4. 逐 peer 改写向量表(vecarr)的维护 ========== */
+/* 【bpacket_vec_arr_inherit_attr_flags】把属性 attr 上的“route-map 改动标志”翻译成 vecarr
+ *   的下一跳改写标志：告诉发送阶段“这条报文的下一跳是否需要/如何按 peer 改写”。
+ * 参数 vecarr：目标向量表；type：向量类型（当前仅 BGP_ATTR_VEC_NH）；attr：已编码属性。
+ * 返回：无。
+ * 关键点：把 attr->rmap_change_flags 的各类(NH_PEER_ADDRESS / NH_UNCHANGED / IPV4_NH /
+ *   IPV6_GNH / VPNV4_NH / VPNV6_GNH / IPV6_LNH) 映射为 BPKT_ATTRVEC_FLAGS_RMAP_* 位，
+ *   供 bpacket_reformat_for_peer 判断如何改写下一跳。 */
 static void
 bpacket_vec_arr_inherit_attr_flags(struct bpacket_attr_vec_arr *vecarr,
 				   enum bpacket_attr_vec_type type,
@@ -1346,6 +1525,8 @@ bpacket_vec_arr_inherit_attr_flags(struct bpacket_attr_vec_arr *vecarr,
 /* Reset the Attributes vector array. The vector array is used to override
  * certain output parameters in the packet for a particular peer
  */
+/* 【bpacket_attr_vec_arr_reset】清空向量表：所有项的 flags/offset 归零。
+ * 参数 vecarr：待清表。调用时机：每次编码一条新报文前（编码器初始化）。 */
 void bpacket_attr_vec_arr_reset(struct bpacket_attr_vec_arr *vecarr)
 {
 	int i;
@@ -1362,6 +1543,13 @@ void bpacket_attr_vec_arr_reset(struct bpacket_attr_vec_arr *vecarr)
 }
 
 /* Setup a particular node entry in the vecarr */
+/* 【bpacket_attr_vec_arr_set_vec】记录“某类向量”在报文流中的位置：置 UPDATED 位并记下
+ *   stream s 当前写入位置(endp)作为偏移。
+ * 参数 vecarr：向量表；type：向量类型；s：正在编码的流；attr：对应属性（用于继承 route-map
+ *   下一跳改写标志，可为 NULL）。
+ * 返回：无。
+ * 调用时机：bgp_packet_attribute 编码到下一跳字段时（经 bgp_attr_stream_put_... 路径）。
+ * 关键点：offset 即下一跳字段在 buffer 中的字节偏移，reformat 阶段据此原地改写。 */
 void bpacket_attr_vec_arr_set_vec(struct bpacket_attr_vec_arr *vecarr,
 				  enum bpacket_attr_vec_type type,
 				  struct stream *s, struct attr *attr)
